@@ -8,7 +8,7 @@
 
 | 仓库 | 用途 |
 | --- | --- |
-| `1951779219/novel_video_pipeline` | 私有源码仓库 |
+| `1951779219/novel_video_pipeline_mac` | 私有源码仓库 |
 | `1951779219/novel_video_pipeline_release` | 公开发布仓库，放更新 zip 和 `latest.json` |
 | `1951779219/novel_video_pipeline_feedback` | 公开反馈仓库 |
 
