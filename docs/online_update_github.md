@@ -8,14 +8,14 @@
 
 | 仓库 | 用途 |
 | --- | --- |
-| `1951779219/novel_video_pipeline_mac` | 私有源码仓库 |
-| `1951779219/novel_video_pipeline_release` | 公开发布仓库，放更新 zip 和 `latest.json` |
+| `1951779219/novel_video_pipeline` | 私有源码仓库 |
+| `1951779219/novel_video_pipeline_mac_release` | 公开发布仓库，放更新 zip 和 `latest.json` |
 | `1951779219/novel_video_pipeline_feedback` | 公开反馈仓库 |
 
 GUI 默认读取：
 
 ```text
-https://github.com/1951779219/novel_video_pipeline_release/releases/latest/download/latest.json
+https://github.com/1951779219/novel_video_pipeline_mac_release/releases/latest/download/latest.json
 ```
 
 如果换仓库，改 GUI 的 `更新清单 URL`，或改 `data/settings.json` 里的 `update_manifest_url`。
@@ -32,7 +32,7 @@ gh auth login
 然后在项目根目录运行：
 
 ```bash
-RELEASE_REPO=1951779219/novel_video_pipeline_release ./scripts/publish_github_release.sh
+RELEASE_REPO=1951779219/novel_video_pipeline_mac_release ./scripts/publish_github_release.sh
 ```
 
 脚本会：
@@ -49,7 +49,7 @@ RELEASE_REPO=1951779219/novel_video_pipeline_release ./scripts/publish_github_re
 只打包不上传：
 
 ```bash
-python3 scripts/build_release_package.py --repo 1951779219/novel_video_pipeline_release
+python3 scripts/build_release_package.py --repo 1951779219/novel_video_pipeline_mac_release
 ```
 
 输出：
@@ -64,7 +64,7 @@ dist/latest.json
 ```json
 {
   "version": "1.0.19-mac-update",
-  "url": "https://github.com/1951779219/novel_video_pipeline_release/releases/download/v1.0.19-mac-update/novel_video_pipeline_mac_1.0.19-mac-update_20260709.zip",
+  "url": "https://github.com/1951779219/novel_video_pipeline_mac_release/releases/download/v1.0.19-mac-update/novel_video_pipeline_mac_1.0.19-mac-update_20260709.zip",
   "sha256": "...",
   "notes": "发布说明",
   "mandatory": false
@@ -136,7 +136,7 @@ data/updates/apply_update_<version>_<time>.log
 ```bash
 python3 -m py_compile app/config.py app/gui.py app/updater.py app/update_tab.py scripts/apply_update.py scripts/build_release_package.py
 python3 -m compileall app
-python3 scripts/build_release_package.py --repo 1951779219/novel_video_pipeline_release
+python3 scripts/build_release_package.py --repo 1951779219/novel_video_pipeline_mac_release
 ```
 
 检查包内是否泄露密钥：

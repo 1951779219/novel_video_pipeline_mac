@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-RELEASE_REPO="${RELEASE_REPO:-1951779219/novel_video_pipeline_release}"
+RELEASE_REPO="${RELEASE_REPO:-1951779219/novel_video_pipeline_mac_release}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 if ! command -v gh >/dev/null 2>&1; then

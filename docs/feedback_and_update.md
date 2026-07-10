@@ -4,8 +4,8 @@
 
 | 仓库 | 可见性 | 用途 |
 | --- | --- | --- |
-| `1951779219/novel_video_pipeline_mac` | Private | 源码、发布 workflow |
-| `1951779219/novel_video_pipeline_release` | Public | `latest.json` 和更新包 |
+| `1951779219/novel_video_pipeline` | Private | 源码、发布 workflow |
+| `1951779219/novel_video_pipeline_mac_release` | Public | `latest.json` 和更新包 |
 | `1951779219/novel_video_pipeline_feedback` | Public | 用户提交 BUG、建议和问题 |
 
 用户反馈入口：

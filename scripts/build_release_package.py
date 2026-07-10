@@ -176,7 +176,7 @@ def build_asset_url(repo: str, tag: str, zip_name: str, explicit: str = "") -> s
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build scrubbed release package and latest.json.")
     parser.add_argument("--output-dir", default=str(DIST))
-    parser.add_argument("--repo", default="1951779219/novel_video_pipeline_release", help="GitHub release repo owner/name")
+    parser.add_argument("--repo", default="1951779219/novel_video_pipeline_mac_release", help="GitHub release repo owner/name")
     parser.add_argument("--asset-url", default="", help="Explicit package download URL")
     parser.add_argument("--notes", default="", help="Release notes for latest.json")
     parser.add_argument("--notes-file", default="", help="Release notes file")
