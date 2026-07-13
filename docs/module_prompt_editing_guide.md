@@ -37,7 +37,7 @@
 
 ## 统一 AI 接口
 
-GUI 的“图片与提示词”区域顶部有一组统一接口字段：
+GUI 的“API 设置与 Key”区域顶部有一组统一接口字段，并在同一区域集中管理 TTS、分镜、图片、人设图、剧情参考图和封面的 Provider、Base URL、API Key 与模型：
 
 - `ai_api_enabled`：开启后，文本生成和 OpenAI 兼容生图默认共用统一接口。
 - `ai_api_base_url`：统一 Base URL/中转地址，例如 `https://你的中转站/v1`。
@@ -45,7 +45,11 @@ GUI 的“图片与提示词”区域顶部有一组统一接口字段：
 - `ai_api_text_model`：洗稿、短标题、人设分析、分镜提示词、封面分析使用的文本模型。
 - `ai_api_image_model`：剧情图、封面、人设图、剧情参考图使用的图片模型。
 
+GUI 中所有 API Key 默认用黑点遮挡；可通过输入框右侧的小眼睛临时显示/隐藏，或点击“复制”直接复制完整 Key。
+
 模块自己的 `llm_base_url` / `llm_api_key` / `image_base_url` / `image_api_key` 等字段仍保留，用于高级覆盖或本地服务。普通分包机建议只填统一接口，图片 Provider 选择 `openai` 或 `custom`，封面/人设/剧情参考保持 `same_as_image` 即可。
+
+各业务分组仍保留对应的模型输入框。如果它与“API 设置与 Key”里的同名模型填写不同，保存配置时 GUI 会要求选择最终使用的模型，然后同步两处。
 
 ## OpenAI / gpt-image-2 是否需要 workflow
 

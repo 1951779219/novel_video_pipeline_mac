@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.23-mac-update
+
+- Added a centralized “API Settings & Keys” section with masked secret fields, visibility toggles, and copy controls, while keeping model fields mirrored in their business sections.
+- Made the unified image API the authoritative route for scene, cover, character-reference, and scene-reference generation whenever it is enabled.
+- Added route-, model-, prompt-, size-, and reference-aware image cache metadata so stale images are regenerated after meaningful configuration changes.
+- Stop composition with a retryable error when image generation fails instead of silently completing a color-placeholder video.
+
 ## v1.0.22-mac-update
 
 - Added TXT + prepared MP3 import in the desktop GUI, allowing an existing TTS narration and its source text to bypass speech generation and continue through image planning, image generation, subtitles, cover creation, and final video composition.

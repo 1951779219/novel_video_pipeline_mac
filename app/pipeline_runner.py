@@ -115,13 +115,17 @@ def _can_call_text_llm() -> bool:
     return bool(route["api_key"]) or route["provider"] in {"ollama", "custom"}
 
 
-def _apply_unified_image_api(provider: str, base_url: str, api_key: str, model: str) -> tuple[str, str, str]:
+def _apply_unified_image_api(provider: str, base_url: str, api_key: str, model: str) -> tuple[str, str, str, str]:
     provider = str(provider or "").strip().lower()
-    if _unified_ai_enabled() and provider in {"openai", "custom"}:
+    if _unified_ai_enabled():
+        # The unified image API is the master route while enabled.  Force every
+        # image role through its OpenAI-compatible endpoint instead of allowing
+        # a stale per-role provider (for example Replicate) to bypass it.
+        provider = "openai"
         base_url = str(config.get("ai_api_base_url", "") or base_url or "").strip()
         api_key = str(config.get("ai_api_key", "") or api_key or "").strip()
         model = str(config.get("ai_api_image_model", "") or model or "").strip()
-    return base_url, api_key, model
+    return provider, base_url, api_key, model
 
 
 def _noop(*_args, **_kwargs):
@@ -2225,7 +2229,7 @@ def _image_route_settings(role: str) -> dict:
 
     if role == "scene":
         provider = str(config.image_provider or "placeholder")
-        base_url, api_key, model = _apply_unified_image_api(
+        provider, base_url, api_key, model = _apply_unified_image_api(
             provider,
             str(config.image_base_url or ""),
             str(config.image_api_key or ""),
@@ -2243,7 +2247,7 @@ def _image_route_settings(role: str) -> dict:
         provider = str(config.get("cover_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
             return _image_route_settings("scene")
-        base_url, api_key, model = _apply_unified_image_api(
+        provider, base_url, api_key, model = _apply_unified_image_api(
             provider,
             str(config.get("cover_base_url", "") or config.image_base_url or ""),
             str(config.get("cover_api_key", "") or config.image_api_key or ""),
@@ -2261,7 +2265,7 @@ def _image_route_settings(role: str) -> dict:
         provider = str(config.get("character_reference_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
             return _image_route_settings("scene")
-        base_url, api_key, model = _apply_unified_image_api(
+        provider, base_url, api_key, model = _apply_unified_image_api(
             provider,
             str(config.get("character_reference_base_url", "") or config.image_base_url or ""),
             str(config.get("character_reference_api_key", "") or config.image_api_key or ""),
@@ -2279,7 +2283,7 @@ def _image_route_settings(role: str) -> dict:
         provider = str(config.get("scene_reference_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
             return _image_route_settings("scene")
-        base_url, api_key, model = _apply_unified_image_api(
+        provider, base_url, api_key, model = _apply_unified_image_api(
             provider,
             str(config.get("scene_reference_base_url", "") or config.image_base_url or ""),
             str(config.get("scene_reference_api_key", "") or config.image_api_key or ""),
@@ -2473,6 +2477,43 @@ def _is_image_policy_error(exc: Exception) -> bool:
     )
 
 
+def _image_cache_metadata_path(image_path: Path) -> Path:
+    return image_path.with_suffix(image_path.suffix + ".cache.json")
+
+
+def _image_cache_key(
+    *,
+    route: dict,
+    prompt: str,
+    negative_prompt: str,
+    width: int,
+    height: int,
+    reference_paths: list[Path],
+) -> str:
+    """Fingerprint everything that affects a generated scene image.
+
+    API keys are intentionally excluded: rotating credentials should not throw
+    away a previously successful image, while provider/endpoint/model changes
+    must never reuse an image produced by a different backend.
+    """
+    return _stable_hash(
+        {
+            "schema": 1,
+            "provider": str(route.get("provider") or "").strip().lower(),
+            "base_url": str(route.get("base_url") or "").strip().rstrip("/"),
+            "model": str(route.get("model") or "").strip(),
+            "prompt_hash": _text_hash(prompt),
+            "negative_prompt_hash": _text_hash(negative_prompt),
+            "width": int(width),
+            "height": int(height),
+            "references": [
+                {"path": str(path), "signature": _file_signature(path)}
+                for path in reference_paths
+            ],
+        }
+    )
+
+
 def stage_storyboard_and_image(
     plans: list[ImagePlan],
     job_dir: Path,
@@ -2565,10 +2606,41 @@ def stage_storyboard_and_image(
             "character_context": character_context,
             "reference_images": [str(p) for p in reference_paths],
         }
-        if not out.exists() or out.stat().st_size < 100:
+        cache_path = _image_cache_metadata_path(out)
+        generation_route = (
+            scene_reference_route
+            if reference_paths and scene_route["provider"] != "placeholder"
+            else scene_route
+        )
+        cache_key = _image_cache_key(
+            route=generation_route,
+            prompt=prompt,
+            negative_prompt=str(config.llm_negative_prompt or ""),
+            width=config.image_width,
+            height=config.image_height,
+            reference_paths=reference_paths,
+        )
+        cache_meta = _read_json(cache_path, {})
+        expected_status = "placeholder" if generation_route["provider"] == "placeholder" else "success"
+        reusable = (
+            out.exists()
+            and out.stat().st_size >= 100
+            and isinstance(cache_meta, dict)
+            and cache_meta.get("status") == expected_status
+            and cache_meta.get("cache_key") == cache_key
+        )
+        if not reusable:
+            if out.exists():
+                reason = "missing/invalid metadata" if not cache_meta else "route, prompt, or source changed"
+                on_log(f"  image {i + 1}/{len(plans)} invalidate cached file: {reason}")
+            out.unlink(missing_ok=True)
+            cache_path.unlink(missing_ok=True)
             last_exc: Exception | None = None
             for attempt in range(1, 3):
                 try:
+                    # A backend may create a partial output before raising.  It
+                    # must not survive into the next attempt or a resumed job.
+                    out.unlink(missing_ok=True)
                     on_log(
                         f"  image {i + 1}/{len(plans)} call provider={scene_route['provider']} "
                         f"base={scene_route.get('base_url') or '-'} model={scene_route.get('model') or '-'} "
@@ -2615,20 +2687,43 @@ def stage_storyboard_and_image(
                                     width=config.image_width,
                                     height=config.image_height,
                                 )
+                    if not out.exists() or out.stat().st_size < 100:
+                        raise RuntimeError("image backend returned no valid output file")
+                    _write_json(
+                        cache_path,
+                        {
+                            "schema": 1,
+                            "status": expected_status,
+                            "cache_key": cache_key,
+                            "provider": generation_route["provider"],
+                            "base_url": generation_route.get("base_url", ""),
+                            "model": generation_route.get("model", ""),
+                            "file": _file_signature(out),
+                        },
+                    )
                     break
                 except Exception as exc:
                     last_exc = exc
+                    out.unlink(missing_ok=True)
                     on_log(f"  WARN 图{i} 生成失败 {attempt}/2: {exc}")
                     time.sleep(attempt)
             if not out.exists() or out.stat().st_size < 100:
-                on_log(f"  WARN 图{i} 改用占位图: {last_exc}")
-                make_image_backend("placeholder").generate(
-                    _policy_safe_image_prompt(prompt, fallback_text=plan.text),
-                    "",
-                    out,
-                    width=config.image_width,
-                    height=config.image_height,
+                error_text = redact_secret_text(last_exc or "unknown image generation failure", limit=800)
+                _write_json(
+                    cache_path,
+                    {
+                        "schema": 1,
+                        "status": "failed",
+                        "cache_key": cache_key,
+                        "provider": generation_route["provider"],
+                        "base_url": generation_route.get("base_url", ""),
+                        "model": generation_route.get("model", ""),
+                        "error": error_text,
+                    },
                 )
+                # Never silently turn an API failure into a completed color-
+                # screen video.  Leave a retryable failure marker and stop.
+                raise RuntimeError(f"图{i} 生成失败，已停止合成，重试时会重新请求 API：{error_text}")
         else:
             on_log(f"  image {i + 1}/{len(plans)} reuse cached file: {out}")
         return i, out, prompt
@@ -4050,6 +4145,10 @@ def _copy_prefetched_images(paths: list[Path], prefetch_dir: Path, job_dir: Path
         dst = img_dir / f"img_{i:05d}{suffix}"
         if src.resolve() != dst.resolve():
             shutil.copy2(src, dst)
+        src_cache = _image_cache_metadata_path(src)
+        dst_cache = _image_cache_metadata_path(dst)
+        if src_cache.exists() and src.resolve() != dst.resolve():
+            shutil.copy2(src_cache, dst_cache)
         final_paths.append(dst)
     prompts = prefetch_dir / "prompts.json"
     if prompts.exists():

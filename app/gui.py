@@ -417,6 +417,8 @@ class PipelineGUI:
         self.vars: dict[str, tk.Variable] = {}
         self.combo_widgets: dict[str, ttk.Combobox] = {}
         self._config_sections: dict[str, dict] = {}
+        self._model_mirrors: dict[str, dict] = {}
+        self._secret_widgets: dict[str, dict] = {}
 
         footer = ttk.Frame(parent)
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
@@ -503,6 +505,49 @@ class PipelineGUI:
             self.vars[key] = var
             return var
 
+        def secret_row(label: str, key: str, default=""):
+            line = ttk.Frame(section_parent)
+            line.pack(fill=tk.X, pady=3)
+            ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(config.get(key, default)))
+            entry = ttk.Entry(line, textvariable=var, show="●")
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            def toggle_visibility():
+                hidden = bool(entry.cget("show"))
+                entry.configure(show="" if hidden else "●")
+                eye_button.configure(text="🙈" if hidden else "👁")
+
+            def restore_copy_button():
+                try:
+                    copy_button.configure(text="复制")
+                except tk.TclError:
+                    pass
+
+            def copy_secret():
+                value = clean_api_key(var.get())
+                if not value:
+                    copy_button.configure(text="无内容")
+                    copy_button.after(1200, restore_copy_button)
+                    return
+                self.root.clipboard_clear()
+                self.root.clipboard_append(value)
+                copy_button.configure(text="已复制")
+                copy_button.after(1200, restore_copy_button)
+
+            eye_button = ttk.Button(line, text="👁", width=3, command=toggle_visibility)
+            eye_button.pack(side=tk.LEFT, padx=(5, 0))
+            copy_button = ttk.Button(line, text="复制", width=5, command=copy_secret)
+            copy_button.pack(side=tk.LEFT, padx=(5, 0))
+            self.vars[key] = var
+            self._secret_widgets[key] = {
+                "var": var,
+                "entry": entry,
+                "eye_button": eye_button,
+                "copy_button": copy_button,
+            }
+            return var
+
         def textrow(label: str, key: str, default="", height=3):
             line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
@@ -534,6 +579,36 @@ class PipelineGUI:
             self.combo_widgets[key] = widget
             return var
 
+        def api_model_combo(
+            label: str,
+            key: str,
+            section_title: str,
+            default="",
+            values: list[str] | None = None,
+        ):
+            var = model_combo(label, key, default, values)
+            self._model_mirrors[key] = {
+                "api_var": var,
+                "section_var": None,
+                "section_title": section_title,
+                "label": label,
+            }
+            return var
+
+        def section_model_combo(label: str, key: str, default="", values: list[str] | None = None):
+            line = ttk.Frame(section_parent)
+            line.pack(fill=tk.X, pady=3)
+            ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(config.get(key, default)))
+            widget = ttk.Combobox(line, textvariable=var, values=values or [], state="normal")
+            widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            mirror = self._model_mirrors.get(key)
+            if mirror is None:
+                raise KeyError(f"API model field must be created before section mirror: {key}")
+            mirror["section_var"] = var
+            mirror["section_widget"] = widget
+            return var
+
         def check(label: str, key: str):
             line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
@@ -548,6 +623,14 @@ class PipelineGUI:
             ttk.Label(line, text="", width=18).pack(side=tk.LEFT)
             for text, command in items:
                 ttk.Button(line, text=text, command=command).pack(side=tk.LEFT, padx=(0, 6))
+
+        def subheading(title: str, note: str = ""):
+            line = ttk.Frame(section_parent)
+            line.pack(fill=tk.X, pady=(10, 3))
+            ttk.Label(line, text=title, font=(UI_FONT, UI_FONT_SIZE, "bold")).pack(anchor=tk.W)
+            if note:
+                ttk.Label(line, text=note, foreground="#666", wraplength=520).pack(anchor=tk.W, pady=(2, 0))
+            ttk.Separator(section_parent).pack(fill=tk.X, pady=(0, 3))
 
         profile_box = ttk.LabelFrame(body, text="配置方案", padding=6)
         profile_box.pack(fill=tk.X, pady=(0, 8))
@@ -581,15 +664,109 @@ class PipelineGUI:
         row("依赖检测摘要", "dependency_last_report", "", width=48)
         buttons(("检测/安装依赖", self._manual_dependency_check), ("提交反馈", self._open_feedback_url))
 
+        section("API 设置与 Key")
+        ttk.Label(
+            section_parent,
+            text="集中管理所有接口、Key、Provider 和模型。各业务分组仍保留模型输入框；保存时若两处填写不同，会弹窗让你选择最终使用哪一个。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        subheading("统一 API", "开启后，文本分析和全部图片生成优先使用这套 OpenAI 兼容接口。")
+        check("统一 API 接管文本和全部图片", "ai_api_enabled")
+        row("统一 Base URL/中转", "ai_api_base_url", "")
+        secret_row("统一 API Key", "ai_api_key", "")
+        api_model_combo(
+            "统一文本模型",
+            "ai_api_text_model",
+            "图片与提示词",
+            "gpt-4o-mini",
+            ["gpt-4o-mini", "gpt-4o", "deepseek-chat"],
+        )
+        api_model_combo(
+            "统一图片模型",
+            "ai_api_image_model",
+            "图片与提示词",
+            "gpt-image-1",
+            ["gpt-image-1", "gpt-image-2", "dall-e-3"],
+        )
+        buttons(
+            ("检测统一文本 API", lambda: self._probe_api("unified_llm")),
+            ("检测统一图片 API", lambda: self._probe_api("unified_image")),
+        )
+
+        subheading("TTS")
+        combo("TTS Provider", "tts_provider", ["edge", "voicevox", "openai", "azure", "elevenlabs", "custom"], "edge")
+        row("TTS Base URL/中转", "tts_base_url", "")
+        secret_row("TTS API Key", "tts_api_key", "")
+        api_model_combo(
+            "TTS 模型名",
+            "tts_model",
+            "TTS",
+            "tts-1",
+            ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"],
+        )
+        buttons(("检测 TTS API / 识别模型", lambda: self._probe_api("tts")))
+
+        subheading("图片与提示词")
+        row("分镜 LLM Provider", "llm_provider", "openai")
+        row("分镜 Base URL/中转(可空=统一)", "llm_base_url", "")
+        secret_row("分镜 API Key(可空=统一)", "llm_api_key", "")
+        api_model_combo(
+            "分镜模型",
+            "llm_model",
+            "图片与提示词",
+            "gpt-4o-mini",
+            ["gpt-4o-mini", "gpt-4o", "deepseek-chat"],
+        )
+        combo("图片 Provider", "image_provider", ["placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "placeholder")
+        row("图片 Base URL/中转(可空=统一)", "image_base_url", "")
+        secret_row("图片 API Key(可空=统一)", "image_api_key", "")
+        api_model_combo("图片模型名", "image_model", "图片与提示词", "", ["gpt-image-1", "dall-e-3"])
+        row("图片 API 超时秒", "image_api_timeout_seconds", "300")
+        combo("人设图 Provider", "character_reference_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
+        row("人设图 Base URL/中转(可空=统一)", "character_reference_base_url", "")
+        secret_row("人设图 API Key(可空=统一)", "character_reference_api_key", "")
+        api_model_combo(
+            "人设图模型名",
+            "character_reference_model",
+            "图片与提示词",
+            "",
+            ["gpt-image-1", "dall-e-3", "flux", "sdxl"],
+        )
+        combo("剧情参考 Provider", "scene_reference_provider", ["same_as_image", "comfyui", "sdwebui", "openai", "custom"], "same_as_image")
+        row("剧情参考 Base URL/中转(可空=统一)", "scene_reference_base_url", "")
+        secret_row("剧情参考 API Key(可空=统一)", "scene_reference_api_key", "")
+        api_model_combo(
+            "剧情参考模型名",
+            "scene_reference_model",
+            "图片与提示词",
+            "",
+            ["gpt-image-1", "dall-e-3", "flux", "sdxl"],
+        )
+        buttons(
+            ("检测分镜 LLM", lambda: self._probe_api("llm")),
+            ("检测图片 API", lambda: self._probe_api("image")),
+            ("检测人设图 API", lambda: self._probe_api("character_reference")),
+            ("检测剧情参考 API", lambda: self._probe_api("scene_reference")),
+        )
+
+        subheading("封面")
+        combo("封面 Provider", "cover_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
+        row("封面 Base URL/中转(可空=统一)", "cover_base_url", "")
+        secret_row("封面 API Key(可空=统一)", "cover_api_key", "")
+        api_model_combo("封面模型名", "cover_model", "封面", "", ["gpt-image-1", "dall-e-3"])
+        buttons(("检测封面 API", lambda: self._probe_api("cover")))
+
+        subheading("批量与上传")
+        row("外部 API 并发", "max_concurrent_external_api", "2")
+
         section("TTS")
-        combo("Provider", "tts_provider", ["edge", "voicevox", "openai", "azure", "elevenlabs", "custom"], "edge")
         combo("常用音色", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
         row("语速", "tts_rate", "+0%")
         row("音量倍率", "tts_volume", "1.0")
-        model_combo("TTS 模型名", "tts_model", "tts-1", ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"])
+        section_model_combo("TTS 模型名", "tts_model", "tts-1", ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"])
         row("情感/指令", "tts_emotion", "")
-        row("TTS Base URL/中转", "tts_base_url", "")
-        row("TTS API Key", "tts_api_key", "")
         row("TTS 重试次数", "tts_retries", "3")
         row("TTS 单段超时秒", "tts_segment_timeout_seconds", "180")
         row("TTS 卡段提示秒", "tts_stall_fallback_seconds", "240")
@@ -599,18 +776,15 @@ class PipelineGUI:
         row("TTS 最低 RMS dB", "tts_waveform_min_rms_db", "-55")
         row("TTS 最大静音比例", "tts_waveform_max_silence_ratio", "0.92")
         check("TTS 子进程隔离", "tts_subprocess_isolation")
-        buttons(("检测 TTS API / 识别模型", lambda: self._probe_api("tts")))
 
         section("图片与提示词")
-        check("文本/生图共用统一 API", "ai_api_enabled")
-        row("统一 Base URL/中转", "ai_api_base_url", "")
-        row("统一 API Key", "ai_api_key", "")
-        model_combo("统一文本模型", "ai_api_text_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
-        model_combo("统一图片模型", "ai_api_image_model", "gpt-image-1", ["gpt-image-1", "gpt-image-2", "dall-e-3"])
-        buttons(
-            ("检测统一文本 API", lambda: self._probe_api("unified_llm")),
-            ("检测统一图片 API", lambda: self._probe_api("unified_image")),
-        )
+        subheading("模型输入", "这些模型也可以在“API 设置与 Key”中填写；保存时会检查两处是否一致。")
+        section_model_combo("统一文本模型", "ai_api_text_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
+        section_model_combo("统一图片模型", "ai_api_image_model", "gpt-image-1", ["gpt-image-1", "gpt-image-2", "dall-e-3"])
+        section_model_combo("分镜模型", "llm_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
+        section_model_combo("图片模型名", "image_model", "", ["gpt-image-1", "dall-e-3"])
+        section_model_combo("人设图模型名", "character_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
+        section_model_combo("剧情参考模型名", "scene_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
         check("AI 洗稿改写", "ai_rewrite_enabled")
         row("洗稿批大小", "ai_rewrite_batch_chars", "3500")
         textrow("洗稿提示词", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
@@ -623,27 +797,14 @@ class PipelineGUI:
         check("剧情图注入视觉主题", "scene_inject_visual_theme")
         check("剧情图注入人物锁", "scene_inject_character_triggers")
         check("生成人设参考图", "character_reference_enabled")
-        combo("人设图 Provider", "character_reference_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
-        row("人设图 Base URL/中转(可空=统一)", "character_reference_base_url", "")
-        row("人设图 API Key(可空=统一)", "character_reference_api_key", "")
-        model_combo("人设图模型名", "character_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
         row("人设图 workflow(仅 ComfyUI)", "character_reference_workflow", "")
         row("人设图宽", "character_reference_width", "768")
         row("人设图高", "character_reference_height", "1024")
         row("最多人设图", "character_reference_max_count", "6")
         row("人设图提示词后缀", "character_reference_prompt_suffix", "")
         check("剧情图使用人设参考图", "scene_reference_enabled")
-        combo("剧情参考 Provider", "scene_reference_provider", ["same_as_image", "comfyui", "sdwebui", "openai", "custom"], "same_as_image")
-        row("剧情参考 Base URL/中转(可空=统一)", "scene_reference_base_url", "")
-        row("剧情参考 API Key(可空=统一)", "scene_reference_api_key", "")
-        model_combo("剧情参考模型名", "scene_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
         row("剧情参考 workflow(仅 ComfyUI)", "scene_reference_workflow", "")
         row("剧情参考最大图数", "scene_reference_max_images", "2")
-        combo("图片 Provider", "image_provider", ["placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "placeholder")
-        row("图片 Base URL/中转(可空=统一)", "image_base_url", "")
-        row("图片 API Key(可空=统一)", "image_api_key", "")
-        model_combo("图片模型名", "image_model", "", ["gpt-image-1", "dall-e-3"])
-        row("图片 API 超时秒", "image_api_timeout_seconds", "300")
         textrow("视频图通用前缀", "llm_image_prompt_prefix", str(config.get("llm_image_prompt_prefix", "")), height=3)
         row("视频图风格后缀", "llm_image_style_suffix", "")
         textrow("视频图 AI 分析系统提示词", "llm_storyboard_prompt", str(config.get("llm_storyboard_prompt", "")), height=4)
@@ -652,24 +813,10 @@ class PipelineGUI:
         check("按高光旁白调整换图时间", "storyboard_highlight_align_timeline")
         row("全篇背景分析最大字数", "storyboard_highlight_context_max_chars", "18000")
         row("每图高光最多连续段数", "storyboard_highlight_max_segments", "3")
-        row("分镜 LLM Provider", "llm_provider", "openai")
-        model_combo("分镜模型", "llm_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
-        row("分镜 Base URL/中转(可空=统一)", "llm_base_url", "")
-        row("分镜 API Key(可空=统一)", "llm_api_key", "")
-        buttons(
-            ("检测分镜 LLM", lambda: self._probe_api("llm")),
-            ("检测图片 API", lambda: self._probe_api("image")),
-            ("检测人设图 API", lambda: self._probe_api("character_reference")),
-            ("检测剧情参考 API", lambda: self._probe_api("scene_reference")),
-        )
 
         section("封面")
         check("自动生成封面", "cover_enabled")
-        combo("封面 Provider", "cover_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
-        row("封面 Base URL/中转(可空=统一)", "cover_base_url", "")
-        row("封面 API Key(可空=统一)", "cover_api_key", "")
-        model_combo("封面模型名", "cover_model", "", ["gpt-image-1", "dall-e-3"])
-        buttons(("检测封面 API", lambda: self._probe_api("cover")))
+        section_model_combo("封面模型名", "cover_model", "", ["gpt-image-1", "dall-e-3"])
         row("封面宽", "cover_width", "1280")
         row("封面高", "cover_height", "720")
         textrow("封面固定模板", "cover_prompt_template", str(config.get("cover_prompt_template", "")), height=5)
@@ -718,7 +865,6 @@ class PipelineGUI:
         row("硬件检测摘要", "hardware_autotune_summary", "", width=48)
         buttons(("检测电脑并自动配置并发", self._manual_hardware_autotune))
         row("同时任务数", "max_concurrent_jobs", "1")
-        row("外部 API 并发", "max_concurrent_external_api", "2")
         row("FFmpeg 并发", "max_concurrent_ffmpeg", "1")
         row("TTS 并行数", "max_parallel_tts", "2")
         row("图片并行数", "max_parallel_images", "2")
@@ -760,6 +906,44 @@ class PipelineGUI:
         bind_config_mousewheel(canvas)
         bind_config_mousewheel(scroll)
         self._config_canvas = canvas
+
+    def _resolve_model_mirror_conflicts(self):
+        """Choose one value when the central API model and section copy differ."""
+        for key, mirror in getattr(self, "_model_mirrors", {}).items():
+            api_var = mirror.get("api_var")
+            section_var = mirror.get("section_var")
+            if api_var is None or section_var is None:
+                continue
+            api_value = str(api_var.get() or "").strip()
+            section_value = str(section_var.get() or "").strip()
+            if api_value == section_value:
+                api_var.set(api_value)
+                section_var.set(section_value)
+                continue
+
+            # An empty field is treated as "not filled" and inherits the value
+            # from the other location. Only two actual, different model names
+            # require an explicit decision.
+            if not api_value:
+                chosen = section_value
+            elif not section_value:
+                chosen = api_value
+            else:
+                section_title = str(mirror.get("section_title") or "原配置分组")
+                label = str(mirror.get("label") or key)
+                use_api_value = messagebox.askyesno(
+                    "模型设置不一致",
+                    f"检测到“{label}”在两处填写得不一样：\n\n"
+                    f"API 设置与 Key：{api_value}\n"
+                    f"{section_title}：{section_value}\n\n"
+                    f"选择“是”使用 API 设置中的模型；\n"
+                    f"选择“否”使用 {section_title} 中的模型。",
+                    icon="warning",
+                    parent=self.root,
+                )
+                chosen = api_value if use_api_value else section_value
+            api_var.set(chosen)
+            section_var.set(chosen)
 
     def _config_key_sets(self):
         int_keys = {
@@ -803,6 +987,7 @@ class PipelineGUI:
         return int_keys, float_keys, bool_keys
 
     def _apply_config_form(self, save_profile: bool = True) -> str:
+        self._resolve_model_mirror_conflicts()
         int_keys, float_keys, bool_keys = self._config_key_sets()
         for key, var in self.vars.items():
             value = var.get()
@@ -867,6 +1052,10 @@ class PipelineGUI:
                 var.set("开启" if bool(value) else "关闭")
             else:
                 var.set(str(value))
+        for key, mirror in getattr(self, "_model_mirrors", {}).items():
+            section_var = mirror.get("section_var")
+            if section_var is not None:
+                section_var.set(str(config.get(key, "")))
 
     def _ui_value(self, key: str, default: str = "") -> str:
         var = self.vars.get(key)
@@ -924,9 +1113,11 @@ class PipelineGUI:
             api_key = api_key or self._ui_value("image_api_key")
             model = model or self._ui_value("image_model")
 
-        if force_unified and str(provider).lower() not in {"openai", "custom"}:
+        if force_unified or self._ui_unified_api_enabled():
+            # Keep probes on the exact same route as real generation: when the
+            # unified switch is on, scene, cover and reference images all use
+            # the OpenAI-compatible unified endpoint.
             provider = "openai"
-        if (force_unified or self._ui_unified_api_enabled()) and str(provider).lower() in {"openai", "custom"}:
             base_url = self._ui_value("ai_api_base_url") or base_url
             api_key = self._ui_value("ai_api_key") or api_key
             model = self._ui_value("ai_api_image_model") or model
