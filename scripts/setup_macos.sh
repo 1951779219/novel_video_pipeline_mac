@@ -69,15 +69,15 @@ install_homebrew_runtime() {
     return 1
   fi
   echo "[setup] Homebrew found: $brew_bin"
-  echo "[setup] installing Python/Tk/FFmpeg with Homebrew..."
+  echo "[setup] installing Python/Tk/FFmpeg Full with libass..."
   "$brew_bin" update || true
-  if "$brew_bin" install python@3.12 python-tk@3.12 ffmpeg; then
+  if "$brew_bin" install python@3.12 python-tk@3.12 ffmpeg-full; then
     return 0
   fi
-  if "$brew_bin" install python@3.11 python-tk@3.11 ffmpeg; then
+  if "$brew_bin" install python@3.11 python-tk@3.11 ffmpeg-full; then
     return 0
   fi
-  "$brew_bin" install python python-tk ffmpeg
+  "$brew_bin" install python python-tk ffmpeg-full
 }
 
 if ! PYTHON_BIN="$(select_python)"; then
@@ -99,7 +99,7 @@ On macOS 26/Tahoe, Apple/Xcode system Python may crash with:
   macOS 26 (...) or later required, have instead 16 (...) !
 
 If Homebrew is installed, run:
-  brew install python@3.12 python-tk@3.12 ffmpeg
+  brew install python@3.12 python-tk@3.12 ffmpeg-full
 
 If Homebrew is not installed, install it first:
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
@@ -127,12 +127,12 @@ if [ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && \
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "FFmpeg was not found. Install it with: brew install ffmpeg"
+  echo "FFmpeg was not found. Install it with: brew install ffmpeg-full"
   exit 2
 fi
 
 if ! command -v ffprobe >/dev/null 2>&1; then
-  echo "ffprobe was not found. The app can use ffmpeg fallback for duration checks, but brew install ffmpeg is still recommended."
+  echo "ffprobe was not found. The app can use ffmpeg fallback for duration checks, but brew install ffmpeg-full is still recommended."
 fi
 
 python -m app.dependency_manager --ensure

@@ -8,6 +8,7 @@
 - 阅读/Legado 兼容：提供 `legado_static` 轻量解析器，可导入普通静态 JSON 书源；复杂 `<js>` 书源由专用聚合引擎处理。
 - 长视频稳定性：后台任务、`status.json`、`log.txt`、已有音频/图片复用、长视频 ffmpeg 单次图片清单合成、内嵌 ASS + 外置 SRT 字幕。
 - 人设与剧情图提示词：导入 v1.0.18 的人设分析、视觉主题锁、剧情图人物锁和可选参考图链路；生成任务会写入 `character_profiles.json`、`character_reference_manifest.json` 和带 `character_context` / `theme_context` 的 `prompts.json`。
+- 视频生图解决方案1：保留“每张图秒数”控制的图片预算，不增加出图数量；先分析全篇稳定背景，再从每个旁白预算窗口选择一个完整高光事件生图，并可按高光所在旁白位置调整换图时间。
 
 ## 文档入口
 
@@ -83,7 +84,7 @@ zsh: abort
 新版 `Install_Mac_Dependencies.command` 也可以在没有 Homebrew 时直接询问并运行官方 Homebrew 安装器。Homebrew 安装完成后，它会继续安装 GUI 需要的 Python/Tk/FFmpeg。也可以手动运行：
 
 ```bash
-brew install python@3.12 python-tk@3.12 ffmpeg
+brew install python@3.12 python-tk@3.12 ffmpeg-full
 ```
 
 也可以指定 Python.org 安装版：
@@ -273,22 +274,84 @@ d:短剧名@番茄
 
 长视频模式不会为每张图生成单独 mp4 片段，而是用 concat 图片清单一次性合成，减少临时文件数量和崩溃概率。
 
+## 导入已生成的 MP3（跳过 TTS）
+
+桌面 GUI 的输入区提供两种入口：
+
+- `粘贴文本+MP3`：先在文本框粘贴生成该音频时使用的原文，再选择完整 MP3。
+- `导入正文 TXT + MP3（跳过TTS）`：在同一个文件窗口中同时选中 1 份原文 TXT 和 1 份完整 MP3（macOS 可按住 Command 再点击两个文件）。
+
+这类任务会保留原文，跳过标题清理、AI 洗稿和 TTS，直接继续画面规划、生图、字幕、封面和视频合成。MP3 会复制到任务目录，之后移动或删除原 MP3 不会影响续跑。任务列表的“音频来源”会显示“导入 MP3”。
+导入 MP3 的任务不会附加日语读音词典，因为它不再调用 TTS。
+
+导入单条完整 MP3 时没有逐句时间戳，因此程序会按每个文本切片的长度估算字幕和换图时间，并保证总时长与 MP3 严格一致。若朗读速度起伏很大，局部字幕可能会有偏差。估算结果保存在 `imported_audio_timing.json`。
+
+## 日语 Edge TTS 读音词典
+
+桌面 GUI 的输入区域可以选择一份日语读音词典 TXT。选中词典后，新加入的粘贴文本、TXT 文件或小说搜索任务会自动附加该词典。若任务队列中已有选中的任务，选择词典时会立即附加；启动任务前还会再次检查当前词典。任务列表的“读音词典”列会显示“已附加 N条”，不要在显示“未附加”时开始长任务。
+
+词典使用 UTF-8 文本，一行一条，半角 `=` 和全角 `＝` 都支持：
+
+```text
+# 人名、地名和专有名词
+三国志演義=さんごくしえんぎ
+黄巾の乱=こうきんのらん
+秦の始皇帝=しんのしこうてい
+始皇帝=しこうてい
+```
+
+空行以及以 `#`、`//` 开头的注释行会被忽略。同一个词不能在同一份词典中指定两个不同读音。匹配采用最长词优先，因此“秦の始皇帝”不会先被较短的“始皇帝”替换。
+
+词典只在 Provider 为 `edge` 时修改送入 TTS 的临时朗读文本。`segments.json`、字幕、标题、图片提示词和正文仍保留原来的汉字。任务内部会保存词典副本以及 `audio/tts_pronunciation_preview.json`，方便核对实际替换结果；它们不会写入最终视频或上传内容。给已有任务更换词典时，GUI 会重置其旧 TTS 段和受音频时长影响的下游缓存。
+
+### 批量导入正文和词典
+
+点击“批量导入正文+词典”，可以在一个文件选择窗口中混合选择多篇正文和对应词典。最稳妥的命名规范是：
+
+```text
+作品名_正文.txt
+作品名_读音词典.txt
+```
+
+也支持正文不带后缀：
+
+```text
+作品名.txt
+作品名_读音词典.txt
+```
+
+程序会识别 `读音词典`、`詞典`、`TTS読み方辞書`、`dictionary` 等词典后缀，并在配对时忽略正文侧的 `正文`、`原文`、`本文`、`最终文本`、`日语`、`日本語` 等尾缀。例如下面这组现有命名也能自动配对：
+
+```text
+三国志演義第一话日语_最终文本.txt
+三国志演義第一话_TTS読み方辞書.txt
+```
+
+配对采用“去掉这些后缀后的作品名完全一致”规则，不使用容易配错的模糊匹配。匹配到唯一词典的正文会自动附加词典；正文没有对应词典、词典格式无效或存在多个同名词典时，正文仍会按普通方式建立任务，只是不附加词典。没有对应正文的词典会忽略并在导入结果中列出。若选中的文件中完全没有词典，则维持普通多篇 TXT 导入方式。
+
 ## 续跑与排错
 
 每次完整流水线会生成：
 
 ```text
-data/jobs/{job_id}/
+data/jobs/{输入文件名}/
   status.json
   log.txt
   novel.json
   segments.json
+  imported_audio.json               # 可选，导入 MP3 的任务才有
+  imported_audio_timing.json        # 可选，导入 MP3 的估算时间轴
+  audio/imported_narration.mp3      # 可选，导入后复制的完整音频
+  tts_pronunciation_dictionary.txt  # 可选，仅供任务内部 TTS 使用
   durations.json
   prompts.json
   subtitle.ass
   subtitle.srt
-  final.mp4
+  {输入文件名}.mp4
 ```
+
+从 GUI 导入 TXT 时，工程目录和最终视频会沿用输入文件名（不含 `.txt`）。如果已经存在同名工程，
+新工程目录会自动添加 `_2`、`_3`，不会覆盖旧工程；目录内的视频仍保留原输入文件名。
 
 如果任务中断，在“完整流水线”里填入同一个 `job_id` 到“续跑 job_id”，再次启动即可。已有音频和图片会自动复用。
 
@@ -321,7 +384,7 @@ data/jobs/
 - `data/runtime/locks/` 提供跨进程资源锁，默认普通电脑只允许 1 个 FFmpeg 任务并发，外部 API 默认 2 路，避免多任务抢满 CPU、内存和接口额度。
 - `data/jobs/{job_id}/audio/tts_manifest.json` 记录每段 TTS 的文本 hash、配置 hash、文件指纹和状态，续跑时优先复用已完成音频。
 - TTS 卡在单段时，GUI 可先停止选中任务，再用“重试TTS段...”重置指定 `seg` 或失败/卡住/波形异常段；也可用“TTS卡段重试推进”重置未完成段并自动重新启动任务。
-- `data/jobs/{job_id}/compose_manifest.json` 记录音频拼接和最终合成输入 hash，合成失败不会覆盖已有 `final.mp4`。
+- `data/jobs/{job_id}/compose_manifest.json` 记录音频拼接和最终合成输入 hash，合成失败不会覆盖已有的最终视频。
 
 普通配置电脑建议保持：
 
@@ -335,7 +398,7 @@ Ken Burns = disabled for very long videos
 FFmpeg 会按顺序查找：`MEDIA_FFMPEG_BIN` / `MEDIA_FFPROBE_BIN` 环境变量、系统 PATH、macOS 常见 Homebrew/本地路径、项目内 `runtime/ffmpeg`、`tools/ffmpeg`、`tools/ffmpeg/bin`、`vendor/ffmpeg`，最后才兼容旧的 `F:\Manao\drama_pipeline_release\tools\ffmpeg`。Windows 发包时把 `ffmpeg.exe` 和 `ffprobe.exe` 放进上述任一项目内目录即可；macOS 建议安装：
 
 ```bash
-brew install ffmpeg
+brew install ffmpeg-full
 ```
 
 如果只有 `ffmpeg` 没有 `ffprobe`，本版本会用 `ffmpeg -i` 回退读取音频时长，但完整安装仍更稳。

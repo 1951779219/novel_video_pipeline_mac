@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.22-mac-update
+
+- Added TXT + prepared MP3 import in the desktop GUI, allowing an existing TTS narration and its source text to bypass speech generation and continue through image planning, image generation, subtitles, cover creation, and final video composition.
+- Copies imported narration into the job and estimates subtitle/image timing against the complete MP3 duration so the task can be resumed safely after the original files move.
+- Hardened release packaging so it generates clean default settings and a generic profile without reading or publishing local user configuration.
+
 ## v1.0.18
 
 - Added automatic story and character analysis that writes per-job `character_profiles.json` with protagonists, supporting roles, fixed visual profiles, triggers, and task-level visual theme.

@@ -20,7 +20,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 17
+SETTINGS_SCHEMA_VERSION = 18
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
 DEFAULT_YOUTUBE_DESCRIPTION = (
     "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
@@ -101,6 +101,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     ),
     "llm_image_style_suffix": "anime style, detailed, cinematic lighting, masterpiece",
     "llm_negative_prompt": "lowres, bad anatomy, bad hands, text, error, missing fingers, jpeg artifacts, watermark, logo, words, blood, gore, corpse, severed limbs, nudity, sexual content, explicit violence, weapon close-up",
+
+    # 视频生图解决方案1：把秒数作为图片数量预算，每个预算窗口只选择一个旁白高光点。
+    "storyboard_highlight_enabled": True,
+    "storyboard_highlight_context_max_chars": 18000,
+    "storyboard_highlight_max_segments": 3,
+    "storyboard_highlight_align_timeline": True,
 
     # Character / story visual consistency
     "character_analysis_enabled": True,
@@ -382,7 +388,7 @@ if sys.platform == "darwin":
     DEFAULT_SETTINGS.update(
         {
             "cover_title_font": "PingFang SC",
-            "video_subtitle_font": "PingFang SC",
+            "video_subtitle_font": "Hiragino Mincho ProN",
             "dependency_ffmpeg_url": "",
         }
     )
@@ -561,6 +567,14 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
         for key in API_KEY_FIELDS:
             if key in data:
                 data[key] = clean_api_key(data.get(key))
+    if saved_version < 18:
+        for key in (
+            "storyboard_highlight_enabled",
+            "storyboard_highlight_context_max_chars",
+            "storyboard_highlight_max_segments",
+            "storyboard_highlight_align_timeline",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 

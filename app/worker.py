@@ -16,6 +16,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     job_dir = pr.job_dir_for(args.job_id)
+    pr.record_worker_pid(args.job_id, os.getpid())
     pr.write_status(job_dir, job_id=args.job_id, worker_pid=os.getpid(), stage="worker_starting")
     pr.append_log(job_dir, f"== worker pid={os.getpid()} starting ==")
     try:
@@ -26,6 +27,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         pr.append_log(job_dir, f"== worker pid={os.getpid()} stopped ==")
+        pr.clear_worker_pid(args.job_id, os.getpid())
 
 
 if __name__ == "__main__":

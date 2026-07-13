@@ -30,7 +30,7 @@
 
 ## 多账号上传的工作方式
 
-打开 GUI 里的“上传全部启用方案”后，程序会按 `browser_profiles` JSON 的顺序逐个上传同一个 `final.mp4`。
+打开 GUI 里的“上传全部启用方案”后，程序会按 `browser_profiles` JSON 的顺序逐个上传同一个工程的最终视频。
 
 每个方案可以绑定一个独立的 `chrome_profile`。程序会把它映射到：
 

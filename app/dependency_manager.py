@@ -204,14 +204,20 @@ def install_python_requirements(requirements: list[PythonRequirement] | None, lo
 def ensure_ffmpeg(log: LogFn) -> DependencyStatus:
     status = check_ffmpeg()
     if status.ok:
+        if sys.platform == "darwin":
+            full_ffmpeg = _homebrew_ffmpeg_full_path("ffmpeg")
+            if full_ffmpeg and _ffmpeg_has_filter(full_ffmpeg, "ass"):
+                _write_ffmpeg_full_marker(full_ffmpeg)
         log(f"[依赖检测] FFmpeg 正常：{status.path}")
         return status
-    log("[依赖检测] 未找到可用 FFmpeg/FFprobe。")
+    log("[依赖检测] FFmpeg 缺失或不支持 ASS 硬字幕。")
     if not bool(config.get("dependency_auto_install_ffmpeg", True)):
         status.detail = "已关闭 FFmpeg 自动下载"
         return status
+    if sys.platform == "darwin":
+        return _ensure_macos_ffmpeg_full(log)
     if os.name != "nt":
-        status.detail = "macOS 请先运行 scripts/setup_macos.sh，或手动执行 brew install ffmpeg"
+        status.detail = "当前系统不支持自动安装 FFmpeg"
         return status
     try:
         _download_and_install_ffmpeg(log)
@@ -231,9 +237,12 @@ def check_ffmpeg() -> DependencyStatus:
     ffprobe = _resolve_executable("ffprobe")
     ffmpeg_ok = bool(ffmpeg and _exe_works(ffmpeg, ["-version"]))
     ffprobe_ok = bool(ffprobe and _exe_works(ffprobe, ["-version"]))
-    ok = bool(ffmpeg_ok and (ffprobe_ok or os.name != "nt"))
+    subtitle_ok = bool(ffmpeg_ok and (sys.platform != "darwin" or _ffmpeg_has_filter(ffmpeg, "ass")))
+    ok = bool(ffmpeg_ok and subtitle_ok and (ffprobe_ok or os.name != "nt"))
     if ffmpeg_ok and not ffprobe_ok and os.name != "nt":
         detail = "ffprobe missing; duration detection will use ffmpeg fallback"
+    elif ffmpeg_ok and sys.platform == "darwin" and not subtitle_ok:
+        detail = "FFmpeg lacks libass/ass subtitle filter"
     elif ok:
         detail = "ok"
     else:
@@ -243,7 +252,100 @@ def check_ffmpeg() -> DependencyStatus:
         ok=ok,
         detail=detail,
         path=str(ffmpeg or ""),
-        required="ffmpeg + ffprobe",
+        required="ffmpeg + ffprobe + libass" if sys.platform == "darwin" else "ffmpeg + ffprobe",
+    )
+
+
+def _ffmpeg_has_filter(path: Path | None, filter_name: str) -> bool:
+    if not path:
+        return False
+    proc = _run([str(path), "-hide_banner", "-filters"], timeout=30)
+    if proc.returncode != 0:
+        return False
+    pattern = re.compile(rf"^\s*[TSC\.]+\s+{re.escape(filter_name)}\s", re.MULTILINE)
+    return bool(pattern.search(proc.stdout or ""))
+
+
+def _ensure_macos_ffmpeg_full(log: LogFn) -> DependencyStatus:
+    brew = shutil.which("brew")
+    if not brew:
+        status = check_ffmpeg()
+        status.detail = "Homebrew 不可用，无法自动安装带 libass 的 ffmpeg-full"
+        log("[依赖检测] " + status.detail)
+        return status
+
+    full_ffmpeg = _homebrew_ffmpeg_full_path("ffmpeg")
+    if not full_ffmpeg or not _ffmpeg_has_filter(full_ffmpeg, "ass"):
+        log("[依赖检测] 正在一次性安装 ffmpeg-full（包含 libass），首次可能需要几分钟...")
+        env = dict(os.environ)
+        env.update(
+            {
+                "HOMEBREW_NO_AUTO_UPDATE": "1",
+                "HOMEBREW_NO_INSTALL_CLEANUP": "1",
+                "HOMEBREW_NO_ENV_HINTS": "1",
+                "HOMEBREW_NO_INTERACTIVE": "1",
+            }
+        )
+        proc = _run([brew, "install", "ffmpeg-full"], timeout=3600, env=env)
+        if proc.returncode != 0:
+            status = check_ffmpeg()
+            status.detail = "ffmpeg-full 自动安装失败：" + _tail(proc.stdout + "\n" + proc.stderr, 1800)
+            log("[依赖检测] " + status.detail)
+            return status
+        full_ffmpeg = _homebrew_ffmpeg_full_path("ffmpeg")
+
+    if full_ffmpeg and _ffmpeg_has_filter(full_ffmpeg, "ass"):
+        _link_macos_ffmpeg_full(brew, full_ffmpeg, log)
+        status = check_ffmpeg()
+        if status.ok:
+            _write_ffmpeg_full_marker(full_ffmpeg)
+            log(f"[依赖检测] ffmpeg-full/libass 已就绪：{full_ffmpeg}")
+        return status
+
+    status = check_ffmpeg()
+    status.detail = "ffmpeg-full 安装后仍未检测到 ass 字幕滤镜"
+    log("[依赖检测] " + status.detail)
+    return status
+
+
+def _homebrew_ffmpeg_full_path(name: str) -> Path | None:
+    for prefix in (Path("/opt/homebrew"), Path("/usr/local")):
+        candidate = prefix / "opt" / "ffmpeg-full" / "bin" / name
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _link_macos_ffmpeg_full(brew: str, full_ffmpeg: Path, log: LogFn) -> None:
+    current = shutil.which("ffmpeg")
+    try:
+        if current and Path(current).resolve() == full_ffmpeg.resolve():
+            return
+    except OSError:
+        pass
+    _run([brew, "unlink", "ffmpeg"], timeout=120)
+    proc = _run([brew, "link", "--force", "--overwrite", "ffmpeg-full"], timeout=300)
+    if proc.returncode == 0:
+        log("[依赖检测] 系统 FFmpeg 已链接到 ffmpeg-full。")
+    else:
+        # The app still prefers the keg-only path, so a link failure is not fatal.
+        log("[依赖检测] Homebrew 链接未完成，程序将直接使用 ffmpeg-full 路径。")
+
+
+def _write_ffmpeg_full_marker(full_ffmpeg: Path) -> None:
+    marker = DATA_DIR / "runtime" / "ffmpeg_full_ready.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "ready": True,
+                "path": str(full_ffmpeg),
+                "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
 
@@ -384,6 +486,10 @@ def _resolve_executable(name: str) -> Path | None:
     candidates = []
     if env_value:
         candidates.append(Path(env_value))
+    if sys.platform == "darwin":
+        full = _homebrew_ffmpeg_full_path(name)
+        if full:
+            candidates.append(full)
     found = shutil.which(name)
     if found:
         candidates.append(Path(found))
@@ -550,7 +656,7 @@ def _find_edge() -> Path | None:
     return next((path for path in candidates if path.exists()), None)
 
 
-def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
+def _run(args: list[str], *, timeout: int, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
     kwargs: dict[str, Any] = {}
     if os.name == "nt":
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -563,6 +669,7 @@ def _run(args: list[str], *, timeout: int) -> subprocess.CompletedProcess[str]:
             encoding="utf-8",
             errors="ignore",
             timeout=timeout,
+            env=env,
             **kwargs,
         )
     except Exception as exc:
@@ -587,7 +694,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check and repair novel_video_pipeline dependencies")
     parser.add_argument("--ensure", action="store_true", help="check full dependencies and install what is enabled")
     parser.add_argument("--ensure-core", action="store_true", help="check only GUI core Python packages")
+    parser.add_argument("--ensure-ffmpeg-subtitles", action="store_true", help="ensure macOS ffmpeg-full/libass only")
     args = parser.parse_args()
+    if args.ensure_ffmpeg_subtitles:
+        status = ensure_ffmpeg(print)
+        return 0 if status.ok else 1
     scope = "core" if args.ensure_core else "full"
     report = ensure_dependencies(scope=scope, on_log=print)
     print("[依赖检测] " + str(report.get("summary", "")))

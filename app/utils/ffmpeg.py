@@ -43,6 +43,15 @@ def _resolve(name: str) -> str:
     env_value = os.environ.get(_env_key(name))
     if env_value and Path(env_value).exists():
         return env_value
+    if os.name != "nt":
+        # Homebrew's ffmpeg-full is keg-only. Prefer it when installed because
+        # the regular macOS formula may omit libass/subtitles support.
+        for candidate in (
+            Path("/opt/homebrew/opt/ffmpeg-full/bin") / name,
+            Path("/usr/local/opt/ffmpeg-full/bin") / name,
+        ):
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                return str(candidate)
     found = shutil.which(name)
     if found:
         return found

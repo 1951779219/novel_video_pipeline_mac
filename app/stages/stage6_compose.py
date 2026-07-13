@@ -10,6 +10,7 @@ import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -180,6 +181,38 @@ def _run(cmd: list[str], on_log: Callable[[str], None]):
             raise RuntimeError(f"ffmpeg failed: {rc}")
 
 
+@lru_cache(maxsize=8)
+def _ffmpeg_has_filter(executable: str, filter_name: str) -> bool:
+    try:
+        proc = subprocess.run(
+            [executable, "-hide_banner", "-filters"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pattern = re.compile(rf"^\s*[TSC\.]+\s+{re.escape(filter_name)}\s", re.MULTILINE)
+    return proc.returncode == 0 and bool(pattern.search(proc.stdout or ""))
+
+
+def _subtitle_mode(subtitle_ass: Path | None, on_log: Callable[[str], None]) -> tuple[bool, Path | None]:
+    if not subtitle_ass or not subtitle_ass.exists():
+        return False, None
+    if _ffmpeg_has_filter(ffmpeg_path(), "ass"):
+        return True, None
+    subtitle_srt = subtitle_ass.with_suffix(".srt")
+    if subtitle_srt.exists():
+        on_log("  WARN ffmpeg has no libass filter; embedding subtitle.srt as a selectable MP4 subtitle track")
+        return False, subtitle_srt
+    on_log("  WARN ffmpeg has no libass filter and subtitle.srt is missing; composing without subtitles")
+    return False, None
+
+
 def _concat_file_path(path: Path) -> str:
     # ffmpeg concat demuxer accepts forward slashes on Windows.
     escaped = path.resolve().as_posix().replace("'", r"'\''")
@@ -326,23 +359,31 @@ def _build_video_from_image_list(
         str(audio_path),
     ]
     filter_complex: list[str] = []
+    hard_subtitle, soft_subtitle = _subtitle_mode(subtitle_ass, on_log)
     video_filter = (
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,"
         f"crop={width}:{height},fps={fps},setsar=1"
     )
-    if subtitle_ass and subtitle_ass.exists():
+    if hard_subtitle and subtitle_ass:
         video_filter += "," + _ass_filter(subtitle_ass)
     video_filter += "[v]"
     filter_complex.append(video_filter)
     audio_map = "1:a"
+    next_input_index = 2
     if bgm_path and Path(bgm_path).exists():
         cmd.extend(["-stream_loop", "-1", "-i", str(bgm_path)])
         filter_complex.append(
-            f"[2:a]volume={bgm_volume}[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]"
+            f"[{next_input_index}:a]volume={bgm_volume}[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]"
         )
         audio_map = "[a]"
+        next_input_index += 1
+    soft_subtitle_index: int | None = None
+    if soft_subtitle:
+        soft_subtitle_index = next_input_index
+        cmd.extend(["-i", str(soft_subtitle)])
+
     def make_cmd(encoder_args: list[str]) -> list[str]:
-        return [
+        final_cmd = [
             *cmd,
             "-filter_complex",
             ";".join(filter_complex),
@@ -355,11 +396,22 @@ def _build_video_from_image_list(
             "aac",
             "-b:a",
             "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(out_path),
         ]
+        if soft_subtitle_index is not None:
+            final_cmd.extend(
+                [
+                    "-map",
+                    f"{soft_subtitle_index}:s:0",
+                    "-c:s",
+                    "mov_text",
+                    "-metadata:s:s:0",
+                    "language=und",
+                    "-disposition:s:0",
+                    "default",
+                ]
+            )
+        final_cmd.extend(["-shortest", "-movflags", "+faststart", str(out_path)])
+        return final_cmd
 
     try:
         _run_encoder_command(make_cmd, out_path, on_log, video_encoder, video_encoder_preset, video_encoder_quality)
@@ -525,13 +577,20 @@ def _build_video_from_clips(
     cmd = [ffmpeg_path(), "-y", "-i", str(silent_video), "-i", str(audio_path)]
     filter_complex: list[str] = []
     audio_map = "1:a"
+    next_input_index = 2
     if bgm_path and Path(bgm_path).exists():
         cmd.extend(["-stream_loop", "-1", "-i", str(bgm_path)])
         filter_complex.append(
-            f"[2:a]volume={bgm_volume}[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]"
+            f"[{next_input_index}:a]volume={bgm_volume}[bgm];[1:a][bgm]amix=inputs=2:duration=first:dropout_transition=2[a]"
         )
         audio_map = "[a]"
-    if subtitle_ass and subtitle_ass.exists():
+        next_input_index += 1
+    hard_subtitle, soft_subtitle = _subtitle_mode(subtitle_ass, on_log)
+    soft_subtitle_index: int | None = None
+    if soft_subtitle:
+        soft_subtitle_index = next_input_index
+        cmd.extend(["-i", str(soft_subtitle)])
+    if hard_subtitle and subtitle_ass:
         filter_complex.insert(0, f"[0:v]{_ass_filter(subtitle_ass)}[v]")
         cmd.extend(["-filter_complex", ";".join(filter_complex), "-map", "[v]", "-map", audio_map])
 
@@ -553,12 +612,16 @@ def _build_video_from_clips(
     elif filter_complex:
         cmd.extend(["-filter_complex", ";".join(filter_complex), "-map", "0:v", "-map", audio_map])
         video_args = ["-c:v", "copy"]
-        cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out_path)])
+        cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k"])
+        _append_soft_subtitle_args(cmd, soft_subtitle_index)
+        cmd.extend(["-shortest", "-movflags", "+faststart", str(out_path)])
         _run(cmd, on_log)
     else:
         cmd.extend(["-c:v", "copy", "-map", "0:v", "-map", audio_map])
         video_args = []
-        cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k", "-shortest", "-movflags", "+faststart", str(out_path)])
+        cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k"])
+        _append_soft_subtitle_args(cmd, soft_subtitle_index)
+        cmd.extend(["-shortest", "-movflags", "+faststart", str(out_path)])
         _run(cmd, on_log)
 
     if cleanup_temp:
@@ -577,8 +640,25 @@ def _ass_filter(path: Path) -> str:
     fonts_dir = _default_fonts_dir()
     if fonts_dir.exists():
         fonts = fonts_dir.resolve().as_posix().replace(":", r"\:").replace("'", r"\'")
-        return f"ass='{ass_path}':fontsdir='{fonts}'"
-    return f"ass='{ass_path}'"
+        return f"ass=filename='{ass_path}':fontsdir='{fonts}'"
+    return f"ass=filename='{ass_path}'"
+
+
+def _append_soft_subtitle_args(cmd: list[str], subtitle_index: int | None) -> None:
+    if subtitle_index is None:
+        return
+    cmd.extend(
+        [
+            "-map",
+            f"{subtitle_index}:s:0",
+            "-c:s",
+            "mov_text",
+            "-metadata:s:s:0",
+            "language=und",
+            "-disposition:s:0",
+            "default",
+        ]
+    )
 
 
 def _default_fonts_dir() -> Path:

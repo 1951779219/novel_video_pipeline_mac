@@ -70,11 +70,11 @@ EOF
 fi
 
 echo "[install] Homebrew: $(command -v brew)"
-echo "[install] Installing Python/Tk/FFmpeg..."
+echo "[install] Installing Python/Tk/FFmpeg Full (with libass subtitles)..."
 brew update || true
-if ! brew install python@3.12 python-tk@3.12 ffmpeg; then
-  if ! brew install python@3.11 python-tk@3.11 ffmpeg; then
-    brew install python python-tk ffmpeg
+if ! brew install python@3.12 python-tk@3.12 ffmpeg-full; then
+  if ! brew install python@3.11 python-tk@3.11 ffmpeg-full; then
+    brew install python python-tk ffmpeg-full
   fi
 fi
 

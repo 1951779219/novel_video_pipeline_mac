@@ -8,6 +8,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import unicodedata
 import webbrowser
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
@@ -38,6 +39,73 @@ from app.utils.secrets import clean_api_key, redact_secret_text
 IMPORT_DIR = DATA_DIR / "imports"
 UI_FONT = "PingFang SC" if sys.platform == "darwin" else "Microsoft YaHei UI"
 MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
+UI_FONT_SIZE = 12
+UI_SMALL_FONT_SIZE = 11
+UI_HEADING_FONT_SIZE = 13
+
+_DICTIONARY_SUFFIX_RE = re.compile(
+    r"(?:[\s_.\-—－]*"
+    r"(?:tts[\s_.\-—－]*)?"
+    r"(?:读音词典|讀音詞典|发音词典|發音詞典|注音词典|注音詞典|词典|詞典|"
+    r"読み方辞書|読み辞書|発音辞書|ふりがな辞書|辞書|"
+    r"pronunciation(?:[\s_.\-—－]*dictionary)?|dictionary)"
+    r")+$",
+    re.I,
+)
+_TEXT_SUFFIX_RE = re.compile(
+    r"(?:[\s_.\-—－]*"
+    r"(?:最终文本|最終文本|最終テキスト|完成文本|完成稿|最终稿|最終稿|正文文本|正文|原文|本文|朗读文本|朗讀文本|"
+    r"日语文本|日語文本|日本語テキスト|日语|日語|日本語|text)"
+    r")+$",
+    re.I,
+)
+
+
+def _normalized_batch_pair_key(path: str | Path) -> str:
+    """Normalize body/dictionary filename suffixes to the same work key."""
+    value = unicodedata.normalize("NFKC", Path(path).stem).strip()
+    previous = None
+    while value and value != previous:
+        previous = value
+        value = _DICTIONARY_SUFFIX_RE.sub("", value).strip()
+        value = _TEXT_SUFFIX_RE.sub("", value).strip()
+    return re.sub(r"[\W_]+", "", value, flags=re.UNICODE).casefold()
+
+
+def _is_pronunciation_dictionary_filename(path: str | Path) -> bool:
+    stem = unicodedata.normalize("NFKC", Path(path).stem).strip()
+    return bool(_DICTIONARY_SUFFIX_RE.search(stem))
+
+
+def _match_batch_texts_and_dictionaries(paths: list[str | Path]) -> dict:
+    unique_paths = list(dict.fromkeys(Path(path).expanduser() for path in paths))
+    dictionaries = [path for path in unique_paths if _is_pronunciation_dictionary_filename(path)]
+    texts = [path for path in unique_paths if path not in dictionaries]
+    dictionaries_by_key: dict[str, list[Path]] = {}
+    for path in dictionaries:
+        dictionaries_by_key.setdefault(_normalized_batch_pair_key(path), []).append(path)
+
+    pairs: list[tuple[Path, Path]] = []
+    unmatched_texts: list[Path] = []
+    ambiguous_texts: list[tuple[Path, list[Path]]] = []
+    used_dictionaries: set[Path] = set()
+    for text_path in texts:
+        candidates = dictionaries_by_key.get(_normalized_batch_pair_key(text_path), [])
+        if len(candidates) == 1:
+            pairs.append((text_path, candidates[0]))
+            used_dictionaries.add(candidates[0])
+        elif len(candidates) > 1:
+            ambiguous_texts.append((text_path, candidates))
+        else:
+            unmatched_texts.append(text_path)
+    return {
+        "pairs": pairs,
+        "texts": texts,
+        "dictionaries": dictionaries,
+        "unmatched_texts": unmatched_texts,
+        "ambiguous_texts": ambiguous_texts,
+        "unused_dictionaries": [path for path in dictionaries if path not in used_dictionaries],
+    }
 
 
 class _TextValue:
@@ -187,10 +255,10 @@ class PipelineGUI:
             style.theme_use("clam")
         except Exception:
             pass
-        style.configure(".", font=(UI_FONT, 10))
-        style.configure("Treeview", rowheight=28, font=(UI_FONT, 10))
-        style.configure("Treeview.Heading", font=(UI_FONT, 10, "bold"))
-        style.configure("Primary.TButton", font=(UI_FONT, 10, "bold"))
+        style.configure(".", font=(UI_FONT, UI_FONT_SIZE))
+        style.configure("Treeview", rowheight=34, font=(UI_FONT, UI_FONT_SIZE))
+        style.configure("Treeview.Heading", font=(UI_FONT, UI_FONT_SIZE, "bold"))
+        style.configure("Primary.TButton", font=(UI_FONT, UI_FONT_SIZE, "bold"))
 
     def _build_ui(self):
         outer = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -243,9 +311,33 @@ class PipelineGUI:
         self.manual_title = tk.StringVar()
         ttk.Entry(manual_row, textvariable=self.manual_title, width=28).pack(side=tk.LEFT, padx=6)
         ttk.Button(manual_row, text="加入粘贴文本", command=self._add_manual_text).pack(side=tk.LEFT)
-        ttk.Button(manual_row, text="导入 TXT 多篇", command=self._import_txt_files).pack(side=tk.LEFT, padx=6)
+        ttk.Button(manual_row, text="粘贴文本+MP3", command=self._add_manual_text_with_audio).pack(side=tk.LEFT, padx=6)
 
-        self.manual_text = scrolledtext.ScrolledText(box, height=5, wrap=tk.WORD, font=(UI_FONT, 10))
+        import_row = ttk.Frame(box)
+        import_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(import_row, text="文件导入").pack(side=tk.LEFT)
+        ttk.Button(import_row, text="导入正文 TXT + MP3（跳过TTS）", command=self._import_text_audio_pair).pack(side=tk.LEFT, padx=6)
+        ttk.Button(import_row, text="批量导入正文+词典", command=self._import_txt_files).pack(side=tk.LEFT)
+
+        dictionary_row = ttk.Frame(box)
+        dictionary_row.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(dictionary_row, text="日语读音词典").pack(side=tk.LEFT)
+        self.pronunciation_dictionary_var = tk.StringVar()
+        ttk.Entry(
+            dictionary_row,
+            textvariable=self.pronunciation_dictionary_var,
+            width=52,
+            state="readonly",
+        ).pack(side=tk.LEFT, padx=6)
+        ttk.Button(dictionary_row, text="选择词典 TXT", command=self._choose_pronunciation_dictionary).pack(side=tk.LEFT)
+        ttk.Button(dictionary_row, text="清除选择", command=self._clear_pronunciation_dictionary).pack(side=tk.LEFT, padx=6)
+        ttk.Button(
+            dictionary_row,
+            text="附加到选中任务",
+            command=self._attach_pronunciation_dictionary_to_selected,
+        ).pack(side=tk.LEFT)
+
+        self.manual_text = scrolledtext.ScrolledText(box, height=5, wrap=tk.WORD, font=(UI_FONT, UI_FONT_SIZE))
         self.manual_text.pack(fill=tk.X, pady=(6, 0))
 
     def _build_queue_panel(self, parent):
@@ -268,18 +360,30 @@ class PipelineGUI:
         ttk.Button(tts_toolbar, text="重试TTS段...", command=self._retry_tts_segments).pack(side=tk.LEFT)
         ttk.Button(tts_toolbar, text="TTS卡段重试推进", command=self._retry_stalled_tts_segments).pack(side=tk.LEFT, padx=6)
 
-        cols = ("job_id", "stage", "progress", "worker", "title", "video", "youtube")
+        cols = ("job_id", "stage", "progress", "worker", "audio", "dictionary", "title", "video", "youtube")
         self.job_tree = ttk.Treeview(box, columns=cols, show="headings", selectmode="extended")
         headings = {
             "job_id": "任务ID",
             "stage": "制作阶段",
             "progress": "进度",
             "worker": "Worker",
+            "audio": "音频来源",
+            "dictionary": "读音词典",
             "title": "标题",
             "video": "视频",
             "youtube": "YouTube",
         }
-        widths = {"job_id": 170, "stage": 150, "progress": 62, "worker": 88, "title": 150, "video": 190, "youtube": 170}
+        widths = {
+            "job_id": 170,
+            "stage": 150,
+            "progress": 62,
+            "worker": 88,
+            "audio": 88,
+            "dictionary": 90,
+            "title": 150,
+            "video": 190,
+            "youtube": 170,
+        }
         for col in cols:
             self.job_tree.heading(col, text=headings[col])
             self.job_tree.column(col, width=widths[col], anchor=tk.W)
@@ -304,7 +408,7 @@ class PipelineGUI:
             self.update_tab = None
             self._append_probe_log(f"[软件更新] 更新页加载失败：{exc}")
 
-        self.log_text = scrolledtext.ScrolledText(log_tab, wrap=tk.WORD, font=(MONO_FONT, 9))
+        self.log_text = scrolledtext.ScrolledText(log_tab, wrap=tk.WORD, font=(MONO_FONT, UI_SMALL_FONT_SIZE))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
         self._build_config_panel(cfg_tab)
@@ -312,6 +416,7 @@ class PipelineGUI:
     def _build_config_panel(self, parent):
         self.vars: dict[str, tk.Variable] = {}
         self.combo_widgets: dict[str, ttk.Combobox] = {}
+        self._config_sections: dict[str, dict] = {}
 
         footer = ttk.Frame(parent)
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
@@ -323,14 +428,74 @@ class PipelineGUI:
         canvas = tk.Canvas(scroll_area, highlightthickness=0)
         scroll = ttk.Scrollbar(scroll_area, orient=tk.VERTICAL, command=canvas.yview)
         body = ttk.Frame(canvas)
-        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(body_window, width=event.width))
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+        def scroll_config(event, units: int | None = None):
+            if units is None:
+                delta = int(getattr(event, "delta", 0) or 0)
+                if not delta:
+                    return None
+                units = -delta if sys.platform == "darwin" else -int(delta / 120)
+                if units == 0:
+                    units = -1 if delta > 0 else 1
+            canvas.yview_scroll(units, "units")
+            return "break"
+
+        section_parent = body
+
+        def section(title: str, *, expanded: bool = False):
+            nonlocal section_parent
+            container = ttk.Frame(body)
+            container.pack(fill=tk.X, pady=(0, 6))
+
+            header = ttk.Frame(container, relief=tk.RIDGE, borderwidth=1, padding=(9, 5))
+            header.pack(fill=tk.X)
+            title_label = ttk.Label(
+                header,
+                text=title,
+                font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold"),
+                cursor="hand2",
+            )
+            title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            arrow = ttk.Label(
+                header,
+                text="▼" if expanded else "▶",
+                width=3,
+                anchor=tk.CENTER,
+                cursor="hand2",
+            )
+            arrow.pack(side=tk.RIGHT)
+
+            content = ttk.Frame(container, padding=(8, 4, 4, 4))
+            state = {"expanded": expanded, "content": content, "arrow": arrow}
+            self._config_sections[title] = state
+
+            def toggle(_event=None):
+                state["expanded"] = not state["expanded"]
+                if state["expanded"]:
+                    content.pack(fill=tk.X)
+                    arrow.configure(text="▼")
+                else:
+                    content.pack_forget()
+                    arrow.configure(text="▶")
+                canvas.after_idle(lambda: canvas.configure(scrollregion=canvas.bbox("all")))
+                return "break"
+
+            header.bind("<Button-1>", toggle)
+            title_label.bind("<Button-1>", toggle)
+            arrow.bind("<Button-1>", toggle)
+            if expanded:
+                content.pack(fill=tk.X)
+            section_parent = content
+            return content
+
         def row(label: str, key: str, default="", width=30):
-            line = ttk.Frame(body)
+            line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
             ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(config.get(key, default)))
@@ -339,17 +504,17 @@ class PipelineGUI:
             return var
 
         def textrow(label: str, key: str, default="", height=3):
-            line = ttk.Frame(body)
+            line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
             ttk.Label(line, text=label, width=18).pack(side=tk.LEFT, anchor=tk.N)
-            widget = tk.Text(line, height=height, wrap=tk.WORD, font=(UI_FONT, 9))
+            widget = tk.Text(line, height=height, wrap=tk.WORD, font=(UI_FONT, UI_SMALL_FONT_SIZE))
             widget.insert("1.0", str(config.get(key, default)))
             widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
             self.vars[key] = _TextValue(widget)
             return widget
 
         def combo(label: str, key: str, values: list[str], default=""):
-            line = ttk.Frame(body)
+            line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
             ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(config.get(key, default or (values[0] if values else ""))))
@@ -359,7 +524,7 @@ class PipelineGUI:
             self.combo_widgets[key] = widget
 
         def model_combo(label: str, key: str, default="", values: list[str] | None = None):
-            line = ttk.Frame(body)
+            line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
             ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(config.get(key, default)))
@@ -370,7 +535,7 @@ class PipelineGUI:
             return var
 
         def check(label: str, key: str):
-            line = ttk.Frame(body)
+            line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
             ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
             var = tk.StringVar(value="开启" if bool(config.get(key, False)) else "关闭")
@@ -378,7 +543,7 @@ class PipelineGUI:
             self.vars[key] = var
 
         def buttons(*items: tuple[str, callable]):
-            line = ttk.Frame(body)
+            line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=(5, 3))
             ttk.Label(line, text="", width=18).pack(side=tk.LEFT)
             for text, command in items:
@@ -401,7 +566,7 @@ class PipelineGUI:
         ttk.Button(profile_line, text="加载方案", command=self._load_profile).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(profile_line, text="保存到方案", command=self._save_profile).pack(side=tk.LEFT, padx=(6, 0))
 
-        ttk.Label(body, text="系统与依赖", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        section("系统与依赖")
         check("启动时检测依赖", "dependency_check_on_startup")
         check("自动安装 Python 包", "dependency_auto_install_python")
         check("自动下载 FFmpeg", "dependency_auto_install_ffmpeg")
@@ -416,8 +581,7 @@ class PipelineGUI:
         row("依赖检测摘要", "dependency_last_report", "", width=48)
         buttons(("检测/安装依赖", self._manual_dependency_check), ("提交反馈", self._open_feedback_url))
 
-        ttk.Separator(body).pack(fill=tk.X, pady=8)
-        ttk.Label(body, text="TTS", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W, pady=(0, 4))
+        section("TTS")
         combo("Provider", "tts_provider", ["edge", "voicevox", "openai", "azure", "elevenlabs", "custom"], "edge")
         combo("常用音色", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
         row("语速", "tts_rate", "+0%")
@@ -437,8 +601,7 @@ class PipelineGUI:
         check("TTS 子进程隔离", "tts_subprocess_isolation")
         buttons(("检测 TTS API / 识别模型", lambda: self._probe_api("tts")))
 
-        ttk.Separator(body).pack(fill=tk.X, pady=8)
-        ttk.Label(body, text="图片与提示词", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W)
+        section("图片与提示词")
         check("文本/生图共用统一 API", "ai_api_enabled")
         row("统一 Base URL/中转", "ai_api_base_url", "")
         row("统一 API Key", "ai_api_key", "")
@@ -485,6 +648,10 @@ class PipelineGUI:
         row("视频图风格后缀", "llm_image_style_suffix", "")
         textrow("视频图 AI 分析系统提示词", "llm_storyboard_prompt", str(config.get("llm_storyboard_prompt", "")), height=4)
         textrow("视频图 AI 分析用户模板", "llm_storyboard_user_template", str(config.get("llm_storyboard_user_template", "")), height=4)
+        check("智能选择旁白高光点（不增加图片数）", "storyboard_highlight_enabled")
+        check("按高光旁白调整换图时间", "storyboard_highlight_align_timeline")
+        row("全篇背景分析最大字数", "storyboard_highlight_context_max_chars", "18000")
+        row("每图高光最多连续段数", "storyboard_highlight_max_segments", "3")
         row("分镜 LLM Provider", "llm_provider", "openai")
         model_combo("分镜模型", "llm_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
         row("分镜 Base URL/中转(可空=统一)", "llm_base_url", "")
@@ -496,8 +663,7 @@ class PipelineGUI:
             ("检测剧情参考 API", lambda: self._probe_api("scene_reference")),
         )
 
-        ttk.Separator(body).pack(fill=tk.X, pady=8)
-        ttk.Label(body, text="封面", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W)
+        section("封面")
         check("自动生成封面", "cover_enabled")
         combo("封面 Provider", "cover_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
         row("封面 Base URL/中转(可空=统一)", "cover_base_url", "")
@@ -510,8 +676,7 @@ class PipelineGUI:
         textrow("封面自定义提示词", "cover_custom_prompt", str(config.get("cover_custom_prompt", "")), height=3)
         textrow("封面 AI 分析提示词", "cover_ai_analysis_prompt", str(config.get("cover_ai_analysis_prompt", "")), height=4)
 
-        ttk.Separator(body).pack(fill=tk.X, pady=8)
-        ttk.Label(body, text="画面节奏 / 视频", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W)
+        section("画面节奏 / 视频")
         combo("配图模式", "pacing_mode", ["by_duration", "by_sentence", "by_paragraph", "fixed_count"], "by_duration")
         row("每张图秒数", "pacing_seconds_per_image", "6")
         row("固定图片数", "pacing_fixed_count", "10")
@@ -529,7 +694,7 @@ class PipelineGUI:
         check("长视频稳定模式", "video_long_mode")
         check("Ken Burns 移动特效", "ken_burns")
         combo("字幕位置", "video_subtitle_position", ["下边", "中间", "上边"], "下边")
-        row("字幕字体", "video_subtitle_font", "Microsoft YaHei")
+        row("字幕字体", "video_subtitle_font", "Hiragino Mincho ProN")
         row("字幕字号", "video_subtitle_size", "48")
         row("字幕颜色", "video_subtitle_color", "#FFFFFF")
         row("描边颜色", "video_subtitle_outline_color", "#000000")
@@ -544,8 +709,7 @@ class PipelineGUI:
         check("内嵌字幕（强制）", "video_subtitle")
         check("导出 SRT", "video_external_subtitle")
 
-        ttk.Separator(body).pack(fill=tk.X, pady=8)
-        ttk.Label(body, text="批量与上传", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W)
+        section("批量与上传")
         check("自动短说明标题", "short_title_enabled")
         row("短标题最少字", "short_title_min_chars", "20")
         row("短标题最多字", "short_title_max_chars", "30")
@@ -578,11 +742,24 @@ class PipelineGUI:
         textrow("广告分级模板(JSON)", "browser_ad_suitability_template", str(config.get("browser_ad_suitability_template", "")), height=3)
 
         ttk.Label(
-            body,
+            section_parent,
             text="上传标题可用：{clean_title}=去作者名书名，{title}=原标题，{short_title}=短说明标题。simple=无创收精简流程，full=完整创收/广告/分级流程。",
             foreground="#666",
             wraplength=520,
         ).pack(anchor=tk.W, pady=(4, 14))
+
+        def bind_config_mousewheel(widget):
+            # Bind before the widget class handler so nested Text/Combo widgets
+            # scroll the whole configuration page instead of swallowing the wheel.
+            widget.bind("<MouseWheel>", scroll_config, add="+")
+            widget.bind("<Button-4>", lambda event: scroll_config(event, -1), add="+")
+            widget.bind("<Button-5>", lambda event: scroll_config(event, 1), add="+")
+            for child in widget.winfo_children():
+                bind_config_mousewheel(child)
+
+        bind_config_mousewheel(canvas)
+        bind_config_mousewheel(scroll)
+        self._config_canvas = canvas
 
     def _config_key_sets(self):
         int_keys = {
@@ -590,6 +767,7 @@ class PipelineGUI:
             "video_encoder_quality", "ai_rewrite_batch_chars",
             "character_analysis_max_chars", "character_analysis_max_tokens",
             "character_analysis_max_characters_per_prompt",
+            "storyboard_highlight_context_max_chars", "storyboard_highlight_max_segments",
             "character_reference_width", "character_reference_height", "character_reference_max_count",
             "scene_reference_max_images",
             "image_api_timeout_seconds", "tts_segment_timeout_seconds", "tts_stall_fallback_seconds",
@@ -614,6 +792,7 @@ class PipelineGUI:
             "short_title_enabled", "pipeline_overlap_tts_images", "ai_rewrite_enabled",
             "character_analysis_enabled", "character_analysis_always_include_protagonists",
             "character_reference_enabled", "scene_inject_visual_theme", "scene_inject_character_triggers",
+            "storyboard_highlight_enabled", "storyboard_highlight_align_timeline",
             "scene_reference_enabled", "ai_api_enabled",
             "tts_retry_until_success", "tts_waveform_validation", "tts_subprocess_isolation",
             "hardware_autotune_enabled",
@@ -1062,7 +1241,7 @@ class PipelineGUI:
             wraplength=700,
         ).pack(anchor=tk.W, pady=(0, 8))
 
-        box = scrolledtext.ScrolledText(outer, wrap=tk.WORD, font=(MONO_FONT, 9), height=24)
+        box = scrolledtext.ScrolledText(outer, wrap=tk.WORD, font=(MONO_FONT, UI_SMALL_FONT_SIZE), height=24)
         box.pack(fill=tk.BOTH, expand=True)
         box.insert("1.0", redact_secret_text(text))
         box.configure(state=tk.DISABLED)
@@ -1118,7 +1297,7 @@ class PipelineGUI:
         pane.add(left, weight=1)
         pane.add(right, weight=3)
 
-        ttk.Label(left, text="频道列表", font=(UI_FONT, 11, "bold")).pack(anchor=tk.W)
+        ttk.Label(left, text="频道列表", font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold")).pack(anchor=tk.W)
         list_wrap = ttk.Frame(left)
         list_wrap.pack(fill=tk.BOTH, expand=True, pady=(4, 6))
         list_scroll = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL)
@@ -1182,7 +1361,7 @@ class PipelineGUI:
         ttk.Entry(line, textvariable=title_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         line = row("说明模板")
-        desc_text = tk.Text(line, height=4, wrap=tk.WORD, font=(UI_FONT, 9))
+        desc_text = tk.Text(line, height=4, wrap=tk.WORD, font=(UI_FONT, UI_SMALL_FONT_SIZE))
         desc_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         policy_var = tk.StringVar(value="BTRA")
@@ -1203,7 +1382,7 @@ class PipelineGUI:
         ttk.Label(line, text="秒，仅完整流程使用", foreground="#777").pack(side=tk.LEFT)
 
         line = row("广告分级模板")
-        ad_text = tk.Text(line, height=7, wrap=tk.NONE, font=(MONO_FONT, 9))
+        ad_text = tk.Text(line, height=7, wrap=tk.NONE, font=(MONO_FONT, UI_SMALL_FONT_SIZE))
         ad_text.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
 
         hint = ttk.Label(
@@ -1504,7 +1683,7 @@ class PipelineGUI:
 
         sample = "蒙头睡了十三个小时 醒来一看"
         font_size = max(16, int(int(float(self._ui_value("video_subtitle_size", "48"))) * width / max(1, int(config.get("video_width", 1080) or 1080))))
-        font = self._preview_font(self._ui_value("video_subtitle_font", "Microsoft YaHei"), font_size)
+        font = self._preview_font(self._ui_value("video_subtitle_font", "Hiragino Mincho ProN"), font_size)
         max_chars = max(8, int(float(self._ui_value("video_subtitle_chars_per_line", "24"))))
         lines = self._wrap_preview_text(sample, max_chars)[: max(1, int(float(self._ui_value("video_subtitle_max_lines", "2"))))]
         text = "\n".join(lines)
@@ -1539,8 +1718,19 @@ class PipelineGUI:
         from PIL import ImageFont
 
         fonts_dir = Path(r"C:\Windows\Fonts")
-        candidates = [
-            font_name,
+        candidates: list[str | Path] = [font_name]
+        if sys.platform == "darwin":
+            mac_fonts = Path("/System/Library/Fonts")
+            candidates.extend(sorted(mac_fonts.glob("*明朝*ProN*.ttc")))
+            candidates.extend(
+                [
+                    mac_fonts / "ヒラギノ明朝 ProN.ttc",
+                    mac_fonts / "PingFang.ttc",
+                    Path("/Library/Fonts") / font_name,
+                    Path.home() / "Library" / "Fonts" / font_name,
+                ]
+            )
+        candidates.extend([
             fonts_dir / "msyhbd.ttc",
             fonts_dir / "msyh.ttc",
             fonts_dir / "simhei.ttf",
@@ -1548,7 +1738,7 @@ class PipelineGUI:
             "msyhbd.ttc",
             "msyh.ttc",
             "simhei.ttf",
-        ]
+        ])
         for candidate in candidates:
             try:
                 return ImageFont.truetype(str(candidate), size)
@@ -1650,18 +1840,246 @@ class PipelineGUI:
         self._create_queued_job(title, str(path))
         self.manual_text.delete("1.0", tk.END)
 
-    def _import_txt_files(self):
-        files = filedialog.askopenfilenames(title="选择 TXT 文件", filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
-        for file in files:
-            path = Path(file)
-            self._create_queued_job(path.stem, str(path))
+    def _choose_imported_mp3(self) -> str:
+        path = filedialog.askopenfilename(
+            title="选择已生成的完整配音 MP3",
+            filetypes=[("MP3 audio", "*.mp3"), ("All files", "*.*")],
+        )
+        if not path:
+            return ""
+        try:
+            pr.inspect_imported_audio(path)
+        except Exception as exc:
+            messagebox.showerror("MP3 无效", str(exc))
+            return ""
+        return path
 
-    def _create_queued_job(self, title: str, input_text: str):
-        job_id = pr.new_job_id("article")
-        job_dir = pr.job_dir_for(job_id)
-        pr.write_status(job_dir, job_id=job_id, title=title, input=input_text, stage="queued", progress=0.0)
-        pr.append_log(job_dir, f"queued: {title}")
+    def _add_manual_text_with_audio(self):
+        text = self.manual_text.get("1.0", tk.END).strip()
+        if not text:
+            messagebox.showwarning("没有文本", "请先粘贴用来生成这份 MP3 的原文。")
+            return
+        audio_path = self._choose_imported_mp3()
+        if not audio_path:
+            return
+        title = self.manual_title.get().strip() or next((x.strip() for x in text.splitlines() if x.strip()), "article")
+        path = _save_import_text(title, text)
+        job_id = self._create_queued_job(title, str(path), imported_audio_path=audio_path)
+        if job_id:
+            self.manual_text.delete("1.0", tk.END)
+            messagebox.showinfo(
+                "正文 + MP3 已加入",
+                "任务已设为跳过 TTS。\n字幕时间会按原文长度估算，视频总时长与 MP3 一致。",
+            )
+
+    def _import_text_audio_pair(self):
+        selected = filedialog.askopenfilenames(
+            title="同时选中 1 份原文 TXT 和 1 份完整配音 MP3",
+            filetypes=[("TXT and MP3", ("*.txt", "*.mp3")), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        text_files = [Path(path) for path in selected if Path(path).suffix.lower() == ".txt"]
+        audio_files = [Path(path) for path in selected if Path(path).suffix.lower() == ".mp3"]
+        unsupported = [Path(path).name for path in selected if Path(path).suffix.lower() not in {".txt", ".mp3"}]
+        if len(text_files) != 1 or len(audio_files) != 1 or unsupported:
+            details = []
+            if len(text_files) != 1:
+                details.append(f"TXT 已选 {len(text_files)} 份")
+            if len(audio_files) != 1:
+                details.append(f"MP3 已选 {len(audio_files)} 份")
+            if unsupported:
+                details.append("不支持的文件：" + "、".join(unsupported))
+            messagebox.showwarning(
+                "请选择一对文件",
+                "请在同一个窗口中同时选中 1 份 TXT 和 1 份 MP3。\n"
+                + "\n".join(details),
+            )
+            return
+        text_path = text_files[0]
+        audio_path = audio_files[0]
+        try:
+            pr.inspect_imported_audio(audio_path)
+        except Exception as exc:
+            messagebox.showerror("MP3 无效", str(exc))
+            return
+        title = Path(text_path).stem
+        job_id = self._create_queued_job(title, str(text_path), imported_audio_path=str(audio_path))
+        if job_id:
+            messagebox.showinfo(
+                "正文 + MP3 已加入",
+                f"已导入：\n正文：{Path(text_path).name}\n音频：{Path(audio_path).name}\n\n"
+                "该任务会跳过 TTS，直接继续画面、字幕、封面和视频流程。",
+            )
+
+    def _import_txt_files(self):
+        files = filedialog.askopenfilenames(
+            title="选择正文和读音词典 TXT（可混合多选）",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not files:
+            return
+        initial = _match_batch_texts_and_dictionaries(list(files))
+        if not initial["dictionaries"]:
+            for text_path in initial["texts"]:
+                self._create_queued_job(text_path.stem, str(text_path))
+            return
+
+        valid_dictionaries: list[Path] = []
+        invalid_dictionaries: list[tuple[Path, str]] = []
+        for dictionary_path in initial["dictionaries"]:
+            try:
+                pr.inspect_pronunciation_dictionary(dictionary_path)
+                valid_dictionaries.append(dictionary_path)
+            except Exception as exc:
+                invalid_dictionaries.append((dictionary_path, str(exc)))
+
+        matched = _match_batch_texts_and_dictionaries([*initial["texts"], *valid_dictionaries])
+        created_with_dictionary = 0
+        for text_path, dictionary_path in matched["pairs"]:
+            self._create_queued_job(
+                text_path.stem,
+                str(text_path),
+                dictionary_path=str(dictionary_path),
+            )
+            created_with_dictionary += 1
+
+        texts_without_dictionary = [
+            *matched["unmatched_texts"],
+            *(text_path for text_path, _candidates in matched["ambiguous_texts"]),
+        ]
+        for text_path in texts_without_dictionary:
+            # An explicit empty value prevents a previously selected global
+            # dictionary from being attached to the wrong batch item.
+            self._create_queued_job(text_path.stem, str(text_path), dictionary_path="")
+
+        report = [
+            f"成功创建 {created_with_dictionary + len(texts_without_dictionary)} 个正文任务："
+            f"{created_with_dictionary} 个已自动附加词典，"
+            f"{len(texts_without_dictionary)} 个按普通方式导入。"
+        ]
+        if matched["unmatched_texts"]:
+            names = "\n".join(f"  - {path.name}" for path in matched["unmatched_texts"])
+            report.append(f"未找到同名词典，已按普通正文导入：\n{names}")
+        if matched["ambiguous_texts"]:
+            rows = []
+            for text_path, candidates in matched["ambiguous_texts"]:
+                rows.append(f"  - {text_path.name} → {', '.join(path.name for path in candidates)}")
+            report.append("找到多个同名词典，无法安全选择；正文已按普通方式导入：\n" + "\n".join(rows))
+        if matched["unused_dictionaries"]:
+            names = "\n".join(f"  - {path.name}" for path in matched["unused_dictionaries"])
+            report.append(f"没有对应正文、未使用的词典：\n{names}")
+        if invalid_dictionaries:
+            names = "\n".join(f"  - {path.name}: {error}" for path, error in invalid_dictionaries)
+            report.append(f"格式无效的词典：\n{names}")
+        report.append("推荐命名：作品名_正文.txt + 作品名_读音词典.txt")
+        message = "\n\n".join(report)
+        if created_with_dictionary + len(texts_without_dictionary) and not any(
+            (matched["unmatched_texts"], matched["ambiguous_texts"], matched["unused_dictionaries"], invalid_dictionaries)
+        ):
+            messagebox.showinfo("批量配对完成", message)
+        else:
+            messagebox.showwarning("批量配对结果", message)
+
+    def _choose_pronunciation_dictionary(self) -> str:
+        path = filedialog.askopenfilename(
+            title="选择日语读音词典",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return ""
+        try:
+            info = pr.inspect_pronunciation_dictionary(path)
+        except Exception as exc:
+            messagebox.showerror("读音词典无效", str(exc))
+            return ""
+        self.pronunciation_dictionary_var.set(str(info["path"]))
+        selected_ids = self._selected_job_ids()
+        if selected_ids:
+            self._attach_pronunciation_dictionary_to_jobs(selected_ids, str(info["path"]))
+        else:
+            messagebox.showinfo("读音词典已选择", f"已识别 {info['entries']} 条读音。之后新建的任务会自动附加此词典。")
+        return str(info["path"])
+
+    def _clear_pronunciation_dictionary(self):
+        self.pronunciation_dictionary_var.set("")
+
+    def _attach_pronunciation_dictionary_to_selected(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先在任务队列中选择任务。")
+            return
+        path = self.pronunciation_dictionary_var.get().strip()
+        if not path:
+            self._choose_pronunciation_dictionary()
+            return
+        self._attach_pronunciation_dictionary_to_jobs(ids, path)
+
+    def _attach_pronunciation_dictionary_to_jobs(self, ids: list[str], path: str):
+        errors = []
+        attached = 0
+        reset_segments = 0
+        for job_id in ids:
+            try:
+                result = pr.attach_pronunciation_dictionary(job_id, path)
+                attached += 1
+                reset_segments += int(result.get("reset_segments", 0))
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
         self._refresh_jobs()
+        if errors:
+            messagebox.showerror("附加读音词典失败", "\n".join(errors))
+        if attached:
+            messagebox.showinfo(
+                "读音词典已附加",
+                f"已附加到 {attached} 个任务；已重置 {reset_segments} 个旧 TTS 段。启动任务后会按新读音重新配音。",
+            )
+
+    def _create_queued_job(
+        self,
+        title: str,
+        input_text: str,
+        dictionary_path: str | None = None,
+        imported_audio_path: str | None = None,
+    ) -> str:
+        output_basename = pr.safe_job_name(title, fallback="article")
+        job_id = pr.new_named_job_id(output_basename)
+        job_dir = pr.job_dir_for(job_id)
+        pr.write_status(
+            job_dir,
+            job_id=job_id,
+            title=title,
+            input=input_text,
+            output_basename=output_basename,
+            stage="queued",
+            progress=0.0,
+        )
+        pr.append_log(job_dir, f"queued: {title}")
+        if imported_audio_path:
+            try:
+                pr.attach_imported_audio(job_id, imported_audio_path)
+            except Exception as exc:
+                try:
+                    pr.delete_job(job_id)
+                except Exception:
+                    pass
+                messagebox.showerror("导入 MP3 失败", f"任务未创建：\n{exc}")
+                self._refresh_jobs()
+                return ""
+            self._refresh_jobs()
+            return job_id
+        selected_dictionary = (
+            self.pronunciation_dictionary_var.get().strip()
+            if dictionary_path is None
+            else str(dictionary_path).strip()
+        )
+        if selected_dictionary:
+            try:
+                pr.attach_pronunciation_dictionary(job_id, selected_dictionary)
+            except Exception as exc:
+                messagebox.showerror("附加读音词典失败", f"任务已加入队列，但词典附加失败：\n{exc}")
+        self._refresh_jobs()
+        return job_id
 
     def _selected_job_ids(self) -> list[str]:
         ids = []
@@ -1684,6 +2102,19 @@ class PipelineGUI:
         st = pr.load_status(job_id)
         if st.get("worker_alive"):
             return
+        dictionary_path = self.pronunciation_dictionary_var.get().strip()
+        if dictionary_path:
+            try:
+                dictionary_info = pr.inspect_pronunciation_dictionary(dictionary_path)
+                attached_hash = str(st.get("pronunciation_dictionary_hash") or "")
+                internal_dictionary = pr.job_dir_for(job_id) / pr.TTS_PRONUNCIATION_DICTIONARY
+                if attached_hash != str(dictionary_info["hash"]) or not internal_dictionary.exists():
+                    pr.attach_pronunciation_dictionary(job_id, dictionary_path)
+                    st = pr.load_status(job_id)
+            except Exception as exc:
+                messagebox.showerror("启动失败", f"读音词典自动附加失败：\n{exc}")
+                self._refresh_jobs()
+                return
         input_text = st.get("input", "")
         if not input_text:
             messagebox.showwarning("缺少输入", f"{job_id} 没有 input")
@@ -1698,7 +2129,7 @@ class PipelineGUI:
         ids = self._selected_job_ids()
         if not ids:
             return
-        if not messagebox.askyesno("确认清除缓存", "会删除选中任务的 images/cover/final.mp4，下次启动会重新调用生图 API 和合成视频。继续吗？"):
+        if not messagebox.askyesno("确认清除缓存", "会删除选中任务的图片、封面和最终视频，下次启动会重新调用生图 API 和合成视频。继续吗？"):
             return
         errors = []
         for job_id in ids:
@@ -1879,6 +2310,8 @@ class PipelineGUI:
                 row.get("stage_display", row.get("stage", "")),
                 f"{float(row.get('progress') or 0) * 100:.0f}%",
                 worker,
+                "导入 MP3" if st.get("audio_mode") == "imported" else "TTS",
+                f"已附加 {int(st.get('pronunciation_dictionary_entries') or 0)}条" if st.get("pronunciation_dictionary") else "未附加",
                 row.get("title", ""),
                 row.get("video", ""),
                 st.get("youtube_url", ""),

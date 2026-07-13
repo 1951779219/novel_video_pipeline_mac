@@ -11,6 +11,11 @@ class ImagePlan:
     image_index: int
     segments: list[Segment] = field(default_factory=list)
     duration: float = 0.0  # 累计音频秒数
+    highlight_segment_indexes: list[int] = field(default_factory=list)
+    highlight_text: str = ""
+    highlight_people: list[str] = field(default_factory=list)
+    highlight_location: str = ""
+    highlight_action: str = ""
 
     @property
     def text(self) -> str:

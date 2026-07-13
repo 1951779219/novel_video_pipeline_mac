@@ -26,6 +26,7 @@ COPY_FILES = (
 COPY_DIRS = ("app", "docs", "scripts")
 IGNORE_DIRS = {"__pycache__", ".git", ".venv", "dist"}
 IGNORE_SUFFIXES = {".pyc", ".pyo"}
+IGNORE_FILES = {".DS_Store"}
 
 
 def version() -> str:
@@ -95,17 +96,16 @@ def copy_source(staging: Path) -> None:
             rel_path = src.relative_to(src_dir)
             if any(part in IGNORE_DIRS for part in rel_path.parts):
                 continue
+            if src.name in IGNORE_FILES:
+                continue
             if src.suffix in IGNORE_SUFFIXES:
                 continue
             copy_file(src, staging / rel / rel_path)
 
 
 def copy_sanitized_data(staging: Path) -> None:
-    settings_src = ROOT / "data" / "settings.json"
-    if settings_src.exists():
-        settings = scrub_settings(json.loads(settings_src.read_text(encoding="utf-8")))
-    else:
-        settings = load_default_settings()
+    """Create clean defaults without reading any local user configuration."""
+    settings = load_default_settings()
 
     settings_dst = staging / "data" / "settings.json"
     settings_dst.parent.mkdir(parents=True, exist_ok=True)
@@ -118,22 +118,11 @@ def copy_sanitized_data(staging: Path) -> None:
         encoding="utf-8",
     )
 
-    profiles_src = ROOT / "data" / "profiles"
     profiles_dst = staging / "data" / "profiles"
-    if profiles_src.exists():
-        for src in profiles_src.glob("*.json"):
-            try:
-                profile = scrub_settings(json.loads(src.read_text(encoding="utf-8")))
-            except Exception:
-                continue
-            profiles_dst.mkdir(parents=True, exist_ok=True)
-            (profiles_dst / src.name).write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
-    has_profile = profiles_dst.exists() and any(profiles_dst.glob("*.json"))
-    if not has_profile:
-        profiles_dst.mkdir(parents=True, exist_ok=True)
-        (profiles_dst / "配置1.json").write_text(json.dumps(load_default_settings(), ensure_ascii=False, indent=2), encoding="utf-8")
-    template_profile = next(profiles_dst.glob("*.json"))
-    (defaults_dir / "profile.template.json").write_text(template_profile.read_text(encoding="utf-8"), encoding="utf-8")
+    profiles_dst.mkdir(parents=True, exist_ok=True)
+    default_profile = json.dumps(load_default_settings(), ensure_ascii=False, indent=2)
+    (profiles_dst / "配置1.json").write_text(default_profile, encoding="utf-8")
+    (defaults_dir / "profile.template.json").write_text(default_profile, encoding="utf-8")
 
     for rel in ("data/jobs", "data/runtime", "data/chrome_debug_profiles", "data/updates"):
         (staging / rel).mkdir(parents=True, exist_ok=True)

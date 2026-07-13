@@ -10,6 +10,7 @@ import hashlib
 import html
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import time
 import traceback
 import threading
+import unicodedata
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict
 from pathlib import Path
@@ -45,6 +47,16 @@ from app.character_analysis import (
     character_context_for_text,
     character_reference_prompt,
     visual_theme_context,
+)
+from app.storyboard_highlights import (
+    HIGHLIGHT_SYSTEM_PROMPT,
+    STORY_CONTEXT_SYSTEM_PROMPT,
+    fallback_highlight,
+    highlight_request,
+    normalize_highlight,
+    normalize_story_context,
+    parse_json_object,
+    sampled_story_input,
 )
 from app.utils.ffmpeg import ffmpeg_path
 from app.utils.secrets import redact_secret_text
@@ -117,8 +129,46 @@ def _noop(*_args, **_kwargs):
 
 
 _JOB_ID_LOCK = threading.Lock()
+_STATUS_WRITE_LOCK = threading.RLock()
 _JOB_ID_LAST_STAMP = ""
 _JOB_ID_SEQUENCE = 0
+_INVALID_FILENAME_CHARS_RE = re.compile(r'[\x00-\x1f\x7f/\\:<>"|?*]+')
+_WINDOWS_RESERVED_NAMES = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
+
+
+def safe_job_name(value: str, fallback: str = "article") -> str:
+    """Return a readable, cross-platform-safe project/output basename."""
+    name = unicodedata.normalize("NFKC", str(value or "")).strip()
+    name = _INVALID_FILENAME_CHARS_RE.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    if not name or name in {".", ".."}:
+        name = fallback
+    if name.casefold() in _WINDOWS_RESERVED_NAMES:
+        name = f"_{name}"
+    # Leave room for duplicate suffixes and output extensions on filesystems
+    # whose filename limit is measured in UTF-8 bytes.
+    if len(name.encode("utf-8")) > 180:
+        name = name.encode("utf-8")[:180].decode("utf-8", errors="ignore").rstrip(" .")
+    return name or fallback
+
+
+def new_named_job_id(name: str, fallback: str = "article") -> str:
+    """Use the imported filename as the job directory, without overwriting."""
+    base = safe_job_name(name, fallback=fallback)
+    with _JOB_ID_LOCK:
+        candidate = base
+        sequence = 1
+        while job_dir_for(candidate).exists():
+            sequence += 1
+            suffix = f"_{sequence}"
+            max_base_bytes = 180 - len(suffix.encode("utf-8"))
+            trimmed = base.encode("utf-8")[:max_base_bytes].decode("utf-8", errors="ignore").rstrip(" .")
+            candidate = f"{trimmed or fallback}{suffix}"
+        return candidate
 
 
 def new_job_id(prefix: str = "job") -> str:
@@ -144,6 +194,22 @@ def job_dir_for(job_id: str) -> Path:
     return JOBS_DIR / job_id
 
 
+def video_output_path(job_dir: Path) -> Path:
+    """Choose a readable final video name while retaining old-job behavior."""
+    output_basename = ""
+    status_path = job_dir / "status.json"
+    if status_path.exists():
+        try:
+            status = json.loads(status_path.read_text(encoding="utf-8"))
+            output_basename = str(status.get("output_basename") or "").strip()
+        except Exception:
+            pass
+    if not output_basename:
+        # Jobs created before readable names were introduced always used this.
+        return job_dir / "final.mp4"
+    return job_dir / f"{safe_job_name(output_basename)}.mp4"
+
+
 def append_log(job_dir: Path, message: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     with (job_dir / "log.txt").open("a", encoding="utf-8") as f:
@@ -159,26 +225,111 @@ def tail_log(job_id: str, lines: int = 240) -> str:
 
 
 def write_status(job_dir: Path, **updates):
-    job_dir.mkdir(parents=True, exist_ok=True)
-    path = job_dir / "status.json"
-    current = {}
-    if path.exists():
+    # TTS and image generation report progress from multiple threads.  Serialize
+    # their read/modify/write cycle and replace atomically so one reporter cannot
+    # erase fields (notably worker_pid) written by another reporter.
+    with _STATUS_WRITE_LOCK:
+        job_dir.mkdir(parents=True, exist_ok=True)
+        path = job_dir / "status.json"
+        current = {}
+        if path.exists():
+            try:
+                current = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                current = {}
+        current.update({key: redact_secret_text(value) if isinstance(value, str) else value for key, value in updates.items()})
+        current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        temp_path = job_dir / f".status.{os.getpid()}.{threading.get_ident()}.tmp"
+        temp_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, path)
+
+
+def _worker_pid_path(job_id: str) -> Path:
+    return job_dir_for(job_id) / "worker.pid"
+
+
+def record_worker_pid(job_id: str, pid: int) -> None:
+    path = _worker_pid_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(int(pid)), encoding="ascii")
+
+
+def clear_worker_pid(job_id: str, pid: int | None = None) -> None:
+    path = _worker_pid_path(job_id)
+    if pid is not None:
         try:
-            current = json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            current = {}
-    current.update({key: redact_secret_text(value) if isinstance(value, str) else value for key, value in updates.items()})
-    current["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+            if int(path.read_text(encoding="ascii").strip()) != int(pid):
+                return
+        except (FileNotFoundError, OSError, ValueError):
+            return
+    path.unlink(missing_ok=True)
 
 
-def load_status(job_id: str) -> dict:
+def worker_pid(job_id: str) -> int:
+    try:
+        pid = int(_worker_pid_path(job_id).read_text(encoding="ascii").strip())
+        if pid_alive(pid):
+            return pid
+    except (FileNotFoundError, OSError, ValueError):
+        pass
+    status = load_status(job_id, include_worker=False)
+    try:
+        pid = int(status.get("worker_pid") or 0)
+        if pid_alive(pid):
+            return pid
+    except (TypeError, ValueError):
+        pass
+    # Compatibility recovery for workers launched by an older build before the
+    # durable PID file existed.  This is intentionally an exact argv match.
+    legacy_active_stages = {
+        "worker_starting", "starting", "scrape", "clean", "tts",
+        "images_prefetch", "pacing", "images", "cover", "compose",
+        "upload", "stopping",
+    }
+    if os.name != "nt" and status.get("stage") in legacy_active_stages:
+        try:
+            output = subprocess.run(
+                ["ps", "-axo", "pid=,command="],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=3,
+                check=False,
+            ).stdout
+            for line in output.splitlines():
+                raw_pid, _, command = line.strip().partition(" ")
+                try:
+                    argv = shlex.split(command)
+                    index = argv.index("--job-id")
+                except (ValueError, IndexError):
+                    continue
+                is_pipeline_worker = any(
+                    argv[i] == "-m" and argv[i + 1] == "app.worker"
+                    for i in range(len(argv) - 1)
+                )
+                if is_pipeline_worker and index + 1 < len(argv) and argv[index + 1] == job_id:
+                    pid = int(raw_pid)
+                    if pid_alive(pid):
+                        record_worker_pid(job_id, pid)
+                        return pid
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+    return 0
+
+
+def load_status(job_id: str, *, include_worker: bool = True) -> dict:
     path = job_dir_for(job_id) / "status.json"
     if not path.exists():
         return {"job_id": job_id, "stage": "missing", "progress": 0}
     try:
         status = json.loads(path.read_text(encoding="utf-8"))
-        status["worker_alive"] = pid_alive(status.get("worker_pid"))
+        if include_worker:
+            durable_pid = worker_pid(job_id)
+            if durable_pid:
+                status["worker_pid"] = durable_pid
+            status["worker_alive"] = bool(durable_pid)
         status["stage_display"] = stage_display(status)
         return status
     except Exception as exc:
@@ -210,6 +361,8 @@ _STAGE_LABELS = {
 def stage_display(status: dict) -> str:
     stage = str(status.get("stage") or "")
     label = _STAGE_LABELS.get(stage, stage or "未知")
+    if stage == "tts" and str(status.get("audio_mode") or "") == "imported":
+        label = "3/6 读取导入音频"
     try:
         progress = max(0.0, min(1.0, float(status.get("progress") or 0)))
     except Exception:
@@ -227,7 +380,7 @@ def list_jobs(limit: int = 50) -> list[dict]:
     rows: list[dict] = []
     if not JOBS_DIR.exists():
         return rows
-    for d in sorted([p for p in JOBS_DIR.iterdir() if p.is_dir()], reverse=True):
+    for d in [p for p in JOBS_DIR.iterdir() if p.is_dir()]:
         st = load_status(d.name)
         rows.append(
             {
@@ -242,13 +395,14 @@ def list_jobs(limit: int = 50) -> list[dict]:
                 "updated_at": st.get("updated_at", ""),
             }
         )
-        if len(rows) >= limit:
-            break
-    return rows
+    # Project names are now human-readable instead of timestamp-prefixed, so
+    # alphabetical directory order no longer represents recency.
+    rows.sort(key=lambda row: (str(row.get("updated_at") or ""), row["job_id"]), reverse=True)
+    return rows[:limit]
 
 
 def is_worker_running(job_id: str) -> bool:
-    return bool(load_status(job_id).get("worker_alive"))
+    return bool(worker_pid(job_id))
 
 
 def count_running_workers() -> int:
@@ -320,7 +474,7 @@ def _terminate_process_tree(pid: int, *, timeout_seconds: float = 8.0) -> bool:
 def stop_job(job_id: str) -> bool:
     path = _safe_job_path(job_id)
     st = load_status(job_id)
-    pid = st.get("worker_pid")
+    pid = worker_pid(job_id) or st.get("worker_pid")
     try:
         pid_int = int(pid or 0)
     except Exception:
@@ -329,6 +483,7 @@ def stop_job(job_id: str) -> bool:
     if not path.exists():
         return False
     if not pid_int or not pid_alive(pid_int):
+        clear_worker_pid(job_id)
         write_status(
             path,
             stage="stopped" if st.get("stage") not in {"completed", "failed"} else st.get("stage"),
@@ -346,6 +501,7 @@ def stop_job(job_id: str) -> bool:
         append_log(path, f"stop failed: worker pid={pid_int} is still alive")
         raise RuntimeError(f"{job_id} 停止失败，worker pid={pid_int} 仍在运行")
     write_status(path, stage="stopped", worker_pid=None, stopped_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    clear_worker_pid(job_id, pid_int)
     append_log(path, f"worker pid={pid_int} stopped by user")
     return True
 
@@ -387,8 +543,6 @@ def clear_job_media_cache(job_id: str) -> None:
     for name in (
         "prompts.json",
         "compose_manifest.json",
-        "final.mp4",
-        "final.tmp.mp4",
         "audio_full.mp3",
         "subtitle.ass",
         "subtitle.srt",
@@ -396,6 +550,9 @@ def clear_job_media_cache(job_id: str) -> None:
         "upload_result.json",
     ):
         (path / name).unlink(missing_ok=True)
+    for video_path in {path / "final.mp4", video_output_path(path)}:
+        video_path.unlink(missing_ok=True)
+        video_path.with_name(video_path.stem + ".tmp" + video_path.suffix).unlink(missing_ok=True)
     write_status(path, stage="queued", progress=0.0, video="", youtube_url="", cover="")
     append_log(path, "media cache cleared: images/cover/final video will regenerate")
 
@@ -459,6 +616,7 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
             close_fds=False,
             **kwargs,
         )
+    record_worker_pid(job_id, process.pid)
     write_status(job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.0, worker_pid=process.pid)
     append_log(job_dir, f"worker pid={process.pid}")
     return job_id, int(process.pid)
@@ -637,10 +795,22 @@ def stage_scrape(
     return novel
 
 
-def stage_clean(novel: Novel, on_log: LogFn = _noop, job_dir: Path | None = None) -> list[Segment]:
+def stage_clean(
+    novel: Novel,
+    on_log: LogFn = _noop,
+    job_dir: Path | None = None,
+    preserve_source_text: bool = False,
+) -> list[Segment]:
     on_log("[2/6] 整理/洗稿 + 切片")
-    text = _strip_story_scaffold(novel.full_text, novel, on_log=on_log, job_dir=job_dir)
-    text = _rewrite_story_text(text, on_log=on_log, job_dir=job_dir)
+    if preserve_source_text:
+        # An imported narration was generated from this exact script.  Removing
+        # headings or rewriting the prose would make subtitles and images refer
+        # to words that are not present in the supplied audio.
+        text = str(novel.full_text or "").strip()
+        on_log("  导入音频模式：保留原文，跳过标题清理和 AI 洗稿")
+    else:
+        text = _strip_story_scaffold(novel.full_text, novel, on_log=on_log, job_dir=job_dir)
+        text = _rewrite_story_text(text, on_log=on_log, job_dir=job_dir)
     segs = split_segments(text)
     on_log(f"  OK 切成 {len(segs)} 段")
     if not segs:
@@ -862,6 +1032,203 @@ def _tts_config_hash() -> str:
     )
 
 
+TTS_PRONUNCIATION_DICTIONARY = "tts_pronunciation_dictionary.txt"
+IMPORTED_AUDIO_MANIFEST = "imported_audio.json"
+IMPORTED_AUDIO_FILENAME = "imported_narration.mp3"
+
+
+def parse_pronunciation_dictionary(text: str) -> list[tuple[str, str]]:
+    """Parse `written=reading` lines and return longest terms first."""
+    readings: dict[str, str] = {}
+    first_seen: dict[str, int] = {}
+    for line_number, raw_line in enumerate(str(text or "").lstrip("\ufeff").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.startswith("//"):
+            continue
+        separator = "=" if "=" in line else ("＝" if "＝" in line else "")
+        if not separator:
+            raise ValueError(f"读音词典第 {line_number} 行缺少 = 或 ＝：{line[:50]}")
+        written, reading = (part.strip() for part in line.split(separator, 1))
+        if not written or not reading:
+            raise ValueError(f"读音词典第 {line_number} 行的词语或读音为空")
+        previous = readings.get(written)
+        if previous is not None and previous != reading:
+            raise ValueError(
+                f"读音词典中的“{written}”有两个不同读音：{previous} / {reading}；"
+                "请只保留本任务需要的一个读音"
+            )
+        if written not in first_seen:
+            first_seen[written] = len(first_seen)
+        readings[written] = reading
+    if not readings:
+        raise ValueError("读音词典中没有可用条目；格式应为：汉字词语=假名读音")
+    return sorted(readings.items(), key=lambda item: (-len(item[0]), first_seen[item[0]]))
+
+
+def inspect_pronunciation_dictionary(source_path: str | Path) -> dict:
+    path = Path(source_path).expanduser()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"找不到读音词典：{path}")
+    source = path.read_text(encoding="utf-8-sig")
+    entries = parse_pronunciation_dictionary(source)
+    normalized = source.lstrip("\ufeff")
+    return {
+        "path": str(path),
+        "entries": len(entries),
+        "text": source,
+        "hash": _text_hash(normalized),
+    }
+
+
+def _apply_pronunciation_dictionary(text: str, entries: list[tuple[str, str]]) -> tuple[str, int]:
+    if not entries or not text:
+        return str(text or ""), 0
+    readings = dict(entries)
+    pattern = re.compile("|".join(re.escape(written) for written, _reading in entries))
+    replacements = 0
+
+    def replace(match: re.Match) -> str:
+        nonlocal replacements
+        replacements += 1
+        return readings[match.group(0)]
+
+    return pattern.sub(replace, str(text)), replacements
+
+
+def attach_pronunciation_dictionary(job_id: str, source_path: str | Path) -> dict:
+    """Copy a validated pronunciation dictionary into a job and invalidate its TTS."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再附加读音词典。")
+    info = inspect_pronunciation_dictionary(source_path)
+    job_dir = _safe_job_path(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    target = job_dir / TTS_PRONUNCIATION_DICTIONARY
+    target.write_text(str(info["text"]).lstrip("\ufeff"), encoding="utf-8")
+    reset_result = {"changed": 0, "segments": []}
+    if (job_dir / "segments.json").exists():
+        segments = _load_job_segments(job_dir)
+        reset_result = reset_tts_segments(job_id, indices=range(len(segments)))
+    write_status(
+        job_dir,
+        pronunciation_dictionary=TTS_PRONUNCIATION_DICTIONARY,
+        pronunciation_dictionary_entries=int(info["entries"]),
+        pronunciation_dictionary_hash=str(info["hash"]),
+    )
+    append_log(
+        job_dir,
+        f"pronunciation dictionary attached: {info['entries']} entries; "
+        f"TTS segments reset={reset_result.get('changed', 0)}",
+    )
+    return {
+        "job_id": job_id,
+        "entries": int(info["entries"]),
+        "hash": str(info["hash"]),
+        "path": str(target),
+        "reset_segments": int(reset_result.get("changed", 0)),
+    }
+
+
+def inspect_imported_audio(source_path: str | Path) -> dict:
+    """Validate an MP3 narration before it is copied into a job."""
+    path = Path(source_path).expanduser()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"找不到 MP3 音频：{path}")
+    if path.suffix.lower() != ".mp3":
+        raise ValueError("导入音频目前只支持 MP3 文件。")
+    duration = float(_audio_duration(path) or 0.0)
+    if duration <= 0.05:
+        raise ValueError(f"无法读取 MP3 时长，或音频为空：{path.name}")
+    signature = _file_signature(path)
+    if int(signature.get("size") or 0) < 512:
+        raise ValueError(f"MP3 文件过小或已损坏：{path.name}")
+    return {
+        "path": str(path.resolve()),
+        "name": path.name,
+        "duration": duration,
+        "size": int(signature.get("size") or 0),
+    }
+
+
+def attach_imported_audio(job_id: str, source_path: str | Path) -> dict:
+    """Copy a complete narration MP3 into a job and mark TTS as bypassed."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再导入 MP3。")
+    info = inspect_imported_audio(source_path)
+    job_dir = _safe_job_path(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    audio_dir = job_dir / "audio"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+    target = audio_dir / IMPORTED_AUDIO_FILENAME
+    source = Path(str(info["path"]))
+    if source.resolve() != target.resolve():
+        temp = target.with_suffix(".tmp.mp3")
+        temp.unlink(missing_ok=True)
+        shutil.copy2(source, temp)
+        temp.replace(target)
+
+    copied_duration = float(_audio_duration(target) or 0.0)
+    if copied_duration <= 0.05:
+        target.unlink(missing_ok=True)
+        raise ValueError("复制后的 MP3 无法读取，导入已取消。")
+    signature = _file_signature(target)
+    manifest = {
+        "mode": "imported_mp3",
+        "path": str(Path("audio") / IMPORTED_AUDIO_FILENAME),
+        "original_name": str(info["name"]),
+        "duration": round(copied_duration, 6),
+        "file_size": int(signature.get("size") or 0),
+        "file_mtime": float(signature.get("mtime") or 0),
+        "timing_mode": "text_weight_estimate",
+        "attached_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(job_dir / IMPORTED_AUDIO_MANIFEST, manifest)
+    _clear_downstream_after_tts_change(job_dir)
+    write_status(
+        job_dir,
+        stage="queued",
+        progress=0.0,
+        audio_mode="imported",
+        imported_audio=str(Path("audio") / IMPORTED_AUDIO_FILENAME),
+        imported_audio_name=str(info["name"]),
+        imported_audio_duration=round(copied_duration, 3),
+        worker_pid=None,
+        error="",
+        video="",
+        youtube_url="",
+    )
+    append_log(
+        job_dir,
+        f"imported narration attached: {info['name']} ({copied_duration:.1f}s); TTS will be skipped",
+    )
+    return {
+        "job_id": job_id,
+        "path": str(target),
+        "name": str(info["name"]),
+        "duration": copied_duration,
+    }
+
+
+def _job_imported_audio(job_dir: Path) -> tuple[Path, dict] | None:
+    manifest_path = job_dir / IMPORTED_AUDIO_MANIFEST
+    if not manifest_path.exists():
+        return None
+    manifest = _read_json(manifest_path, {})
+    if not isinstance(manifest, dict) or str(manifest.get("mode") or "") != "imported_mp3":
+        raise RuntimeError("导入音频记录已损坏，请重新创建“正文 + MP3”任务。")
+    relative = Path(str(manifest.get("path") or Path("audio") / IMPORTED_AUDIO_FILENAME))
+    audio_path = relative if relative.is_absolute() else job_dir / relative
+    try:
+        resolved = audio_path.resolve()
+        root = job_dir.resolve()
+    except OSError as exc:
+        raise RuntimeError(f"无法读取导入的 MP3：{exc}") from exc
+    if resolved == root or root not in resolved.parents:
+        raise RuntimeError("导入音频路径不安全，请重新创建任务。")
+    if not resolved.exists():
+        raise FileNotFoundError("任务内的导入 MP3 已丢失，请重新创建“正文 + MP3”任务。")
+    return resolved, manifest
+
+
 def _load_tts_manifest(path: Path) -> dict:
     data = _read_json(path, {})
     if not isinstance(data, dict):
@@ -931,9 +1298,13 @@ def _tts_cache_matches(entry: dict | None, expected: dict, out: Path) -> bool:
     return float(entry.get("duration") or 0) > 0.05
 
 
-def _tts_expected_for_segment(seg: Segment, config_hash: str | None = None) -> dict:
+def _tts_expected_for_segment(
+    seg: Segment,
+    config_hash: str | None = None,
+    narration_text: str | None = None,
+) -> dict:
     return {
-        "text_hash": _text_hash(seg.text),
+        "text_hash": _text_hash(seg.text if narration_text is None else narration_text),
         "config_hash": config_hash or _tts_config_hash(),
         "provider": config.tts_provider,
         "voice": config.tts_voice,
@@ -1196,17 +1567,18 @@ def _safe_unlink_under(root: Path, value) -> None:
 
 
 def _clear_downstream_after_tts_change(job_dir: Path) -> None:
-    for name in ("_clips", "_prefetch_images"):
+    # TTS duration changes invalidate video clips and pacing, but not the generated
+    # story images or their prefetch cache. Keeping images avoids paid regeneration.
+    for name in ("_clips",):
         target = job_dir / name
         if target.exists():
             shutil.rmtree(target)
     for name in (
         "durations.json",
+        "imported_audio_timing.json",
         "plans.json",
         "plans_prefetch.json",
         "compose_manifest.json",
-        "final.mp4",
-        "final.tmp.mp4",
         "audio_full.mp3",
         "subtitle.ass",
         "subtitle.srt",
@@ -1214,6 +1586,9 @@ def _clear_downstream_after_tts_change(job_dir: Path) -> None:
         "upload_result.json",
     ):
         (job_dir / name).unlink(missing_ok=True)
+    for video_path in {job_dir / "final.mp4", video_output_path(job_dir)}:
+        video_path.unlink(missing_ok=True)
+        video_path.with_name(video_path.stem + ".tmp" + video_path.suffix).unlink(missing_ok=True)
 
 
 def _refresh_tts_manifest_header(manifest: dict, total: int) -> None:
@@ -1335,6 +1710,19 @@ def _stage_tts_manifest_impl(
     on_log: LogFn,
     on_prog: ProgFn,
 ) -> tuple[list[Path], list[float]]:
+    dictionary_path = job_dir / TTS_PRONUNCIATION_DICTIONARY
+    dictionary_entries: list[tuple[str, str]] = []
+    dictionary_hash = ""
+    narration_texts = [seg.text for seg in segments]
+    replacement_counts = [0 for _seg in segments]
+    if dictionary_path.exists() and config.tts_provider == "edge":
+        dictionary_source = dictionary_path.read_text(encoding="utf-8-sig")
+        dictionary_entries = parse_pronunciation_dictionary(dictionary_source)
+        dictionary_hash = _text_hash(dictionary_source.lstrip("\ufeff"))
+        applied = [_apply_pronunciation_dictionary(seg.text, dictionary_entries) for seg in segments]
+        narration_texts = [item[0] for item in applied]
+        replacement_counts = [item[1] for item in applied]
+
     workers = _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
     segment_timeout_seconds = _bounded_timeout(config.get("tts_segment_timeout_seconds", 180), 180.0)
     stall_retry_seconds = _optional_timeout(config.get("tts_stall_fallback_seconds", 240), 240.0, minimum=5.0)
@@ -1345,6 +1733,15 @@ def _stage_tts_manifest_impl(
         f"timeout={segment_timeout_seconds:.0f}s stall_retry_log={stall_retry_seconds:.0f}s "
         f"retry_until_success={'on' if retry_until_success else 'off'} waveform_check={'on' if config.get('tts_waveform_validation', True) else 'off'}"
     )
+    if dictionary_entries:
+        changed_segments = sum(1 for count in replacement_counts if count)
+        total_replacements = sum(replacement_counts)
+        on_log(
+            f"  pronunciation dictionary: {len(dictionary_entries)} entries, "
+            f"{total_replacements} replacements in {changed_segments}/{len(segments)} segments"
+        )
+    elif dictionary_path.exists() and config.tts_provider != "edge":
+        on_log("  pronunciation dictionary is attached but only applies when TTS provider=edge")
 
     def make_tts() -> TTSBackend:
         return TTSBackend(
@@ -1368,8 +1765,45 @@ def _stage_tts_manifest_impl(
     manifest = _load_tts_manifest(manifest_path)
     manifest_lock = threading.Lock()
     _refresh_tts_manifest_header(manifest, len(segments))
+    if dictionary_hash:
+        manifest["config_hash"] = _stable_hash(
+            {"tts_config_hash": manifest["config_hash"], "pronunciation_dictionary_hash": dictionary_hash}
+        )
+        manifest["pronunciation_dictionary"] = TTS_PRONUNCIATION_DICTIONARY
+        manifest["pronunciation_dictionary_entries"] = len(dictionary_entries)
+        manifest["pronunciation_dictionary_hash"] = dictionary_hash
+    else:
+        for key in (
+            "pronunciation_dictionary",
+            "pronunciation_dictionary_entries",
+            "pronunciation_dictionary_hash",
+        ):
+            manifest.pop(key, None)
     manifest["parallel"] = workers
     _write_json(manifest_path, manifest)
+
+    preview_path = audio_dir / "tts_pronunciation_preview.json"
+    if dictionary_entries:
+        _write_json(
+            preview_path,
+            {
+                "dictionary": TTS_PRONUNCIATION_DICTIONARY,
+                "entries": len(dictionary_entries),
+                "total_replacements": sum(replacement_counts),
+                "changed_segments": [
+                    {
+                        "index": i,
+                        "replacements": replacement_counts[i],
+                        "original": seg.text,
+                        "tts_text": narration_texts[i],
+                    }
+                    for i, seg in enumerate(segments)
+                    if replacement_counts[i]
+                ],
+            },
+        )
+    else:
+        preview_path.unlink(missing_ok=True)
 
     audios: list[Path | None] = [None] * len(segments)
     durations: list[float] = [0.0] * len(segments)
@@ -1413,7 +1847,12 @@ def _stage_tts_manifest_impl(
 
     def process_segment(i: int, seg: Segment) -> tuple[int, Path, float]:
         out = audio_dir / f"seg_{i:05d}.mp3"
-        expected = _tts_expected_for_segment(seg, str(manifest["config_hash"]))
+        narration_text = narration_texts[i]
+        expected = _tts_expected_for_segment(
+            seg,
+            str(manifest["config_hash"]),
+            narration_text=narration_text,
+        )
         with manifest_lock:
             entry = _tts_manifest_entry(manifest, i)
         d = 0.0
@@ -1436,6 +1875,9 @@ def _stage_tts_manifest_impl(
                 )
                 on_log(f"  WARN seg{i} cached TTS invalid, retrying: {exc}")
                 d = 0.0
+        elif out.exists() and entry is not None:
+            out.unlink(missing_ok=True)
+            on_log(f"  TTS seg{i} text/settings changed; regenerating cached audio")
         elif out.exists():
             try:
                 d, waveform = _validate_tts_audio(out)
@@ -1488,7 +1930,7 @@ def _stage_tts_manifest_impl(
                                 },
                             )
                             mark_running(i, attempt)
-                            d = _synth_tts_segment(tts, seg.text, tmp, segment_timeout_seconds)
+                            d = _synth_tts_segment(tts, narration_text, tmp, segment_timeout_seconds)
                         d, waveform = _validate_tts_audio(tmp)
                         tmp.replace(out)
                         set_manifest(_ready_tts_entry(i, seg, out, d, expected, waveform=waveform))
@@ -1597,6 +2039,51 @@ def stage_tts(
     on_log: LogFn = _noop,
     on_prog: ProgFn = _noop,
 ) -> tuple[list[Path], list[float]]:
+    imported = _job_imported_audio(job_dir)
+    if imported is not None:
+        audio_path, manifest = imported
+        total_duration = float(_audio_duration(audio_path) or 0.0)
+        if total_duration <= 0.05:
+            raise RuntimeError("导入的 MP3 无法读取或时长为 0，请重新导入。")
+        if not segments:
+            raise RuntimeError("没有可用的文本切片，无法为导入音频生成时间轴。")
+        weights = [max(0.001, _estimated_speech_duration(seg.text)) for seg in segments]
+        weight_total = sum(weights)
+        durations = [total_duration * weight / weight_total for weight in weights]
+        durations[-1] += total_duration - sum(durations)
+        _write_json(job_dir / "durations.json", durations)
+
+        cursor = 0.0
+        timing_rows = []
+        for seg, duration in zip(segments, durations):
+            timing_rows.append(
+                {
+                    "index": int(seg.index),
+                    "start": round(cursor, 6),
+                    "end": round(cursor + duration, 6),
+                    "duration": round(duration, 6),
+                    "text": seg.text,
+                }
+            )
+            cursor += duration
+        _write_json(
+            job_dir / "imported_audio_timing.json",
+            {
+                "mode": "text_weight_estimate",
+                "audio": str(audio_path),
+                "audio_duration": round(total_duration, 6),
+                "original_name": str(manifest.get("original_name") or audio_path.name),
+                "note": "No word timestamps were supplied; segment timing is estimated from text length.",
+                "segments": timing_rows,
+            },
+        )
+        on_log(
+            f"[3/6] 使用导入 MP3，跳过 TTS：{manifest.get('original_name') or audio_path.name} "
+            f"({total_duration:.1f}s, {len(segments)} 个文本段)"
+        )
+        on_log("  字幕和画面时间轴按各段文本长度估算，总时长与 MP3 严格一致")
+        on_prog(1.0)
+        return [audio_path], durations
     return _stage_tts_manifest_impl(segments, job_dir, on_log, on_prog)
 
 
@@ -1672,6 +2159,62 @@ def stage_character_analysis(
     characters = payload.get("characters") if isinstance(payload, dict) else []
     on_log(f"  OK character profiles: {len(characters) if isinstance(characters, list) else 0} characters -> {out.name}")
     return payload
+
+
+def stage_story_context(
+    novel: Novel,
+    segments: list[Segment],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+) -> dict:
+    """Build one cached global background guide for highlight selection.
+
+    The guide is deliberately not an image prompt: local numbered narration remains
+    the only source allowed to introduce visible people, actions, and objects.
+    """
+    if not bool(config.get("storyboard_highlight_enabled", True)):
+        return {}
+    max_chars = int(config.get("storyboard_highlight_context_max_chars", 18000) or 18000)
+    source = sampled_story_input(novel, segments, max_chars)
+    route = _llm_route_settings()
+    input_hash = _stable_hash({
+        "schema": "video_image_solution_1_story_context_v1",
+        "source": source,
+        "provider": route["provider"],
+        "model": route["model"],
+        "prompt": STORY_CONTEXT_SYSTEM_PROMPT,
+    })
+    out = job_dir / "story_visual_context.json"
+    cached = _read_json(out, {})
+    if isinstance(cached, dict) and cached.get("input_hash") == input_hash:
+        on_log("  reuse story visual context for highlight selection")
+        return normalize_story_context(cached.get("context"))
+
+    fallback = normalize_story_context({
+        "story_summary": str(novel.description or "").strip()[:600],
+        "era_and_world": "Follow the local narration exactly.",
+    })
+    if not _can_call_text_llm():
+        _write_json(out, {"schema": "video_image_solution_1", "input_hash": input_hash, "context": fallback, "fallback_used": True})
+        on_log("  WARN story context analysis skipped: no usable text LLM")
+        return fallback
+
+    llm = LLMBackend(
+        provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"],
+        model=route["model"], system_prompt=STORY_CONTEXT_SYSTEM_PROMPT,
+        style_suffix="", temperature=0.15, max_tokens=1200,
+    )
+    try:
+        with external_api_slot(action="story visual context"):
+            raw = llm.complete(STORY_CONTEXT_SYSTEM_PROMPT, source, max_tokens=1200, temperature=0.15)
+        context = normalize_story_context(parse_json_object(raw))
+        _write_json(out, {"schema": "video_image_solution_1", "input_hash": input_hash, "context": context, "fallback_used": False})
+        on_log("  OK story visual context ready for highlight selection")
+        return context
+    except Exception as exc:
+        _write_json(out, {"schema": "video_image_solution_1", "input_hash": input_hash, "context": fallback, "fallback_used": True, "error": str(redact_secret_text(exc))})
+        on_log(f"  WARN story context analysis failed: {redact_secret_text(exc)}; using local narration only")
+        return fallback
 
 
 def _image_route_settings(role: str) -> dict:
@@ -1789,7 +2332,10 @@ def _reference_images_for_text(analysis: dict | None, text: str, *, max_count: i
             names.extend(str(x).strip() for x in aliases)
         if any(name and name in haystack for name in names):
             matched.append(item)
-    if bool(config.get("character_analysis_always_include_protagonists", True)):
+    if (
+        bool(config.get("character_analysis_always_include_protagonists", True))
+        and not bool(config.get("storyboard_highlight_enabled", True))
+    ):
         for item in characters:
             if not isinstance(item, dict):
                 continue
@@ -1931,6 +2477,7 @@ def stage_storyboard_and_image(
     plans: list[ImagePlan],
     job_dir: Path,
     character_analysis: dict | None = None,
+    story_context: dict | None = None,
     on_log: LogFn = _noop,
     on_prog: ProgFn = _noop,
 ) -> list[Path]:
@@ -1968,13 +2515,28 @@ def stage_storyboard_and_image(
 
     def process_image(i: int, plan: ImagePlan) -> tuple[int, Path, str]:
         out = img_dir / f"img_{i:05d}.png"
-        base_prompt = _prompt_for_plan(make_llm(), plan, on_log, i)
+        base_prompt, highlight = _prompt_for_plan(make_llm(), plan, story_context or {}, on_log, i)
+        grounding_text = " ".join([
+            str(highlight.get("highlight_text") or ""),
+            " ".join(str(x) for x in (highlight.get("people") or [])),
+            str(highlight.get("location") or ""),
+            str(highlight.get("action") or ""),
+        ])
+        plan.highlight_segment_indexes = list(highlight.get("segment_indexes") or [])
+        plan.highlight_text = str(highlight.get("highlight_text") or "")
+        plan.highlight_people = list(highlight.get("people") or [])
+        plan.highlight_location = str(highlight.get("location") or "")
+        plan.highlight_action = str(highlight.get("action") or "")
         theme_context = visual_theme_context(character_analysis) if bool(config.get("scene_inject_visual_theme", True)) else ""
         character_context = character_context_for_text(
             character_analysis,
-            plan.text,
+            grounding_text or plan.text,
             max_characters=int(config.get("character_analysis_max_characters_per_prompt", 4) or 4),
-            always_include_protagonists=bool(config.get("character_analysis_always_include_protagonists", True)),
+            # In highlight mode, a protagonist absent from the selected moment must not be invented.
+            always_include_protagonists=(
+                bool(config.get("character_analysis_always_include_protagonists", True))
+                and not bool(config.get("storyboard_highlight_enabled", True))
+            ),
         ) if bool(config.get("scene_inject_character_triggers", True)) else ""
         if theme_context and theme_context not in character_context:
             base_prompt = f"{base_prompt}. {theme_context}"
@@ -1983,12 +2545,21 @@ def stage_storyboard_and_image(
         prompt = _policy_safe_image_prompt(base_prompt, fallback_text=plan.text)
         reference_paths = _reference_images_for_text(
             character_analysis,
-            plan.text,
+            grounding_text or plan.text,
             max_count=int(config.get("scene_reference_max_images", 2) or 2),
         ) if bool(config.get("scene_reference_enabled", False)) else []
         prompts_log[i] = {
             "index": i,
             "text": plan.text,
+            "solution": "视频生图解决方案1",
+            "story_context": story_context or {},
+            "highlight_segment_indexes": plan.highlight_segment_indexes,
+            "highlight_text": plan.highlight_text,
+            "highlight_people": plan.highlight_people,
+            "highlight_location": plan.highlight_location,
+            "highlight_action": plan.highlight_action,
+            "excluded_people": highlight.get("excluded_people") or [],
+            "highlight_fallback_used": bool(highlight.get("fallback_used")),
             "prompt": prompt,
             "theme_context": theme_context,
             "character_context": character_context,
@@ -2010,7 +2581,9 @@ def stage_storyboard_and_image(
                             "distance, lighting, and environment; no direct harm or explicit content.",
                             fallback_text=plan.text,
                         )
-                        prompts_log[i] = {"index": i, "text": plan.text, "prompt": attempt_prompt, "safe_retry": True}
+                        if isinstance(prompts_log[i], dict):
+                            prompts_log[i]["prompt"] = attempt_prompt
+                            prompts_log[i]["safe_retry"] = True
                         on_log(f"  image {i + 1}/{len(plans)} retry with safer prompt")
                     if scene_route["provider"] == "placeholder":
                         make_image_backend("placeholder").generate(
@@ -2774,17 +3347,18 @@ def _stage_compose_manifest_impl(
         chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
         max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
     )
-    if config.video_external_subtitle:
-        build_srt(
-            subs,
-            job_dir / "subtitle.srt",
-            chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
-            max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
-        )
+    # Always keep an SRT fallback. FFmpeg builds without libass cannot burn ASS
+    # subtitles, but can still embed SRT as a selectable mov_text track.
+    build_srt(
+        subs,
+        job_dir / "subtitle.srt",
+        chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
+        max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+    )
 
     bgm = Path(config.video_bgm_path) if config.video_bgm_path else None
     image_durations = [p.duration for p in plans]
-    out = job_dir / "final.mp4"
+    out = video_output_path(job_dir)
     final_hash = _stable_hash(
         {
             "kind": "final_video_v2",
@@ -3127,16 +3701,16 @@ def stage_compose(
         chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
         max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
     )
-    if config.video_external_subtitle:
-        build_srt(
-            subs,
-            job_dir / "subtitle.srt",
-            chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
-            max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
-        )
+    # Always keep an SRT fallback for FFmpeg builds without libass.
+    build_srt(
+        subs,
+        job_dir / "subtitle.srt",
+        chars_per_line=int(config.get("video_subtitle_chars_per_line", 24) or 24),
+        max_lines=int(config.get("video_subtitle_max_lines", 2) or 2),
+    )
 
     bgm = Path(config.video_bgm_path) if config.video_bgm_path else None
-    out = job_dir / "final.mp4"
+    out = video_output_path(job_dir)
     build_video(
         images=images,
         image_durations=[p.duration for p in plans],
@@ -3220,21 +3794,30 @@ def run_full(
     log(f"== Job {job_id} ==")
     progress("starting", 0.0, input=url_or_id, site=config.scraper_site, worker_pid=os.getpid(), started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
+        imported_audio_mode = (job_dir / IMPORTED_AUDIO_MANIFEST).exists()
         progress("scrape", 0.03)
         novel = timed(
             "1_scrape",
             stage_scrape,
             url_or_id,
             site=config.scraper_site,
-            max_chars=config.scraper_max_chars,
+            max_chars=0 if imported_audio_mode else config.scraper_max_chars,
             on_log=log,
         )
         _write_novel(job_dir / "novel.json", novel)
         metadata = timed("2_metadata", stage_metadata, novel, job_dir, on_log=log)
         progress("clean", 0.10, title=novel.title, short_title=metadata.get("short_title", ""))
 
-        segments = timed("3_clean", stage_clean, novel, on_log=log, job_dir=job_dir)
+        segments = timed(
+            "3_clean",
+            stage_clean,
+            novel,
+            on_log=log,
+            job_dir=job_dir,
+            preserve_source_text=imported_audio_mode,
+        )
         _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
+        story_context = timed("4_story_context", stage_story_context, novel, segments, job_dir, on_log=log)
         character_analysis = timed("4_character_analysis", stage_character_analysis, novel, segments, job_dir, on_log=log)
         character_analysis = timed("4b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
         progress("tts", 0.15, title=novel.title)
@@ -3263,6 +3846,7 @@ def run_full(
                 prefetch_plans,
                 prefetch_dir,
                 character_analysis,
+                story_context,
                 log,
                 lambda p: progress("images_prefetch", 0.18 + p * 0.28, title=novel.title),
             )
@@ -3285,6 +3869,7 @@ def run_full(
                             plans,
                             job_dir,
                             character_analysis,
+                            story_context,
                             on_log=log,
                             on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
                         )
@@ -3300,6 +3885,7 @@ def run_full(
                         plans,
                         job_dir,
                         character_analysis,
+                        story_context,
                         on_log=log,
                         on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
                     )
@@ -3326,9 +3912,12 @@ def run_full(
                 plans,
                 job_dir,
                 character_analysis,
+                story_context,
                 on_log=log,
                 on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
             )
+        _finalize_highlight_timeline(plans, segments, durs, job_dir, on_log=log)
+        _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
         progress("cover", 0.89, title=novel.title)
         cover = timed("7_cover", stage_cover, novel, segments, job_dir, on_log=log)
         progress("compose", 0.90, title=novel.title, cover=str(cover or ""))
@@ -3372,7 +3961,38 @@ def run_full(
         raise
 
 
-def _prompt_for_plan(llm: LLMBackend, plan: ImagePlan, on_log: LogFn, index: int) -> str:
+def _prompt_for_plan(
+    llm: LLMBackend,
+    plan: ImagePlan,
+    story_context: dict,
+    on_log: LogFn,
+    index: int,
+) -> tuple[str, dict]:
+    if bool(config.get("storyboard_highlight_enabled", True)):
+        max_segments = int(config.get("storyboard_highlight_max_segments", 3) or 3)
+        highlight = fallback_highlight(plan.segments)
+        if _can_call_text_llm():
+            request = highlight_request(plan.segments, story_context, max_segments)
+            try:
+                with external_api_slot(action=f"highlight storyboard {index}"):
+                    raw = llm.complete(HIGHLIGHT_SYSTEM_PROMPT, request, max_tokens=900, temperature=0.15)
+                highlight = normalize_highlight(parse_json_object(raw), plan.segments, max_segments=max_segments)
+            except Exception as exc:
+                on_log(f"  WARN highlight storyboard {index} failed: {exc}; using grounded local fallback")
+        selected_text = str(highlight.get("highlight_text") or plan.text)
+        generated = str(highlight.get("image_prompt_en") or "").strip()
+        if generated:
+            excluded = ", ".join(str(x) for x in (highlight.get("excluded_people") or []) if str(x).strip())
+            exclusion = f" Do not show these people: {excluded}." if excluded else ""
+            grounding = (
+                "Depict only this selected narration event; do not import other events or people from the broader story. "
+                f"Selected source moment: {selected_text[:700]}."
+                + exclusion
+            )
+            prompt = _with_image_prefix(f"{generated}. {grounding} {config.llm_image_style_suffix}")
+            return _policy_safe_image_prompt(prompt, fallback_text=selected_text), highlight
+        return _fallback_storyboard_prompt(selected_text), highlight
+
     prefix = str(config.get("llm_image_prompt_prefix", "") or "").strip()
     context = {
         "text": plan.text,
@@ -3391,10 +4011,11 @@ def _prompt_for_plan(llm: LLMBackend, plan: ImagePlan, on_log: LogFn, index: int
     if _can_call_text_llm():
         try:
             with external_api_slot(action=f"storyboard {index}"):
-                return _policy_safe_image_prompt(_with_image_prefix(llm.storyboard(request)), fallback_text=plan.text)
+                prompt = _policy_safe_image_prompt(_with_image_prefix(llm.storyboard(request)), fallback_text=plan.text)
+                return prompt, fallback_highlight(plan.segments)
         except Exception as exc:
             on_log(f"  WARN storyboard {index} LLM failed: {exc}; using safe template fallback")
-    return _fallback_storyboard_prompt(plan.text)
+    return _fallback_storyboard_prompt(plan.text), fallback_highlight(plan.segments)
 
 
 def _with_image_prefix(prompt: str) -> str:
@@ -3440,6 +4061,73 @@ def _copy_prefetched_images(paths: list[Path], prefetch_dir: Path, job_dir: Path
     return final_paths
 
 
+def _finalize_highlight_timeline(
+    plans: list[ImagePlan],
+    segments: list[Segment],
+    durations: list[float],
+    job_dir: Path,
+    on_log: LogFn = _noop,
+) -> None:
+    """Center unchanged image count around selected narration highlights."""
+    if not plans or not bool(config.get("storyboard_highlight_enabled", True)):
+        return
+    rows = _read_json(job_dir / "prompts.json", [])
+    by_image = {
+        int(row.get("index")): row
+        for row in rows
+        if isinstance(row, dict) and str(row.get("index", "")).lstrip("-").isdigit()
+    } if isinstance(rows, list) else {}
+    timing: dict[int, tuple[float, float]] = {}
+    cursor = 0.0
+    for seg, duration in zip(segments, durations):
+        end = cursor + max(0.05, float(duration))
+        timing[int(seg.index)] = (cursor, end)
+        cursor = end
+    total = cursor
+    if total <= 0.05:
+        return
+
+    anchors: list[float] = []
+    for i, plan in enumerate(plans):
+        row = by_image.get(i, {})
+        indexes = []
+        for raw in row.get("highlight_segment_indexes") or []:
+            try:
+                idx = int(raw)
+            except Exception:
+                continue
+            if idx in timing:
+                indexes.append(idx)
+        if indexes:
+            plan.highlight_segment_indexes = indexes
+            plan.highlight_text = str(row.get("highlight_text") or "")
+            plan.highlight_people = [str(x) for x in (row.get("highlight_people") or [])]
+            plan.highlight_location = str(row.get("highlight_location") or "")
+            plan.highlight_action = str(row.get("highlight_action") or "")
+            anchors.append((timing[indexes[0]][0] + timing[indexes[-1]][1]) / 2.0)
+        else:
+            plan_indexes = [int(s.index) for s in plan.segments if int(s.index) in timing]
+            if plan_indexes:
+                anchors.append((timing[plan_indexes[0]][0] + timing[plan_indexes[-1]][1]) / 2.0)
+            else:
+                anchors.append(total * (i + 0.5) / len(plans))
+
+    if not bool(config.get("storyboard_highlight_align_timeline", True)) or len(plans) == 1:
+        return
+    boundaries = [0.0]
+    for left, right in zip(anchors, anchors[1:]):
+        boundaries.append(max(boundaries[-1] + 0.05, min(total, (left + right) / 2.0)))
+    boundaries.append(total)
+    if len(boundaries) != len(plans) + 1 or boundaries[-2] >= total:
+        on_log("  WARN highlight timeline alignment skipped: invalid highlight ordering")
+        return
+    for i, plan in enumerate(plans):
+        plan.duration = max(0.05, boundaries[i + 1] - boundaries[i])
+    # Correct tiny floating-point drift without changing image count.
+    plans[-1].duration += total - sum(p.duration for p in plans)
+    on_log(f"  highlight timeline aligned: {len(plans)} images unchanged, total={total:.1f}s")
+
+
 def _estimated_speech_duration(text: str) -> float:
     compact = "".join(text.split())
     return max(1.2, min(45.0, len(compact) / 4.2))
@@ -3470,5 +4158,11 @@ def _image_plan_to_dict(plan: ImagePlan) -> dict:
     return {
         "image_index": plan.image_index,
         "duration": plan.duration,
+        "solution": "视频生图解决方案1" if bool(config.get("storyboard_highlight_enabled", True)) else "legacy",
+        "highlight_segment_indexes": list(plan.highlight_segment_indexes),
+        "highlight_text": plan.highlight_text,
+        "highlight_people": list(plan.highlight_people),
+        "highlight_location": plan.highlight_location,
+        "highlight_action": plan.highlight_action,
         "segments": [{"index": s.index, "text": s.text} for s in plan.segments],
     }

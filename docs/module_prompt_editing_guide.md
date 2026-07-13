@@ -27,7 +27,7 @@
 | 人设参考图 | 图片与提示词 | `app/backends/image.py`, `app/pipeline_runner.py` | `character_reference_manifest.json` |
 | 剧情图 | 图片与提示词 | `app/backends/image.py`, `app/pipeline_runner.py` | `images/`, `prompts.json` |
 | 封面 | 封面配置 | `app/backends/image.py`, `app/pipeline_runner.py` | `cover/` |
-| 合成视频 | 字幕/视频配置 | `app/stages/stage6_compose.py`, `app/pipeline_runner.py` | `final.mp4`, `subtitle.srt` |
+| 合成视频 | 字幕/视频配置 | `app/stages/stage6_compose.py`, `app/pipeline_runner.py` | `{输入文件名}.mp4`, `subtitle.srt` |
 | 浏览器上传 | 批量与上传 | `app/upload.py`, `app/vendor/stage5_upload_browser.py` | `upload_result.json` |
 | 依赖检测 | 依赖检测 | `app/dependency_manager.py`, `scripts/setup_macos.sh` | `data/dependency_report.json` |
 
@@ -88,6 +88,14 @@ GUI 里的 `人设图 workflow(仅 ComfyUI)`、`剧情参考 workflow(仅 ComfyU
 
 ## 剧情图提示词怎么改
 
+### 视频生图解决方案1（高光点选图）
+
+开启“智能选择旁白高光点（不增加图片数）”后，`pacing_seconds_per_image` 只决定图片预算。例如总旁白 1800 秒、每图 300 秒，仍生成约 6 张图。程序先生成 `story_visual_context.json`，再从每个预算窗口的带编号旁白段中选择 1～3 个连续段作为唯一高光事件。全篇背景只能约束时代、世界观和关系，不能向当前画面添加旁白高光中没有的人物或事件。
+
+开启“按高光旁白调整换图时间”后，程序会在图片总数不变、视频总时长不变的前提下，把相邻图片的切换点调整到两个高光时间的中间。最终选择结果记录在 `prompts.json` 和 `plans.json` 的 `highlight_*` 字段中。
+
+旧任务已有图片时仍会复用缓存。要让旧任务应用本方案，需要先在任务队列点击“清除图片缓存”再重新运行。
+
 剧情图由两层组成：
 
 1. `llm_image_prompt_prefix`：每张图都会带上的通用前缀，比如画风、角色年龄、无文字、构图要求。
@@ -126,7 +134,7 @@ python3 -m compileall app
 - `prompts.json` 里出现新提示词或新前缀。
 - `character_profiles.json` 里人设输出合理。
 - `cover/` 里的封面是新风格。
-- `final.mp4` 能生成。
+- 与输入文件同名的 `.mp4` 能生成。
 
 ## 常见问题
 
