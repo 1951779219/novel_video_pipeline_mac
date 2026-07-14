@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.0.24-mac-update
+
+- Added per-job non-sensitive settings snapshots so a launched task stays pinned to the selected profile while API keys are passed only through the worker process environment.
+- Ensured API key fields are omitted entirely from task snapshots and generated release JSON files.
+- Added compose-only retry, optional chapter-heading narration, safe framing for motion effects, and queue layout improvements.
+
 ## v1.0.23-mac-update
 
 - Added a centralized “API Settings & Keys” section with masked secret fields, visibility toggles, and copy controls, while keeping model fields mirrored in their business sections.

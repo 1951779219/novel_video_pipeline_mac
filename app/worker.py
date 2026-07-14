@@ -13,6 +13,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--input", required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--compose-only", action="store_true", help="only rebuild the final video from cached artifacts")
     args = parser.parse_args(argv)
 
     job_dir = pr.job_dir_for(args.job_id)
@@ -20,10 +21,32 @@ def main(argv: list[str] | None = None) -> int:
     pr.write_status(job_dir, job_id=args.job_id, worker_pid=os.getpid(), stage="worker_starting")
     pr.append_log(job_dir, f"== worker pid={os.getpid()} starting ==")
     try:
-        pr.run_full(args.input, job_id=args.job_id, resume=args.resume)
+        if args.compose_only:
+            pr.write_status(job_dir, job_id=args.job_id, worker_pid=os.getpid(), stage="compose", progress=0.90, error="")
+            video = pr.resume_compose_only(args.job_id, on_log=lambda message: pr.append_log(job_dir, message))
+            pr.write_status(
+                job_dir,
+                job_id=args.job_id,
+                worker_pid=None,
+                stage="completed",
+                progress=1.0,
+                video=str(video),
+                error="",
+            )
+        else:
+            pr.run_full(args.input, job_id=args.job_id, resume=args.resume)
         return 0
     except Exception as exc:
         pr.append_log(job_dir, f"== worker failed: {exc} ==")
+        if args.compose_only:
+            pr.write_status(
+                job_dir,
+                job_id=args.job_id,
+                worker_pid=None,
+                stage="failed",
+                progress=0.90,
+                error=str(exc),
+            )
         return 1
     finally:
         pr.append_log(job_dir, f"== worker pid={os.getpid()} stopped ==")

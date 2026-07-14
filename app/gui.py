@@ -337,31 +337,93 @@ class PipelineGUI:
             command=self._attach_pronunciation_dictionary_to_selected,
         ).pack(side=tk.LEFT)
 
-        self.manual_text = scrolledtext.ScrolledText(box, height=5, wrap=tk.WORD, font=(UI_FONT, UI_FONT_SIZE))
-        self.manual_text.pack(fill=tk.X, pady=(6, 0))
+        ttk.Label(box, text="粘贴正文 可上下滚动").pack(anchor=tk.W, pady=(6, 0))
+        self.manual_text = scrolledtext.ScrolledText(box, height=3, wrap=tk.WORD, font=(UI_FONT, UI_FONT_SIZE))
+        self.manual_text.pack(fill=tk.X, pady=(2, 0))
 
     def _build_queue_panel(self, parent):
         box = ttk.LabelFrame(parent, text="任务队列", padding=8)
         box.pack(fill=tk.BOTH, expand=True)
 
-        toolbar = ttk.Frame(box)
-        toolbar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(toolbar, text="启动选中", style="Primary.TButton", command=self._start_selected).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="启动全部待处理", command=self._start_all_pending).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="停止选中", command=self._stop_selected_jobs).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="刷新", command=self._refresh_jobs).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="打开任务目录", command=self._open_selected_dir).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="清除图片缓存", command=self._clear_selected_media_cache).pack(side=tk.LEFT, padx=6)
-        ttk.Button(toolbar, text="删除选中任务", command=self._delete_selected_jobs).pack(side=tk.LEFT)
-        ttk.Button(toolbar, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT, padx=6)
+        toolbar_box = ttk.LabelFrame(box, text="任务操作", padding=4)
+        toolbar_box.pack(fill=tk.X, pady=(0, 6))
+        toolbar_box.columnconfigure(0, weight=1)
 
-        tts_toolbar = ttk.Frame(box)
-        tts_toolbar.pack(fill=tk.X, pady=(0, 6))
-        ttk.Button(tts_toolbar, text="重试TTS段...", command=self._retry_tts_segments).pack(side=tk.LEFT)
-        ttk.Button(tts_toolbar, text="TTS卡段重试推进", command=self._retry_stalled_tts_segments).pack(side=tk.LEFT, padx=6)
+        # Keep the controls compact: the full three-column grid scrolls vertically.
+        toolbar_canvas = tk.Canvas(toolbar_box, height=64, highlightthickness=0)
+        toolbar_vscroll = ttk.Scrollbar(toolbar_box, orient=tk.VERTICAL, command=toolbar_canvas.yview)
+        toolbar_canvas.configure(yscrollcommand=toolbar_vscroll.set)
+        toolbar_canvas.grid(row=0, column=0, sticky="ew")
+        toolbar_vscroll.grid(row=0, column=1, sticky="ns")
+
+        toolbar_inner = ttk.Frame(toolbar_canvas)
+        toolbar_window = toolbar_canvas.create_window((0, 0), window=toolbar_inner, anchor="nw")
+        for column in range(3):
+            toolbar_inner.columnconfigure(column, weight=1)
+
+        def update_toolbar_scrollregion(_event=None):
+            toolbar_canvas.configure(scrollregion=toolbar_canvas.bbox("all"))
+
+        def fit_toolbar_to_canvas(event):
+            toolbar_canvas.itemconfigure(toolbar_window, width=event.width)
+            update_toolbar_scrollregion()
+
+        toolbar_inner.bind("<Configure>", update_toolbar_scrollregion)
+        toolbar_canvas.bind("<Configure>", fit_toolbar_to_canvas)
+
+        def scroll_toolbar(event):
+            delta = int(getattr(event, "delta", 0) or 0)
+            if delta:
+                units = -delta if sys.platform == "darwin" else -int(delta / 120)
+                toolbar_canvas.yview_scroll(units or (-1 if delta > 0 else 1), "units")
+            return "break"
+        toolbar_actions = [
+            ("启动选中", self._start_selected, "Primary.TButton"),
+            ("仅重试合成", self._compose_selected, None),
+            ("启动全部待处理", self._start_all_pending, None),
+            ("停止选中", self._stop_selected_jobs, None),
+            ("刷新", self._refresh_jobs, None),
+            ("打开任务目录", self._open_selected_dir, None),
+            ("清除图片缓存", self._clear_selected_media_cache, None),
+            ("删除选中任务", self._delete_selected_jobs, None),
+            ("清空已结束任务", self._delete_finished_jobs, None),
+            ("指定段配音修复", self._retry_tts_segments, None),
+            ("全段配音修复", self._retry_stalled_tts_segments, None),
+        ]
+        for index, (label, command, style) in enumerate(toolbar_actions):
+            row, column = divmod(index, 3)
+            button = ttk.Button(toolbar_inner, text=label, command=command, style=style or "TButton")
+            button.grid(
+                row=row,
+                column=column,
+                sticky="ew",
+                padx=2,
+                pady=2,
+            )
+            button.bind("<MouseWheel>", scroll_toolbar, add="+")
+            button.bind("<Button-4>", lambda event: (toolbar_canvas.yview_scroll(-1, "units"), "break")[1], add="+")
+            button.bind("<Button-5>", lambda event: (toolbar_canvas.yview_scroll(1, "units"), "break")[1], add="+")
+        toolbar_canvas.bind("<MouseWheel>", scroll_toolbar, add="+")
+        toolbar_canvas.bind("<Button-4>", lambda event: (toolbar_canvas.yview_scroll(-1, "units"), "break")[1], add="+")
+        toolbar_canvas.bind("<Button-5>", lambda event: (toolbar_canvas.yview_scroll(1, "units"), "break")[1], add="+")
 
         cols = ("job_id", "stage", "progress", "worker", "audio", "dictionary", "title", "video", "youtube")
-        self.job_tree = ttk.Treeview(box, columns=cols, show="headings", selectmode="extended")
+        tree_box = ttk.Frame(box)
+        tree_box.pack(fill=tk.BOTH, expand=True)
+        tree_box.columnconfigure(0, weight=1)
+        tree_box.rowconfigure(0, weight=1)
+        tree_vscroll = ttk.Scrollbar(tree_box, orient=tk.VERTICAL)
+        tree_hscroll = ttk.Scrollbar(tree_box, orient=tk.HORIZONTAL)
+        self.job_tree = ttk.Treeview(
+            tree_box,
+            columns=cols,
+            show="headings",
+            selectmode="extended",
+            xscrollcommand=tree_hscroll.set,
+            yscrollcommand=tree_vscroll.set,
+        )
+        tree_vscroll.configure(command=self.job_tree.yview)
+        tree_hscroll.configure(command=self.job_tree.xview)
         headings = {
             "job_id": "任务ID",
             "stage": "制作阶段",
@@ -386,9 +448,13 @@ class PipelineGUI:
         }
         for col in cols:
             self.job_tree.heading(col, text=headings[col])
-            self.job_tree.column(col, width=widths[col], anchor=tk.W)
-        self.job_tree.pack(fill=tk.BOTH, expand=True)
+            self.job_tree.column(col, width=widths[col], minwidth=widths[col], stretch=False, anchor=tk.W)
+        self.job_tree.grid(row=0, column=0, sticky="nsew")
+        tree_vscroll.grid(row=0, column=1, sticky="ns")
+        tree_hscroll.grid(row=1, column=0, sticky="ew")
         self.job_tree.bind("<<TreeviewSelect>>", self._on_job_select)
+        self._job_tree_hscroll = tree_hscroll
+        self._job_tree_vscroll = tree_vscroll
 
     def _build_right_panel(self, parent):
         notebook = ttk.Notebook(parent)
@@ -422,8 +488,7 @@ class PipelineGUI:
 
         footer = ttk.Frame(parent)
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
-        ttk.Button(footer, text="保存配置", style="Primary.TButton", command=self._save_config).pack(side=tk.RIGHT)
-        ttk.Button(footer, text="保存到当前方案", command=self._save_profile).pack(side=tk.RIGHT, padx=(0, 6))
+        ttk.Button(footer, text="保存到当前方案", style="Primary.TButton", command=self._save_profile).pack(side=tk.RIGHT)
 
         scroll_area = ttk.Frame(parent)
         scroll_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -646,8 +711,10 @@ class PipelineGUI:
             width=20,
         )
         self.profile_combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(profile_line, text="加载方案", command=self._load_profile).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(profile_line, text="保存到方案", command=self._save_profile).pack(side=tk.LEFT, padx=(6, 0))
+        # Selecting a profile from the drop-down must load its saved values.
+        # Without this binding, only the displayed name changes while all form
+        # fields (and the configuration used for a run) remain from the prior profile.
+        self.profile_combo.bind("<<ComboboxSelected>>", self._on_profile_selected)
 
         section("系统与依赖")
         check("启动时检测依赖", "dependency_check_on_startup")
@@ -786,6 +853,7 @@ class PipelineGUI:
         section_model_combo("人设图模型名", "character_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
         section_model_combo("剧情参考模型名", "scene_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
         check("AI 洗稿改写", "ai_rewrite_enabled")
+        check("保留章节标题并朗读（第X话）", "narrate_chapter_headings")
         row("洗稿批大小", "ai_rewrite_batch_chars", "3500")
         textrow("洗稿提示词", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
         check("AI 人设分析", "character_analysis_enabled")
@@ -838,6 +906,7 @@ class PipelineGUI:
         row("移动周期秒(0=整段)", "video_motion_cycle_seconds", "0")
         combo("转场", "video_transition", ["随机", "none", "fade", "fadeblack", "fadewhite"], "none")
         row("转场秒数", "video_transition_duration", "0.4")
+        check("保护人物构图（保留移动、减小裁切，推荐）", "video_safe_framing")
         check("长视频稳定模式", "video_long_mode")
         check("Ken Burns 移动特效", "ken_burns")
         combo("字幕位置", "video_subtitle_position", ["下边", "中间", "上边"], "下边")
@@ -971,9 +1040,10 @@ class PipelineGUI:
             "video_subtitle_outline", "video_subtitle_shadow", "video_subtitle_spacing",
         }
         bool_keys = {
-            "video_long_mode", "ken_burns", "video_subtitle", "video_external_subtitle",
+            "video_long_mode", "video_safe_framing", "ken_burns", "video_subtitle", "video_external_subtitle",
             "upload_enabled", "cover_enabled", "video_subtitle_bold", "video_subtitle_italic",
             "short_title_enabled", "pipeline_overlap_tts_images", "ai_rewrite_enabled",
+            "narrate_chapter_headings",
             "character_analysis_enabled", "character_analysis_always_include_protagonists",
             "character_reference_enabled", "scene_inject_visual_theme", "scene_inject_character_triggers",
             "storyboard_highlight_enabled", "storyboard_highlight_align_timeline",
@@ -1021,15 +1091,15 @@ class PipelineGUI:
         config.save()
         return profile_name
 
-    def _save_config(self):
-        profile_name = self._apply_config_form(save_profile=True)
-        messagebox.showinfo("已保存", f"配置已写入 data/settings.json，并保存到方案：{profile_name}")
-
     def _save_profile(self):
         profile_name = self._apply_config_form(save_profile=True)
         messagebox.showinfo("已保存", f"已保存到配置方案：{profile_name}")
 
-    def _load_profile(self):
+    def _on_profile_selected(self, _event=None):
+        """Apply the profile immediately when it is chosen from the drop-down."""
+        self._load_profile(show_confirmation=False)
+
+    def _load_profile(self, *, show_confirmation: bool = True):
         profile_var = getattr(self, "profile_var", None)
         profile_name = str(profile_var.get() if profile_var is not None else "配置1").strip() or "配置1"
         try:
@@ -1040,7 +1110,8 @@ class PipelineGUI:
                 self.profile_var.set(loaded)
             if hasattr(self, "profile_combo"):
                 self.profile_combo.configure(values=config.list_profiles())
-            messagebox.showinfo("已加载", f"已切换到配置方案：{loaded}")
+            if show_confirmation:
+                messagebox.showinfo("已加载", f"已切换到配置方案：{loaded}")
         except Exception as exc:
             messagebox.showerror("加载失败", str(exc))
 
@@ -2284,6 +2355,18 @@ class PipelineGUI:
         for job_id in self._selected_job_ids():
             self._start_job(job_id)
 
+    def _compose_selected(self):
+        for job_id in self._selected_job_ids():
+            if pr.load_status(job_id).get("worker_alive"):
+                messagebox.showwarning("任务正在运行", f"{job_id} 正在运行，请先停止后再仅重试合成。")
+                continue
+            input_text = pr.load_status(job_id).get("input", "")
+            try:
+                pr.start_worker(input_text, job_id=job_id, resume=True, compose_only=True)
+            except Exception as exc:
+                messagebox.showerror("仅重试合成失败", str(exc))
+        self._refresh_jobs()
+
     def _start_all_pending(self):
         for row in pr.list_jobs(limit=500):
             if row.get("stage") in {"queued", "failed", "missing"} and not row.get("worker_alive"):
@@ -2292,6 +2375,14 @@ class PipelineGUI:
     def _start_job(self, job_id: str):
         st = pr.load_status(job_id)
         if st.get("worker_alive"):
+            return
+        try:
+            # Persist the form currently on screen before the worker creates
+            # its per-job snapshot.  This makes the selected profile and its
+            # displayed fields the exact settings used by this task.
+            self._apply_config_form(save_profile=False)
+        except Exception as exc:
+            messagebox.showerror("启动失败", f"无法应用当前配置方案：\n{exc}")
             return
         dictionary_path = self.pronunciation_dictionary_var.get().strip()
         if dictionary_path:

@@ -4,7 +4,7 @@
 
 ## 入口和保存位置
 
-正常使用入口是项目根目录的 `Open_GUI.command`。GUI 中点击“保存配置”会写入 `data/settings.json`，点击“保存到当前方案”会同步写入 `data/profiles/配置1.json` 这类方案文件。
+正常使用入口是项目根目录的 `Open_GUI.command`。GUI 中点击“保存到当前方案”会写入 `data/settings.json`，并同步写入 `data/profiles/配置1.json` 这类方案文件。
 
 配置优先级大致是：
 

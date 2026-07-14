@@ -59,8 +59,7 @@ def copy_file(src: Path, dst: Path) -> None:
 def scrub_settings(data: dict) -> dict:
     cleaned = dict(data)
     for key in api_key_fields():
-        if key in cleaned:
-            cleaned[key] = ""
+        cleaned.pop(key, None)
     for noisy in (
         "dependency_last_report",
         "hardware_autotune_summary",

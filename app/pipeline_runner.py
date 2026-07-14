@@ -26,7 +26,7 @@ from typing import Callable, Iterable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from app.config import JOBS_DIR, ROOT, config
+from app.config import API_KEY_FIELDS, JOBS_DIR, ROOT, api_key_env_name, config
 from app.concurrency import external_api_slot, ffmpeg_slot, pid_alive
 from app.scrapers.base import BookSearchResult, Novel, NovelChapter
 from app.scrapers.kakuyomu import KakuyomuScraper
@@ -59,7 +59,7 @@ from app.storyboard_highlights import (
     sampled_story_input,
 )
 from app.utils.ffmpeg import ffmpeg_path
-from app.utils.secrets import redact_secret_text
+from app.utils.secrets import clean_api_key, redact_secret_text
 
 
 LogFn = Callable[[str], None]
@@ -561,7 +561,7 @@ def clear_job_media_cache(job_id: str) -> None:
     append_log(path, "media cache cleared: images/cover/final video will regenerate")
 
 
-def start_worker(input_text: str, job_id: str | None = None, resume: bool = False) -> tuple[str, int]:
+def start_worker(input_text: str, job_id: str | None = None, resume: bool = False, compose_only: bool = False) -> tuple[str, int]:
     """Start a detached worker process and return (job_id, pid)."""
     job_id = job_id or new_job_id("pipeline")
     job_dir = job_dir_for(job_id)
@@ -577,6 +577,17 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
         )
     job_dir.mkdir(parents=True, exist_ok=True)
 
+    # Freeze all settings for this worker.  A later GUI profile switch must not
+    # change an already launched (or auto-started) job's AI prompts or routes.
+    settings_snapshot = job_dir / "settings_snapshot.json"
+    snapshot_settings = config.as_dict()
+    for key in API_KEY_FIELDS:
+        snapshot_settings.pop(key, None)
+    settings_snapshot.write_text(
+        json.dumps(snapshot_settings, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     command = [
         sys.executable,
         "-B",
@@ -589,11 +600,16 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
     ]
     if resume:
         command.append("--resume")
+    if compose_only:
+        command.append("--compose-only")
 
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    env["NOVEL_VIDEO_CONFIG_FILE"] = str(settings_snapshot)
+    for key in API_KEY_FIELDS:
+        env[api_key_env_name(key)] = clean_api_key(config.get(key, ""))
     env.setdefault("NO_PROXY", "localhost,127.0.0.1,::1")
     env.setdefault("no_proxy", "localhost,127.0.0.1,::1")
 
@@ -607,6 +623,7 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
         kwargs["start_new_session"] = True
 
     worker_log = job_dir / "worker.log"
+    append_log(job_dir, f"configuration snapshot: {settings_snapshot.name} (profile={config.get('active_profile', '')})")
     append_log(job_dir, f"dispatch worker: {' '.join(command)}")
     write_status(job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.0, worker_pid=None)
     with worker_log.open("a", encoding="utf-8", buffering=1) as log_handle:
@@ -868,7 +885,11 @@ def _strip_story_scaffold(text: str, novel: Novel, on_log: LogFn = _noop, job_di
                 continue
             if stripped:
                 leading_window_open = False
-        if stripped and _CHAPTER_HEADING_RE.match(stripped):
+        if (
+            stripped
+            and _CHAPTER_HEADING_RE.match(stripped)
+            and not bool(config.get("narrate_chapter_headings", False))
+        ):
             removed_chapters += 1
             continue
         cleaned.append(raw_line)
@@ -2451,6 +2472,16 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_tit
             "Family-friendly cinematic anime illustration, adult-looking characters, symbolic emotional drama, "
             "fully clothed characters, clean composition, soft lighting, readable faces, text-free artwork"
         )
+    # Camera language from a story prompt often asks for dramatic close-ups.
+    # Put this constraint at the front so it remains effective even if a long
+    # prompt later has to be shortened for an image provider.
+    framing_guard = (
+        "Medium-wide 16:9 composition; every visible person has their complete head, face, forehead, and chin "
+        "inside the frame, with generous headroom and safe margins on every edge; no cropped head, face, or body "
+        "at the image boundary"
+    )
+    if not re.search(r"(?i)complete\s+(?:heads?|head)|generous\s+headroom|no\s+cropped\s+(?:heads?|faces?)", value):
+        value = f"{framing_guard}. {value}"
     if "family-friendly" not in value.lower():
         value = f"{value}. {guard}"
     return value[:1400]
@@ -3457,6 +3488,9 @@ def _stage_compose_manifest_impl(
     final_hash = _stable_hash(
         {
             "kind": "final_video_v2",
+            # Bump when composition semantics change so an old cached render
+            # (for example, one rendered with motion suppressed) is not reused.
+            "composer_revision": 3,
             "audio": {"path": str(audio_full), **_file_signature(audio_full)},
             "images": [{"path": str(p), **_file_signature(p)} for p in images],
             "image_durations": [round(float(v), 3) for v in image_durations],
@@ -3468,6 +3502,7 @@ def _stage_compose_manifest_impl(
                 "encoder": config.get("video_encoder", "libx264"),
                 "encoder_preset": config.get("video_encoder_preset", "veryfast"),
                 "encoder_quality": config.get("video_encoder_quality", 20),
+                "safe_framing": bool(config.get("video_safe_framing", True)),
                 "ken_burns": bool(config.ken_burns),
                 "long_mode": bool(config.video_long_mode),
                 "motion": str(config.video_motion or "none"),
@@ -3529,6 +3564,7 @@ def _stage_compose_manifest_impl(
             video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
             video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
             video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
+            safe_framing=bool(config.get("video_safe_framing", True)),
         )
         video_duration = _audio_duration(tmp)
         audio_duration = _audio_duration(audio_full)
@@ -3763,6 +3799,46 @@ def stage_compose(
     on_log: LogFn = _noop,
 ) -> Path:
     return _stage_compose_manifest_impl(audios, durations, segments, plans, images, job_dir, on_log)
+
+
+def resume_compose_only(job_id: str, on_log: LogFn = _noop) -> Path:
+    """Build only the final video from durable job artifacts; never calls AI services."""
+    job_dir = _safe_job_path(job_id)
+    segments = _load_job_segments(job_dir)
+    rows = _read_json(job_dir / "plans.json", [])
+    if not isinstance(rows, list) or not rows:
+        raise RuntimeError("缺少 plans.json，无法仅重试合成。")
+    plans: list[ImagePlan] = []
+    for pos, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        plan_segments = [
+            Segment(index=int(item.get("index", 0)), text=str(item.get("text") or ""))
+            for item in row.get("segments", []) if isinstance(item, dict)
+        ]
+        plans.append(ImagePlan(
+            image_index=int(row.get("image_index", pos)),
+            segments=plan_segments,
+            duration=float(row.get("duration") or 0.0),
+            highlight_segment_indexes=[int(i) for i in row.get("highlight_segment_indexes", [])],
+            highlight_text=str(row.get("highlight_text") or ""),
+            highlight_people=[str(i) for i in row.get("highlight_people", [])],
+            highlight_location=str(row.get("highlight_location") or ""),
+            highlight_action=str(row.get("highlight_action") or ""),
+        ))
+    plans.sort(key=lambda p: p.image_index)
+    images = [job_dir / "images" / f"img_{i:05d}.png" for i in range(len(plans))]
+    if len(plans) != len(images) or any(not path.exists() for path in images):
+        raise RuntimeError("合成所需图片不完整；不会自动出图，请先检查图片缓存。")
+    durations = _read_json(job_dir / "durations.json", [])
+    if not isinstance(durations, list) or len(durations) != len(segments):
+        raise RuntimeError("缺少或无效 durations.json，无法仅重试合成。")
+    imported = _job_imported_audio(job_dir)
+    audios = [imported[0]] if imported else [job_dir / "audio_full.mp3"]
+    if any(not path.exists() for path in audios):
+        raise RuntimeError("缺少合成所需音频，无法仅重试合成。")
+    on_log("== compose-only retry: reuse existing images and audio; no image generation ==")
+    return stage_compose(audios, [float(value) for value in durations], segments, plans, images, job_dir, on_log)
     audio_full = job_dir / "audio_full.mp3"
     if not audio_full.exists() or _audio_duration(audio_full) <= 0.05:
         concat_audios(audios, audio_full, on_log)
@@ -3829,6 +3905,7 @@ def stage_compose(
         video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
         video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
         video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
+        safe_framing=bool(config.get("video_safe_framing", True)),
     )
     on_log(f"  OK 视频完成: {out}")
     return out

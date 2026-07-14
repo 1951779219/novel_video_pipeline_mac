@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,10 @@ from app.utils.secrets import clean_api_key
 ROOT = Path(__file__).parent.parent
 DATA_DIR = ROOT / "data"
 JOBS_DIR = DATA_DIR / "jobs"
-SETTINGS_FILE = DATA_DIR / "settings.json"
+# A pipeline worker may be given a per-job settings snapshot.  The GUI keeps
+# using data/settings.json, while each launched job can remain pinned to the
+# profile that was selected at the moment it started.
+SETTINGS_FILE = Path(os.environ.get("NOVEL_VIDEO_CONFIG_FILE") or (DATA_DIR / "settings.json"))
 PROFILES_DIR = DATA_DIR / "profiles"
 DEFAULT_PROFILE_NAMES = ("配置1", "配置2")
 
@@ -36,6 +40,12 @@ API_KEY_FIELDS = {
     "character_reference_api_key",
     "scene_reference_api_key",
 }
+API_KEY_ENV_PREFIX = "NOVEL_VIDEO_SECRET_"
+
+
+def api_key_env_name(key: str) -> str:
+    """Return the process-only environment variable for a sensitive setting."""
+    return f"{API_KEY_ENV_PREFIX}{str(key).upper()}"
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -97,7 +107,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "llm_image_prompt_prefix": (
         "Single finished cinematic anime/editorial illustration for a novel recap video, one clear hero subject, "
         "visible story action, strong visual hierarchy, expressive adult-looking characters, dramatic lighting, "
-        "restrained 4-6 color palette, clean composition, no readable text."
+        "restrained 4-6 color palette, medium-wide 16:9 composition, every visible person's complete head and face "
+        "fully inside the frame with generous top headroom and safe edge margins, no cropped heads or faces, "
+        "clean composition, no readable text."
     ),
     "llm_image_style_suffix": "anime style, detailed, cinematic lighting, masterpiece",
     "llm_negative_prompt": "lowres, bad anatomy, bad hands, text, error, missing fingers, jpeg artifacts, watermark, logo, words, blood, gore, corpse, severed limbs, nudity, sexual content, explicit violence, weapon close-up",
@@ -182,6 +194,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "要求 20 到 30 个中文字符，突出爽点/冲突/悬念，不要书名号，不要引号，不要换行，不要标签。"
     ),
     "ai_rewrite_enabled": False,
+    # When enabled, standalone labels such as "第九話" are included in TTS.
+    "narrate_chapter_headings": False,
     "ai_rewrite_batch_chars": 3500,
     "ai_rewrite_prompt": (
         "你是小说推文视频的洗稿改写编辑。"
@@ -267,6 +281,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "pacing_seconds_per_image": 6,
     "pacing_sentences_per_image": 3,
     "pacing_fixed_count": 10,
+    # Safe framing keeps motion, but limits its overscan so it is much less
+    # likely to cut off a character composed close to an edge.
+    "video_safe_framing": True,
     "ken_burns": True,
     "video_motion": "上下移动",
     "video_motion_curve": "ease",
@@ -592,6 +609,13 @@ class Config:
                 _apply_compat_migrations(self._data, saved)
             except Exception:
                 pass
+        # Worker jobs receive their non-sensitive settings from a JSON snapshot.
+        # API keys deliberately travel only through the child-process environment
+        # so no task JSON, log, or release package stores a real credential.
+        for key in API_KEY_FIELDS:
+            value = os.environ.get(api_key_env_name(key))
+            if value is not None:
+                self._data[key] = clean_api_key(value)
 
     def save(self):
         SETTINGS_FILE.write_text(

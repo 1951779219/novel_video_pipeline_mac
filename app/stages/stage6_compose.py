@@ -273,6 +273,7 @@ def build_video(
     video_encoder: str = "libx264",
     video_encoder_preset: str = "veryfast",
     video_encoder_quality: int | float = 20,
+    safe_framing: bool = True,
 ):
     if len(images) != len(image_durations):
         raise ValueError("images 和 image_durations 数量不一致")
@@ -280,6 +281,10 @@ def build_video(
         raise ValueError("没有可合成的视频图片")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     motion = _normalize_motion(motion)
+    # Panning a 16:9 source requires overscan.  Keep the user's chosen motion,
+    # but use a gentle movement when safe framing is enabled.
+    motion_overscan = 1.06 if safe_framing else 1.22
+    zoom_amount = 0.04 if safe_framing else 0.10
     if (long_mode or not ken_burns) and motion in {"", "none", "static"}:
         _build_video_from_image_list(
             images=images,
@@ -319,6 +324,8 @@ def build_video(
         video_encoder=video_encoder,
         video_encoder_preset=video_encoder_preset,
         video_encoder_quality=video_encoder_quality,
+        motion_overscan=motion_overscan,
+        zoom_amount=zoom_amount,
     )
 
 
@@ -440,6 +447,8 @@ def _build_video_from_clips(
     video_encoder: str,
     video_encoder_preset: str,
     video_encoder_quality: int | float,
+    motion_overscan: float,
+    zoom_amount: float,
 ):
     tmp_dir = out_path.parent / "_clips"
     tmp_dir.mkdir(exist_ok=True)
@@ -469,7 +478,7 @@ def _build_video_from_clips(
         i, img, dur, clip, clip_motion, clip_transition = job
         frames = max(1, int(dur * fps))
         if clip_motion in {"vertical_pan", "pan_up", "pan_down"}:
-            scale_h = int(height * 1.22)
+            scale_h = int(height * motion_overscan)
             reverse = (i % 2 == 1) if clip_motion == "vertical_pan" else clip_motion == "pan_down"
             progress = _ease_progress_expr(
                 frames,
@@ -485,7 +494,7 @@ def _build_video_from_clips(
                 f"fps={fps},setsar=1"
             )
         elif clip_motion in {"horizontal_pan", "pan_left", "pan_right"}:
-            scale_w = int(width * 1.22)
+            scale_w = int(width * motion_overscan)
             reverse = (i % 2 == 1) if clip_motion == "horizontal_pan" else clip_motion == "pan_right"
             progress = _ease_progress_expr(
                 frames,
@@ -511,7 +520,7 @@ def _build_video_from_clips(
             )
             vf = (
                 f"scale={width * 2}:-1,"
-                f"zoompan=z='1+0.10*{progress}':d={frames}:"
+                f"zoompan=z='1+{zoom_amount:.2f}*{progress}':d={frames}:"
                 f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={width}x{height}:fps={fps},"
                 f"setsar=1"
             )
