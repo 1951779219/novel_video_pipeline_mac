@@ -24,7 +24,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 18
+SETTINGS_SCHEMA_VERSION = 21
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
 DEFAULT_YOUTUBE_DESCRIPTION = (
     "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
@@ -112,7 +112,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "clean composition, no readable text."
     ),
     "llm_image_style_suffix": "anime style, detailed, cinematic lighting, masterpiece",
-    "llm_negative_prompt": "lowres, bad anatomy, bad hands, text, error, missing fingers, jpeg artifacts, watermark, logo, words, blood, gore, corpse, severed limbs, nudity, sexual content, explicit violence, weapon close-up",
+    # Keep this compatible with SD/ComfyUI backends without putting policy
+    # trigger words in a reusable setting.  OpenAI-compatible backends do not
+    # receive this list because their API has no negative-prompt field.
+    "llm_negative_prompt": "low resolution, anatomy errors, malformed hands, unreadable text, watermark, logo, UI overlay, duplicate limbs, cropped face, cropped head",
 
     # 视频生图解决方案1：把秒数作为图片数量预算，每个预算窗口只选择一个旁白高光点。
     "storyboard_highlight_enabled": True,
@@ -205,6 +208,12 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "语言更顺、更有悬念和画面感，适合 TTS 朗读；"
         "保持段落分隔，不要输出标题、解释、编号、标签或 JSON，只输出改写后的正文。"
     ),
+    # Make the rewritten script safe to display and narrate before it is split.
+    "tts_clean_rewritten_text": True,
+    # Off is the unattended-safe default.  When enabled, only deterministic
+    # high-risk Japanese token candidates are sent to the text LLM for readings.
+    "tts_auto_pronunciation_enabled": False,
+    "tts_auto_pronunciation_max_terms": 40,
     # TTS
     "tts_provider": "edge",  # edge / voicevox / azure / openai / elevenlabs / custom
     "tts_voice": "ja-JP-NanamiNeural",
@@ -319,6 +328,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "video_bgm_volume": 0.15,
     "video_long_mode": True,
     "video_cleanup_temp": True,
+    # Optional delivery folder.  The job copy remains in data/jobs so a task
+    # can still resume or upload later; completed videos are copied here too.
+    "output_directory": "",
 
     "max_concurrent_jobs": 1,
     "max_concurrent_external_api": 2,
@@ -592,6 +604,21 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             "storyboard_highlight_align_timeline",
         ):
             data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 19:
+        # Only replace the known old bundled list; leave deliberate custom
+        # negative prompts untouched for local SD/ComfyUI users.
+        old_negative = "lowres, bad anatomy, bad hands, text, error, missing fingers, jpeg artifacts, watermark, logo, words, blood, gore, corpse, severed limbs, nudity, sexual content, explicit violence, weapon close-up"
+        if str(data.get("llm_negative_prompt") or "").strip() == old_negative:
+            data["llm_negative_prompt"] = DEFAULT_SETTINGS["llm_negative_prompt"]
+    if saved_version < 20:
+        for key in (
+            "tts_clean_rewritten_text",
+            "tts_auto_pronunciation_enabled",
+            "tts_auto_pronunciation_max_terms",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 21:
+        data.setdefault("output_directory", DEFAULT_SETTINGS["output_directory"])
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 

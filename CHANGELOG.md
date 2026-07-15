@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.25-mac-update
+
+- Added one-pass batch import and automatic pairing for body TXT files, matching MP3 narration, and matching pronunciation dictionaries.
+- Added image-failure choices that can reuse completed images, plus TTS completion and compose-only recovery paths that avoid unnecessary API calls.
+- Added optional rewritten-text cleanup and automatic pronunciation assistance, VOICEVOX curated voice codes, completed-video export folders, and safer image/cover framing.
+- Kept API keys out of all task and release JSON files; workers receive them only through their process environment.
+
 ## v1.0.24-mac-update
 
 - Added per-job non-sensitive settings snapshots so a launched task stays pinned to the selected profile while API keys are passed only through the worker process environment.

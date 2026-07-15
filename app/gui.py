@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 import json
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -32,7 +33,7 @@ from app.autotune import run_startup_autotune
 from app.config import DATA_DIR, config
 from app.config import API_KEY_FIELDS
 from app.version import VERSION
-from app.backends.tts import EDGE_MULTI_VOICES
+from app.backends.tts import EDGE_MULTI_VOICES, VOICEVOX_FREQUENT_VOICES
 from app.utils.secrets import clean_api_key, redact_secret_text
 
 
@@ -105,6 +106,53 @@ def _match_batch_texts_and_dictionaries(paths: list[str | Path]) -> dict:
         "unmatched_texts": unmatched_texts,
         "ambiguous_texts": ambiguous_texts,
         "unused_dictionaries": [path for path in dictionaries if path not in used_dictionaries],
+    }
+
+
+def _match_import_files(paths: list[str | Path]) -> dict:
+    """Classify one multi-file import and pair body, MP3, and dictionary by name."""
+    unique_paths = list(dict.fromkeys(Path(path).expanduser() for path in paths))
+    txt_paths = [path for path in unique_paths if path.suffix.lower() == ".txt"]
+    audio_paths = [path for path in unique_paths if path.suffix.lower() == ".mp3"]
+    unsupported = [path for path in unique_paths if path not in txt_paths and path not in audio_paths]
+    dictionary_paths = [path for path in txt_paths if _is_pronunciation_dictionary_filename(path)]
+    text_paths = [path for path in txt_paths if path not in dictionary_paths]
+
+    def by_key(items: list[Path]) -> dict[str, list[Path]]:
+        result: dict[str, list[Path]] = {}
+        for item in items:
+            result.setdefault(_normalized_batch_pair_key(item), []).append(item)
+        return result
+
+    audio_by_key = by_key(audio_paths)
+    dictionary_by_key = by_key(dictionary_paths)
+    pairs = []
+    used_audio: set[Path] = set()
+    used_dictionary: set[Path] = set()
+    ambiguous: list[tuple[Path, str, list[Path]]] = []
+    for text_path in text_paths:
+        key = _normalized_batch_pair_key(text_path)
+        audio_candidates = audio_by_key.get(key, [])
+        dictionary_candidates = dictionary_by_key.get(key, [])
+        if len(audio_candidates) > 1:
+            ambiguous.append((text_path, "MP3", audio_candidates))
+            continue
+        if len(dictionary_candidates) > 1:
+            ambiguous.append((text_path, "词典", dictionary_candidates))
+            continue
+        audio_path = audio_candidates[0] if audio_candidates else None
+        dictionary_path = dictionary_candidates[0] if dictionary_candidates else None
+        if audio_path:
+            used_audio.add(audio_path)
+        if dictionary_path:
+            used_dictionary.add(dictionary_path)
+        pairs.append((text_path, audio_path, dictionary_path))
+    return {
+        "pairs": pairs,
+        "ambiguous": ambiguous,
+        "unused_audio": [path for path in audio_paths if path not in used_audio],
+        "unused_dictionaries": [path for path in dictionary_paths if path not in used_dictionary],
+        "unsupported": unsupported,
     }
 
 
@@ -240,6 +288,7 @@ class PipelineGUI:
         self._search_seq = 0
         self._search_result_queue: queue.Queue = queue.Queue()
         self._dependency_check_running = False
+        self._image_failure_prompted: set[str] = set()
         self._build_style()
         self._build_ui()
         self._poll_jobs()
@@ -311,13 +360,12 @@ class PipelineGUI:
         self.manual_title = tk.StringVar()
         ttk.Entry(manual_row, textvariable=self.manual_title, width=28).pack(side=tk.LEFT, padx=6)
         ttk.Button(manual_row, text="加入粘贴文本", command=self._add_manual_text).pack(side=tk.LEFT)
-        ttk.Button(manual_row, text="粘贴文本+MP3", command=self._add_manual_text_with_audio).pack(side=tk.LEFT, padx=6)
 
         import_row = ttk.Frame(box)
         import_row.pack(fill=tk.X, pady=(6, 0))
         ttk.Label(import_row, text="文件导入").pack(side=tk.LEFT)
-        ttk.Button(import_row, text="导入正文 TXT + MP3（跳过TTS）", command=self._import_text_audio_pair).pack(side=tk.LEFT, padx=6)
-        ttk.Button(import_row, text="批量导入正文+词典", command=self._import_txt_files).pack(side=tk.LEFT)
+        ttk.Button(import_row, text="选择文件导入…", command=self._import_files).pack(side=tk.LEFT, padx=6)
+        ttk.Label(import_row, text="可同时选择正文 TXT、同名 MP3、同名读音词典；自动配对", foreground="#666").pack(side=tk.LEFT)
 
         dictionary_row = ttk.Frame(box)
         dictionary_row.pack(fill=tk.X, pady=(6, 0))
@@ -345,71 +393,17 @@ class PipelineGUI:
         box = ttk.LabelFrame(parent, text="任务队列", padding=8)
         box.pack(fill=tk.BOTH, expand=True)
 
-        toolbar_box = ttk.LabelFrame(box, text="任务操作", padding=4)
-        toolbar_box.pack(fill=tk.X, pady=(0, 6))
-        toolbar_box.columnconfigure(0, weight=1)
+        queue_pane = ttk.PanedWindow(box, orient=tk.VERTICAL)
+        queue_pane.pack(fill=tk.BOTH, expand=True)
 
-        # Keep the controls compact: the full three-column grid scrolls vertically.
-        toolbar_canvas = tk.Canvas(toolbar_box, height=64, highlightthickness=0)
-        toolbar_vscroll = ttk.Scrollbar(toolbar_box, orient=tk.VERTICAL, command=toolbar_canvas.yview)
-        toolbar_canvas.configure(yscrollcommand=toolbar_vscroll.set)
-        toolbar_canvas.grid(row=0, column=0, sticky="ew")
-        toolbar_vscroll.grid(row=0, column=1, sticky="ns")
-
-        toolbar_inner = ttk.Frame(toolbar_canvas)
-        toolbar_window = toolbar_canvas.create_window((0, 0), window=toolbar_inner, anchor="nw")
-        for column in range(3):
-            toolbar_inner.columnconfigure(column, weight=1)
-
-        def update_toolbar_scrollregion(_event=None):
-            toolbar_canvas.configure(scrollregion=toolbar_canvas.bbox("all"))
-
-        def fit_toolbar_to_canvas(event):
-            toolbar_canvas.itemconfigure(toolbar_window, width=event.width)
-            update_toolbar_scrollregion()
-
-        toolbar_inner.bind("<Configure>", update_toolbar_scrollregion)
-        toolbar_canvas.bind("<Configure>", fit_toolbar_to_canvas)
-
-        def scroll_toolbar(event):
-            delta = int(getattr(event, "delta", 0) or 0)
-            if delta:
-                units = -delta if sys.platform == "darwin" else -int(delta / 120)
-                toolbar_canvas.yview_scroll(units or (-1 if delta > 0 else 1), "units")
-            return "break"
-        toolbar_actions = [
-            ("启动选中", self._start_selected, "Primary.TButton"),
-            ("仅重试合成", self._compose_selected, None),
-            ("启动全部待处理", self._start_all_pending, None),
-            ("停止选中", self._stop_selected_jobs, None),
-            ("刷新", self._refresh_jobs, None),
-            ("打开任务目录", self._open_selected_dir, None),
-            ("清除图片缓存", self._clear_selected_media_cache, None),
-            ("删除选中任务", self._delete_selected_jobs, None),
-            ("清空已结束任务", self._delete_finished_jobs, None),
-            ("指定段配音修复", self._retry_tts_segments, None),
-            ("全段配音修复", self._retry_stalled_tts_segments, None),
-        ]
-        for index, (label, command, style) in enumerate(toolbar_actions):
-            row, column = divmod(index, 3)
-            button = ttk.Button(toolbar_inner, text=label, command=command, style=style or "TButton")
-            button.grid(
-                row=row,
-                column=column,
-                sticky="ew",
-                padx=2,
-                pady=2,
-            )
-            button.bind("<MouseWheel>", scroll_toolbar, add="+")
-            button.bind("<Button-4>", lambda event: (toolbar_canvas.yview_scroll(-1, "units"), "break")[1], add="+")
-            button.bind("<Button-5>", lambda event: (toolbar_canvas.yview_scroll(1, "units"), "break")[1], add="+")
-        toolbar_canvas.bind("<MouseWheel>", scroll_toolbar, add="+")
-        toolbar_canvas.bind("<Button-4>", lambda event: (toolbar_canvas.yview_scroll(-1, "units"), "break")[1], add="+")
-        toolbar_canvas.bind("<Button-5>", lambda event: (toolbar_canvas.yview_scroll(1, "units"), "break")[1], add="+")
+        toolbar_box = ttk.Frame(queue_pane, padding=4)
+        ttk.Button(toolbar_box, text="启动全部待处理", command=self._start_all_pending, style="Primary.TButton").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(toolbar_box, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT)
 
         cols = ("job_id", "stage", "progress", "worker", "audio", "dictionary", "title", "video", "youtube")
-        tree_box = ttk.Frame(box)
-        tree_box.pack(fill=tk.BOTH, expand=True)
+        tree_box = ttk.Frame(queue_pane)
+        queue_pane.add(toolbar_box, weight=0)
+        queue_pane.add(tree_box, weight=1)
         tree_box.columnconfigure(0, weight=1)
         tree_box.rowconfigure(0, weight=1)
         tree_vscroll = ttk.Scrollbar(tree_box, orient=tk.VERTICAL)
@@ -453,6 +447,24 @@ class PipelineGUI:
         tree_vscroll.grid(row=0, column=1, sticky="ns")
         tree_hscroll.grid(row=1, column=0, sticky="ew")
         self.job_tree.bind("<<TreeviewSelect>>", self._on_job_select)
+        self.job_tree.bind("<Button-3>", self._show_job_context_menu)
+        self.job_tree.bind("<Button-2>", self._show_job_context_menu)
+        self.job_tree.bind("<Control-Button-1>", self._show_job_context_menu)
+        self.job_context_menu = tk.Menu(self.root, tearoff=False)
+        for label, command in (
+            ("启动选中", self._start_selected),
+            ("仅重试合成", self._compose_selected),
+            ("停止选中", self._stop_selected_jobs),
+            ("清除图片缓存", self._clear_selected_media_cache),
+            ("指定段配音修复", self._retry_tts_segments),
+            ("全段配音修复", self._retry_stalled_tts_segments),
+        ):
+            self.job_context_menu.add_command(label=label, command=command)
+        self.job_context_menu.add_separator()
+        self.job_context_menu.add_command(label="打开任务文件夹", command=self._open_selected_output_dir)
+        self.job_context_menu.add_command(label="删除选中任务", command=self._delete_selected_jobs)
+        self.job_context_menu.add_separator()
+        self.job_context_menu.add_command(label="刷新", command=self._refresh_jobs)
         self._job_tree_hscroll = tree_hscroll
         self._job_tree_vscroll = tree_vscroll
 
@@ -495,10 +507,60 @@ class PipelineGUI:
         canvas = tk.Canvas(scroll_area, highlightthickness=0)
         scroll = ttk.Scrollbar(scroll_area, orient=tk.VERTICAL, command=canvas.yview)
         body = ttk.Frame(canvas)
+        # The section heading that has just scrolled past the top is repeated
+        # here.  Keeping this widget outside the canvas makes it genuinely
+        # fixed while the settings body scrolls.
+        sticky_header = ttk.Frame(scroll_area, relief=tk.RIDGE, borderwidth=1, padding=(9, 5))
+        sticky_title = ttk.Label(
+            sticky_header,
+            font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold"),
+            cursor="hand2",
+        )
+        sticky_title.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        sticky_arrow = ttk.Label(sticky_header, width=3, anchor=tk.CENTER, cursor="hand2")
+        sticky_arrow.pack(side=tk.RIGHT)
+        sticky_state: dict[str, dict | None] = {"section": None}
         body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
         body_window = canvas.create_window((0, 0), window=body, anchor="nw")
-        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(body_window, width=event.width))
-        canvas.configure(yscrollcommand=scroll.set)
+
+        def update_sticky_header():
+            """Show the current settings section title at the top while scrolling."""
+            canvas.update_idletasks()
+            viewport_top = canvas.canvasy(0)
+            current = None
+            for state in self._config_sections.values():
+                header = state.get("header")
+                container = state.get("container")
+                header_y = (
+                    container.winfo_y() + header.winfo_y()
+                    if header is not None and container is not None
+                    else None
+                )
+                if header_y is not None and header_y < viewport_top:
+                    current = state
+                else:
+                    break
+            if current is None:
+                sticky_header.place_forget()
+                sticky_state["section"] = None
+                return
+            sticky_state["section"] = current
+            sticky_title.configure(text=current["title"])
+            sticky_arrow.configure(text="▼" if current["expanded"] else "▶")
+            sticky_header.place(x=0, y=0, width=canvas.winfo_width())
+
+        def on_canvas_configure(event):
+            canvas.itemconfigure(body_window, width=event.width)
+            if sticky_state["section"] is not None:
+                sticky_header.place_configure(width=event.width)
+            canvas.after_idle(update_sticky_header)
+
+        def on_canvas_scroll(first, last):
+            scroll.set(first, last)
+            canvas.after_idle(update_sticky_header)
+
+        canvas.bind("<Configure>", on_canvas_configure)
+        canvas.configure(yscrollcommand=on_canvas_scroll)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -511,6 +573,7 @@ class PipelineGUI:
                 if units == 0:
                     units = -1 if delta > 0 else 1
             canvas.yview_scroll(units, "units")
+            canvas.after_idle(update_sticky_header)
             return "break"
 
         section_parent = body
@@ -539,7 +602,14 @@ class PipelineGUI:
             arrow.pack(side=tk.RIGHT)
 
             content = ttk.Frame(container, padding=(8, 4, 4, 4))
-            state = {"expanded": expanded, "content": content, "arrow": arrow}
+            state = {
+                "title": title,
+                "expanded": expanded,
+                "content": content,
+                "arrow": arrow,
+                "header": header,
+                "container": container,
+            }
             self._config_sections[title] = state
 
             def toggle(_event=None):
@@ -550,12 +620,36 @@ class PipelineGUI:
                 else:
                     content.pack_forget()
                     arrow.configure(text="▶")
+                if sticky_state["section"] is state:
+                    sticky_arrow.configure(text="▼" if state["expanded"] else "▶")
                 canvas.after_idle(lambda: canvas.configure(scrollregion=canvas.bbox("all")))
+                canvas.after_idle(update_sticky_header)
                 return "break"
 
             header.bind("<Button-1>", toggle)
             title_label.bind("<Button-1>", toggle)
             arrow.bind("<Button-1>", toggle)
+            # The fixed copy uses exactly the same toggle handler as the
+            # original header, so its behaviour stays consistent.
+            def toggle_sticky(_event=None):
+                current = sticky_state["section"]
+                if current is None:
+                    return "break"
+                current["expanded"] = not current["expanded"]
+                if current["expanded"]:
+                    current["content"].pack(fill=tk.X)
+                    current["arrow"].configure(text="▼")
+                else:
+                    current["content"].pack_forget()
+                    current["arrow"].configure(text="▶")
+                sticky_arrow.configure(text="▼" if current["expanded"] else "▶")
+                canvas.after_idle(lambda: canvas.configure(scrollregion=canvas.bbox("all")))
+                canvas.after_idle(update_sticky_header)
+                return "break"
+
+            sticky_header.bind("<Button-1>", toggle_sticky)
+            sticky_title.bind("<Button-1>", toggle_sticky)
+            sticky_arrow.bind("<Button-1>", toggle_sticky)
             if expanded:
                 content.pack(fill=tk.X)
             section_parent = content
@@ -567,6 +661,25 @@ class PipelineGUI:
             ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
             var = tk.StringVar(value=str(config.get(key, default)))
             ttk.Entry(line, textvariable=var, width=width).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.vars[key] = var
+            return var
+
+        def directory_row(label: str, key: str):
+            line = ttk.Frame(section_parent)
+            line.pack(fill=tk.X, pady=3)
+            ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(config.get(key, "") or ""))
+            ttk.Entry(line, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            def choose_directory():
+                selected = filedialog.askdirectory(
+                    title="选择成品视频保存目录",
+                    initialdir=var.get().strip() or str(Path.home()),
+                )
+                if selected:
+                    var.set(selected)
+
+            ttk.Button(line, text="选择…", command=choose_directory).pack(side=tk.LEFT, padx=(6, 0))
             self.vars[key] = var
             return var
 
@@ -830,6 +943,10 @@ class PipelineGUI:
 
         section("TTS")
         combo("常用音色", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
+        self.combo_widgets["tts_provider"].bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options()
+        )
+        self._refresh_tts_voice_options()
         row("语速", "tts_rate", "+0%")
         row("音量倍率", "tts_volume", "1.0")
         section_model_combo("TTS 模型名", "tts_model", "tts-1", ["tts-1", "tts-1-hd", "gpt-4o-mini-tts"])
@@ -843,6 +960,15 @@ class PipelineGUI:
         row("TTS 最低 RMS dB", "tts_waveform_min_rms_db", "-55")
         row("TTS 最大静音比例", "tts_waveform_max_silence_ratio", "0.92")
         check("TTS 子进程隔离", "tts_subprocess_isolation")
+        check("高风险新词自动注音（Edge，调用文本 API）", "tts_auto_pronunciation_enabled")
+        row("自动注音最多候选词", "tts_auto_pronunciation_max_terms", "40")
+
+        section("洗稿")
+        check("AI 洗稿改写", "ai_rewrite_enabled")
+        check("保留章节标题并朗读（第X话）", "narrate_chapter_headings")
+        check("洗稿后朗读净化（清除装饰符号）", "tts_clean_rewritten_text")
+        row("洗稿批大小", "ai_rewrite_batch_chars", "3500")
+        textrow("洗稿提示词", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
 
         section("图片与提示词")
         subheading("模型输入", "这些模型也可以在“API 设置与 Key”中填写；保存时会检查两处是否一致。")
@@ -852,10 +978,6 @@ class PipelineGUI:
         section_model_combo("图片模型名", "image_model", "", ["gpt-image-1", "dall-e-3"])
         section_model_combo("人设图模型名", "character_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
         section_model_combo("剧情参考模型名", "scene_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
-        check("AI 洗稿改写", "ai_rewrite_enabled")
-        check("保留章节标题并朗读（第X话）", "narrate_chapter_headings")
-        row("洗稿批大小", "ai_rewrite_batch_chars", "3500")
-        textrow("洗稿提示词", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
         check("AI 人设分析", "character_analysis_enabled")
         row("人设分析最大字数", "character_analysis_max_chars", "12000")
         row("人设分析输出 tokens", "character_analysis_max_tokens", "1800")
@@ -925,6 +1047,15 @@ class PipelineGUI:
         check("内嵌字幕（强制）", "video_subtitle")
         check("导出 SRT", "video_external_subtitle")
 
+        section("输出目录")
+        directory_row("成品视频保存到", "output_directory")
+        ttk.Label(
+            section_parent,
+            text="选择后，每个任务完成时都会按任务名创建文件夹，内含成品 MP4、封面和标题.txt；不填则只保存在任务目录。关闭自动上传也会正常导出。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(0, 4))
+
         section("批量与上传")
         check("自动短说明标题", "short_title_enabled")
         row("短标题最少字", "short_title_min_chars", "20")
@@ -974,6 +1105,29 @@ class PipelineGUI:
 
         bind_config_mousewheel(canvas)
         bind_config_mousewheel(scroll)
+
+        def scroll_config_under_pointer(event):
+            """Catch trackpad/mouse scrolling anywhere over the config pane.
+
+            Some Tk controls consume wheel events before their child bindings
+            see them.  Checking the pointer against the canvas gives the whole
+            visible settings area one predictable scrolling behaviour, without
+            affecting the task list or other tabs.
+            """
+            x = event.x_root
+            y = event.y_root
+            left = canvas.winfo_rootx()
+            top = canvas.winfo_rooty()
+            if left <= x < left + canvas.winfo_width() and top <= y < top + canvas.winfo_height():
+                return scroll_config(event)
+            return None
+
+        # This is a fallback for controls that do not pass wheel events to
+        # their parent (notably some macOS Tk widgets).  Existing per-widget
+        # bindings continue to handle the normal path first.
+        self.root.bind_all("<MouseWheel>", scroll_config_under_pointer, add="+")
+        self.root.bind_all("<Button-4>", scroll_config_under_pointer, add="+")
+        self.root.bind_all("<Button-5>", scroll_config_under_pointer, add="+")
         self._config_canvas = canvas
 
     def _resolve_model_mirror_conflicts(self):
@@ -1024,7 +1178,7 @@ class PipelineGUI:
             "character_reference_width", "character_reference_height", "character_reference_max_count",
             "scene_reference_max_images",
             "image_api_timeout_seconds", "tts_segment_timeout_seconds", "tts_stall_fallback_seconds",
-            "tts_heartbeat_seconds", "tts_retries",
+            "tts_heartbeat_seconds", "tts_retries", "tts_auto_pronunciation_max_terms",
             "max_concurrent_jobs", "max_concurrent_external_api", "max_concurrent_ffmpeg",
             "max_parallel_tts", "max_parallel_images", "max_parallel_video_clips",
             "browser_ad_interval", "browser_ad_start", "dependency_pip_timeout_seconds",
@@ -1049,6 +1203,7 @@ class PipelineGUI:
             "storyboard_highlight_enabled", "storyboard_highlight_align_timeline",
             "scene_reference_enabled", "ai_api_enabled",
             "tts_retry_until_success", "tts_waveform_validation", "tts_subprocess_isolation",
+            "tts_clean_rewritten_text", "tts_auto_pronunciation_enabled",
             "hardware_autotune_enabled",
             "dependency_check_on_startup", "dependency_auto_install_python",
             "dependency_auto_install_ffmpeg", "dependency_auto_install_browser",
@@ -1446,6 +1601,18 @@ class PipelineGUI:
         except Exception:
             pass
 
+    def _refresh_tts_voice_options(self):
+        """Keep the voice picker meaningful for the currently selected TTS."""
+        provider = self._ui_value("tts_provider").strip().lower()
+        widget = self.combo_widgets.get("tts_voice")
+        var = self.vars.get("tts_voice")
+        if widget is None or var is None:
+            return
+        choices = VOICEVOX_FREQUENT_VOICES if provider == "voicevox" else EDGE_MULTI_VOICES
+        widget.configure(values=choices)
+        if self._ui_value("tts_voice") not in choices:
+            var.set(choices[0])
+
     def _show_probe_result(self, kind: str, result):
         text = result.to_text()
         target_key = {
@@ -1459,7 +1626,7 @@ class PipelineGUI:
         }.get(kind)
         if kind == "tts" and self._ui_value("tts_provider") in {"openai", "custom"}:
             target_key = "tts_model"
-        elif kind == "tts" and self._ui_value("tts_provider") in {"edge", "voicevox", "elevenlabs"}:
+        elif kind == "tts" and self._ui_value("tts_provider") in {"edge", "elevenlabs"}:
             target_key = "tts_voice"
         if target_key and result.models:
             widget = self.combo_widgets.get(target_key)
@@ -2134,6 +2301,70 @@ class PipelineGUI:
                 "任务已设为跳过 TTS。\n字幕时间会按原文长度估算，视频总时长与 MP3 一致。",
             )
 
+    def _import_files(self):
+        """Import all related files in one selection, pairing them by filename."""
+        selected = filedialog.askopenfilenames(
+            title="选择正文 TXT、可选同名 MP3 和可选同名读音词典",
+            filetypes=[("Supported files", ("*.txt", "*.mp3")), ("All files", "*.*")],
+        )
+        if not selected:
+            return
+        matched = _match_import_files(list(selected))
+        if not matched["pairs"]:
+            messagebox.showwarning("没有正文", "请选择至少一个正文 TXT。词典 TXT 需要与正文一起选择。")
+            return
+
+        invalid_audio: list[tuple[Path, str]] = []
+        invalid_dictionary: list[tuple[Path, str]] = []
+        created = 0
+        audio_attached = 0
+        dictionary_attached = 0
+        for text_path, audio_path, dictionary_path in matched["pairs"]:
+            if audio_path:
+                try:
+                    pr.inspect_imported_audio(audio_path)
+                except Exception as exc:
+                    invalid_audio.append((audio_path, str(exc)))
+                    audio_path = None
+            if dictionary_path:
+                try:
+                    pr.inspect_pronunciation_dictionary(dictionary_path)
+                except Exception as exc:
+                    invalid_dictionary.append((dictionary_path, str(exc)))
+                    dictionary_path = None
+            job_id = self._create_queued_job(
+                text_path.stem,
+                str(text_path),
+                dictionary_path=str(dictionary_path) if dictionary_path else "",
+                imported_audio_path=str(audio_path) if audio_path else None,
+            )
+            if job_id:
+                created += 1
+                audio_attached += int(audio_path is not None)
+                dictionary_attached += int(dictionary_path is not None)
+
+        report = [f"已创建 {created} 个任务，其中 {audio_attached} 个自动跳过 TTS，{dictionary_attached} 个自动附加读音词典。"]
+        if matched["ambiguous"]:
+            report.append("以下文件名匹配到多个候选文件，未导入：\n" + "\n".join(
+                f"  - {text.name} 的 {kind}：{', '.join(path.name for path in candidates)}"
+                for text, kind, candidates in matched["ambiguous"]
+            ))
+        if matched["unused_audio"]:
+            report.append("未找到同名正文的 MP3（未使用）：\n" + "\n".join(f"  - {path.name}" for path in matched["unused_audio"]))
+        if matched["unused_dictionaries"]:
+            report.append("未找到同名正文的词典（未使用）：\n" + "\n".join(f"  - {path.name}" for path in matched["unused_dictionaries"]))
+        if invalid_audio:
+            report.append("无效 MP3，已作为普通 TTS 任务导入：\n" + "\n".join(f"  - {path.name}: {error}" for path, error in invalid_audio))
+        if invalid_dictionary:
+            report.append("无效词典，未附加：\n" + "\n".join(f"  - {path.name}: {error}" for path, error in invalid_dictionary))
+        if matched["unsupported"]:
+            report.append("不支持的文件：\n" + "\n".join(f"  - {path.name}" for path in matched["unsupported"]))
+        report.append("配对规则：同一作品名的正文、MP3、词典自动组合；例如《作品.txt》《作品.mp3》《作品_读音词典.txt》。")
+        if len(report) == 2:
+            messagebox.showinfo("文件导入完成", "\n\n".join(report))
+        else:
+            messagebox.showwarning("文件导入完成", "\n\n".join(report))
+
     def _import_text_audio_pair(self):
         selected = filedialog.askopenfilenames(
             title="同时选中 1 份原文 TXT 和 1 份完整配音 MP3",
@@ -2317,6 +2548,11 @@ class PipelineGUI:
             progress=0.0,
         )
         pr.append_log(job_dir, f"queued: {title}")
+        selected_dictionary = (
+            self.pronunciation_dictionary_var.get().strip()
+            if dictionary_path is None
+            else str(dictionary_path).strip()
+        )
         if imported_audio_path:
             try:
                 pr.attach_imported_audio(job_id, imported_audio_path)
@@ -2328,13 +2564,6 @@ class PipelineGUI:
                 messagebox.showerror("导入 MP3 失败", f"任务未创建：\n{exc}")
                 self._refresh_jobs()
                 return ""
-            self._refresh_jobs()
-            return job_id
-        selected_dictionary = (
-            self.pronunciation_dictionary_var.get().strip()
-            if dictionary_path is None
-            else str(dictionary_path).strip()
-        )
         if selected_dictionary:
             try:
                 pr.attach_pronunciation_dictionary(job_id, selected_dictionary)
@@ -2351,16 +2580,62 @@ class PipelineGUI:
                 ids.append(str(values[0]))
         return ids
 
+    def _show_job_context_menu(self, event):
+        """Select the clicked row (without losing a multi-selection) and show actions."""
+        row_id = self.job_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+        if row_id not in self.job_tree.selection():
+            self.job_tree.selection_set(row_id)
+        self.job_tree.focus(row_id)
+        self.job_context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+
+    def _require_single_selected_job(self, action: str) -> str | None:
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", f"请先选择一个任务再{action}。")
+            return None
+        if len(ids) > 1:
+            messagebox.showwarning("只能选择一个任务", f"{action}一次只能处理一个任务，请只选择一个任务。")
+            return None
+        return ids[0]
+
     def _start_selected(self):
         for job_id in self._selected_job_ids():
             self._start_job(job_id)
 
     def _compose_selected(self):
         for job_id in self._selected_job_ids():
-            if pr.load_status(job_id).get("worker_alive"):
+            status = pr.load_status(job_id)
+            if status.get("worker_alive"):
                 messagebox.showwarning("任务正在运行", f"{job_id} 正在运行，请先停止后再仅重试合成。")
                 continue
-            input_text = pr.load_status(job_id).get("input", "")
+            fallback = pr.image_fallback_info(job_id)
+            tts = pr.tts_completion_info(job_id)
+            input_text = status.get("input", "")
+            if not tts.get("complete"):
+                if not fallback.get("needs_fallback"):
+                    messagebox.showwarning("配音尚未完成", "仅重试合成需要完整配音。请用“启动选中”补完 TTS 后再合成。")
+                    continue
+                answer = messagebox.askyesnocancel(
+                    "配音未完成：补完后继续合成",
+                    f"配音尚未完成；已保存 {fallback.get('available_images', 0)}/{fallback.get('total_images', 0)} 张图片。\n\n"
+                    "选择“是”：先补完 TTS，再循环使用已有图片完成合成。\n"
+                    "选择“否”：先补完 TTS，后续固定使用最后一张已有图片。\n"
+                    "选择“取消”：不继续。\n\n"
+                    "补 TTS 时不会重新调用图片 API。",
+                )
+                if answer is None:
+                    continue
+                try:
+                    pr.set_image_fallback_selection(job_id, "cycle" if answer else "hold_last")
+                    pr.start_worker(input_text, job_id=job_id, resume=True)
+                except Exception as exc:
+                    messagebox.showerror("补完 TTS 并继续合成失败", str(exc))
+                continue
+            if fallback.get("needs_fallback") and not self._choose_image_fallback(job_id, fallback):
+                continue
             try:
                 pr.start_worker(input_text, job_id=job_id, resume=True, compose_only=True)
             except Exception as exc:
@@ -2368,9 +2643,24 @@ class PipelineGUI:
         self._refresh_jobs()
 
     def _start_all_pending(self):
-        for row in pr.list_jobs(limit=500):
-            if row.get("stage") in {"queued", "failed", "missing"} and not row.get("worker_alive"):
-                self._start_job(row["job_id"])
+        try:
+            # Save once before dispatching the batch.  The workers then retain
+            # this configuration in their normal per-job snapshots.
+            self._apply_config_form(save_profile=False)
+            queued, started = pr.queue_all_pending_jobs()
+        except Exception as exc:
+            messagebox.showerror("启动全部待处理失败", str(exc))
+            return
+        self._refresh_jobs()
+        if queued:
+            waiting = len(queued) - len(started)
+            messagebox.showinfo(
+                "已加入任务队列",
+                f"已安排 {len(queued)} 个待处理任务。"
+                + (f"其中 {len(started)} 个已启动，剩余 {waiting} 个会在前面的任务结束后自动继续。" if waiting else "已全部启动。"),
+            )
+        else:
+            messagebox.showinfo("没有待处理任务", "没有可启动的待处理任务。")
 
     def _start_job(self, job_id: str):
         st = pr.load_status(job_id)
@@ -2524,7 +2814,11 @@ class PipelineGUI:
         ids = self._selected_job_ids()
         if not ids:
             return
-        running = [job_id for job_id in ids if pr.load_status(job_id).get("worker_alive")]
+        active_stages = {"queued", "worker_starting", "starting", "scrape", "clean", "tts", "images_prefetch", "pacing", "images", "image_decision", "cover", "compose", "upload", "stopping"}
+        running = [
+            job_id for job_id in ids
+            if (status := pr.load_status(job_id)).get("worker_alive") or status.get("stage") in active_stages
+        ]
         if not running:
             messagebox.showinfo("无需停止", "选中的任务没有正在运行的 worker。")
             return
@@ -2583,7 +2877,16 @@ class PipelineGUI:
             messagebox.showerror("清空失败", "\n".join(errors))
 
     def _refresh_jobs(self):
+        # Polling used to delete and recreate every row every 2.5 seconds.
+        # That silently cleared the selection just as an operator clicked a
+        # task action.  Preserve both the selected rows and viewport across a
+        # data refresh so task actions always operate on the visible choice.
+        selected_ids = list(self.job_tree.selection())
+        focused_id = self.job_tree.focus()
+        yview = self.job_tree.yview()
+        xview = self.job_tree.xview()
         self.job_tree.delete(*self.job_tree.get_children())
+        inserted_ids: set[str] = set()
         for row in pr.list_jobs(limit=500):
             st = pr.load_status(row["job_id"])
             worker = f"PID {st.get('worker_pid')}" if st.get("worker_alive") else ""
@@ -2599,10 +2902,85 @@ class PipelineGUI:
                 st.get("youtube_url", ""),
             )
             self.job_tree.insert("", tk.END, iid=row["job_id"], values=values)
+            inserted_ids.add(str(row["job_id"]))
+        retained = [job_id for job_id in selected_ids if job_id in inserted_ids]
+        if retained:
+            self.job_tree.selection_set(retained)
+            self.job_tree.focus(focused_id if focused_id in retained else retained[0])
+            self.job_tree.see(retained[0])
+        elif self._selected_job and self._selected_job not in inserted_ids:
+            self._selected_job = ""
+        if yview:
+            self.job_tree.yview_moveto(yview[0])
+        if xview:
+            self.job_tree.xview_moveto(xview[0])
 
     def _poll_jobs(self):
         self._refresh_jobs()
+        self._prompt_image_failure_choices()
         self.root.after(2500, self._poll_jobs)
+
+    def _prompt_image_failure_choices(self):
+        """Show a single, explicit choice for workers paused after image failure."""
+        for row in pr.list_jobs(limit=500):
+            job_id = row["job_id"]
+            status = pr.load_status(job_id)
+            failure = status.get("image_failure")
+            if status.get("stage") != "image_decision" or not isinstance(failure, dict):
+                self._image_failure_prompted.discard(job_id)
+                continue
+            if job_id in self._image_failure_prompted:
+                continue
+            self._image_failure_prompted.add(job_id)
+            try:
+                self._choose_image_failure_action(job_id, failure)
+            except Exception as exc:
+                self._image_failure_prompted.discard(job_id)
+                messagebox.showerror("无法继续合成", f"无法保存图片处理选择：\n{exc}")
+
+    def _choose_image_failure_action(self, job_id: str, failure: dict) -> None:
+        available = int(failure.get("available_images") or 0)
+        total = int(failure.get("total_images") or 0)
+        error = str(failure.get("error") or "图片生成失败")
+        answer = messagebox.askyesnocancel(
+            "图片生成失败：请选择处理方式",
+            f"已成功保存 {available}/{total} 张图片，但后续图片生成失败。\n\n"
+            "选择“是”：循环使用已成功生成的图片，继续完成视频；后续不再调用图片 API。\n"
+            "选择“否”：跳过此任务，自动开始队列中的下一个任务；本任务保留，之后可手动处理。\n"
+            "选择“取消”：保持暂停。\n\n"
+            f"失败原因：{error}",
+        )
+        if answer is True:
+            pr.set_image_fallback_selection(job_id, "cycle")
+            return
+        if answer is False:
+            path = pr.job_dir_for(job_id) / pr.IMAGE_FAILURE_DECISION_FILE
+            payload = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload["decision"] = "skip"
+            payload["decided_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _choose_image_fallback(self, job_id: str, info: dict, *, title: str = "图片不完整：仅重试合成", error: str = "") -> bool:
+        available = int(info.get("available_images") or 0)
+        total = int(info.get("total_images") or 0)
+        if available < 1:
+            return False
+        message = (
+            f"已成功保存 {available}/{total} 张图片。\n"
+            "可直接使用这些图片完成后续视频，且不会再调用图片 API。\n\n"
+            "选择“是”：循环使用已有图片。\n"
+            "选择“否”：从缺失位置起固定使用最后一张已生成图片。\n"
+            "选择“取消”：不继续。"
+        )
+        if error:
+            message += f"\n\n失败原因：{error}"
+        answer = messagebox.askyesnocancel(title, message)
+        if answer is None:
+            return False
+        pr.set_image_fallback_selection(job_id, "cycle" if answer else "hold_last")
+        return True
 
     def _on_job_select(self, _event=None):
         ids = self._selected_job_ids()
@@ -2628,14 +3006,22 @@ class PipelineGUI:
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.NORMAL)
 
-    def _open_selected_dir(self):
-        ids = self._selected_job_ids()
-        if not ids:
+    def _open_selected_output_dir(self):
+        """Open this task's own job folder, where its completed MP4 is kept."""
+        job_id = self._require_single_selected_job("打开任务文件夹")
+        if job_id is None:
             return
-        path = pr.job_dir_for(ids[0])
-        path.mkdir(parents=True, exist_ok=True)
-        import os
-        os.startfile(str(path))
+        job_dir = pr.job_dir_for(job_id)
+        path = job_dir
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif sys.platform == "win32":
+                __import__("os").startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            messagebox.showerror("打开任务文件夹失败", str(exc))
 
 
 def main():

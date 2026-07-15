@@ -64,7 +64,21 @@ from app.utils.secrets import clean_api_key, redact_secret_text
 
 LogFn = Callable[[str], None]
 ProgFn = Callable[[float], None]
+IMAGE_FAILURE_DECISION_FILE = "image_failure_decision.json"
+IMAGE_SELECTION_FILE = "image_selection.json"
 
+
+class ImageGenerationFailed(RuntimeError):
+    """A scene image could not be generated after its normal retries."""
+
+    def __init__(self, index: int, error: str):
+        super().__init__(error)
+        self.index = index
+        self.error = error
+
+
+class ImageGenerationSkipped(RuntimeError):
+    """The operator chose to leave an image-failed job for later handling."""
 
 def _parallel_limit(config_key: str, default: int, total: int, hard_cap: int = 16) -> int:
     try:
@@ -214,6 +228,49 @@ def video_output_path(job_dir: Path) -> Path:
     return job_dir / f"{safe_job_name(output_basename)}.mp4"
 
 
+def export_completed_video(
+    video_path: Path,
+    cover_path: Path | None,
+    title: str,
+    short_title: str = "",
+    on_log: LogFn = _noop,
+) -> Path | None:
+    """Export one completed task as a self-contained delivery folder.
+
+    The working copy deliberately stays in the job folder, because it is used
+    for resume and optional YouTube upload.  The delivery folder is an
+    additional stable hand-off package for workflows where publishing is off.
+    """
+    configured = str(config.get("output_directory", "") or "").strip()
+    if not configured:
+        return None
+    try:
+        destination_dir = Path(configured).expanduser().resolve()
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        destination = destination_dir / safe_job_name(video_path.stem, fallback="article")
+        sequence = 2
+        while destination.exists():
+            destination = destination_dir / f"{safe_job_name(video_path.stem, fallback='article')}_{sequence}"
+            sequence += 1
+        temporary = destination.with_name(f".{destination.name}.copying")
+        if temporary.exists():
+            shutil.rmtree(temporary)
+        temporary.mkdir()
+        shutil.copy2(video_path, temporary / video_path.name)
+        if cover_path is not None and cover_path.exists():
+            shutil.copy2(cover_path, temporary / cover_path.name)
+        title_lines = [f"原始标题：{title.strip() or video_path.stem}"]
+        if short_title.strip():
+            title_lines.append(f"生成短标题：{short_title.strip()}")
+        (temporary / "标题.txt").write_text("\n".join(title_lines) + "\n", encoding="utf-8")
+        temporary.replace(destination)
+        on_log(f"  OK 成品文件夹已导出: {destination}")
+        return destination
+    except Exception as exc:
+        on_log(f"  ⚠️ 成品文件夹导出失败（任务内成品仍保留）: {exc}")
+        return None
+
+
 def append_log(job_dir: Path, message: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     with (job_dir / "log.txt").open("a", encoding="utf-8") as f:
@@ -347,6 +404,7 @@ _STAGE_LABELS = {
     "clean": "2/6 整理/洗稿切片",
     "tts": "3/6 配音",
     "images_prefetch": "4/6 预生成图片",
+    "image_decision": "等待图片处理选择",
     "pacing": "4/6 规划画面",
     "images": "4/6 生成图片",
     "cover": "5/6 生成封面",
@@ -671,6 +729,41 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
     return None
 
 
+def queue_all_pending_jobs(*, on_log: LogFn = _noop) -> tuple[list[str], list[tuple[str, int]]]:
+    """Queue every restartable pending job and fill the available worker slots.
+
+    This is deliberately separate from ``start_worker``: a batch request must
+    remain useful when its size is greater than ``max_concurrent_jobs``.  Jobs
+    left in ``queued`` are picked up by each finishing worker.
+    """
+    queued: list[str] = []
+    for row in list_jobs(limit=500):
+        job_id = str(row.get("job_id") or "")
+        if not job_id or row.get("worker_alive"):
+            continue
+        status = load_status(job_id)
+        if status.get("stage") not in {"queued", "failed"}:
+            continue
+        if not str(status.get("input") or "").strip():
+            continue
+        # A failed job is a resumable job in a batch.  Convert it to the same
+        # durable queue state as a newly created job so a later worker can
+        # start it after capacity becomes available.
+        if status.get("stage") != "queued":
+            write_status(job_dir_for(job_id), stage="queued", worker_pid=None, error="")
+            append_log(job_dir_for(job_id), "queued by 'start all pending'")
+        queued.append(job_id)
+
+    started: list[tuple[str, int]] = []
+    max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
+    while count_running_workers() < max_jobs:
+        next_job = start_next_queued_job(on_log=on_log)
+        if next_job is None:
+            break
+        started.append(next_job)
+    return queued, started
+
+
 def _build_scraper(site: str):
     if site in {"source_catalog", "catalog", "novel_catalog"}:
         return SourceCatalogScraper()
@@ -832,6 +925,9 @@ def stage_clean(
     else:
         text = _strip_story_scaffold(novel.full_text, novel, on_log=on_log, job_dir=job_dir)
         text = _rewrite_story_text(text, on_log=on_log, job_dir=job_dir)
+        if bool(config.get("tts_clean_rewritten_text", True)):
+            text = _clean_rewritten_narration_text(text, on_log=on_log, job_dir=job_dir)
+        _generate_auto_pronunciation_dictionary(text, on_log=on_log, job_dir=job_dir)
     segs = split_segments(text)
     on_log(f"  OK 切成 {len(segs)} 段")
     if not segs:
@@ -948,6 +1044,118 @@ def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None =
     return rewritten
 
 
+_NARRATION_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>]+", re.I)
+_NARRATION_DECORATION_RE = re.compile(r"[《》〈〉「」『』“”‘’\"'（）()［］\[\]【】〔〕{}｛｝]")
+_NARRATION_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\U00002700-\U000027BF\U0000FE0F]")
+
+
+def _clean_rewritten_narration_text(text: str, on_log: LogFn = _noop, job_dir: Path | None = None) -> str:
+    """Remove decorative syntax while retaining prose and natural pauses."""
+    source = str(text or "")
+    value = _NARRATION_URL_RE.sub("", source)
+    value = _NARRATION_EMOJI_RE.sub("", value)
+    value = _NARRATION_DECORATION_RE.sub("", value)
+    value = re.sub(r"[\u200b-\u200d\ufeff]", "", value)
+    value = re.sub(r"[#$＃＊*•●◆◇▪▫]+", "", value)
+    value = re.sub(r"(?:\.{2,}|…+)", "。", value)
+    value = re.sub(r"[—―－〜～]+", "，", value)
+    value = re.sub(r"[，,]{2,}", "，", value)
+    value = re.sub(r"[。]{2,}", "。", value)
+    value = re.sub(r"[ \t]+\n", "\n", value)
+    value = re.sub(r"\n{3,}", "\n\n", value).strip()
+    if job_dir is not None:
+        (job_dir / "text_tts_ready.txt").write_text(value, encoding="utf-8")
+    removed = len(source) - len(value)
+    if removed:
+        on_log(f"  朗读净化完成：清理 {removed} 个装饰/异常字符")
+    return value
+
+
+_JP_RISK_TOKEN_RE = re.compile(r"[\u3400-\u9fff々〆ヶァ-ヴー]{2,}")
+_JP_KANJI_RE = re.compile(r"[\u3400-\u9fff々〆ヶ]")
+_JP_KATAKANA_RE = re.compile(r"[ァ-ヴー]")
+_JP_READING_RE = re.compile(r"^[ぁ-ゖァ-ヺー・]+$")
+
+
+def _high_risk_japanese_terms(text: str, limit: int) -> list[str]:
+    """Return conservative, deterministic candidates; ordinary short words stay out."""
+    terms: list[str] = []
+    seen: set[str] = set()
+    for match in _JP_RISK_TOKEN_RE.finditer(str(text or "")):
+        term = match.group(0)
+        kanji = len(_JP_KANJI_RE.findall(term))
+        katakana = len(_JP_KATAKANA_RE.findall(term))
+        if not (kanji >= 3 or (kanji >= 1 and katakana >= 2)):
+            continue
+        if term not in seen:
+            seen.add(term)
+            terms.append(term)
+        if len(terms) >= limit:
+            break
+    return terms
+
+
+def _generate_auto_pronunciation_dictionary(text: str, on_log: LogFn = _noop, job_dir: Path | None = None) -> None:
+    """Optionally ask the text LLM for readings of a small, pre-filtered term list."""
+    if job_dir is None:
+        return
+    auto_path = job_dir / TTS_AUTO_PRONUNCIATION_DICTIONARY
+    report_path = job_dir / "tts_auto_pronunciation_report.json"
+    auto_path.unlink(missing_ok=True)
+    report_path.unlink(missing_ok=True)
+    if not bool(config.get("ai_rewrite_enabled", False)):
+        return
+    if not bool(config.get("tts_auto_pronunciation_enabled", False)):
+        return
+    if config.tts_provider != "edge":
+        on_log("  自动读音词典仅适用于 Edge TTS，已跳过")
+        return
+    if not _can_call_text_llm():
+        on_log("  自动读音词典已开启，但未配置文本 API；已跳过")
+        return
+    try:
+        max_terms = max(1, min(100, int(config.get("tts_auto_pronunciation_max_terms", 40) or 40)))
+    except Exception:
+        max_terms = 40
+    candidates = _high_risk_japanese_terms(text, max_terms)
+    if not candidates:
+        on_log("  自动读音词典：未发现高风险日语词")
+        return
+    system = (
+        "你是日语 TTS 读音词典助手。只为用户给出的候选词提供日语假名读音。"
+        "只输出严格的 `原词=假名读音`，每行一条；不得输出解释、标题、Markdown，"
+        "不得添加候选列表以外的词，不确定时直接省略该词。"
+        "读音只能使用平假名、片假名、中点或长音符。"
+    )
+    route = _llm_route_settings()
+    llm = LLMBackend(
+        provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"], model=route["model"],
+        system_prompt=system, temperature=0.0, max_tokens=max(200, min(1200, len(candidates) * 24)), timeout=90.0,
+    )
+    try:
+        with external_api_slot(action="auto pronunciation"):
+            reply = llm.complete(system, "候选词：\n" + "\n".join(candidates), temperature=0.0)
+    except Exception as exc:
+        on_log(f"  WARN 自动读音词典生成失败，已保留 Edge 原文朗读: {exc}")
+        return
+    candidate_set = set(candidates)
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for line in _strip_llm_fences(reply).splitlines():
+        if "=" not in line:
+            continue
+        written, reading = (part.strip() for part in line.split("=", 1))
+        if written in candidate_set and written not in seen and _JP_READING_RE.fullmatch(reading or ""):
+            seen.add(written)
+            entries.append((written, reading))
+    _write_json(report_path, {"candidates": candidates, "entries": [{"written": w, "reading": r} for w, r in entries]})
+    if not entries:
+        on_log(f"  自动读音词典：API 未返回可用条目（候选 {len(candidates)} 个）")
+        return
+    auto_path.write_text("\n".join(f"{written}={reading}" for written, reading in entries) + "\n", encoding="utf-8")
+    on_log(f"  自动读音词典：候选 {len(candidates)} 个，采用 {len(entries)} 条")
+
+
 def _split_rewrite_paragraphs(text: str) -> list[str]:
     normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
     raw = re.split(r"\n\s*\n", normalized)
@@ -1058,6 +1266,7 @@ def _tts_config_hash() -> str:
 
 
 TTS_PRONUNCIATION_DICTIONARY = "tts_pronunciation_dictionary.txt"
+TTS_AUTO_PRONUNCIATION_DICTIONARY = "tts_auto_pronunciation_dictionary.txt"
 IMPORTED_AUDIO_MANIFEST = "imported_audio.json"
 IMPORTED_AUDIO_FILENAME = "imported_narration.mp3"
 
@@ -1736,14 +1945,21 @@ def _stage_tts_manifest_impl(
     on_prog: ProgFn,
 ) -> tuple[list[Path], list[float]]:
     dictionary_path = job_dir / TTS_PRONUNCIATION_DICTIONARY
+    auto_dictionary_path = job_dir / TTS_AUTO_PRONUNCIATION_DICTIONARY
     dictionary_entries: list[tuple[str, str]] = []
     dictionary_hash = ""
     narration_texts = [seg.text for seg in segments]
     replacement_counts = [0 for _seg in segments]
-    if dictionary_path.exists() and config.tts_provider == "edge":
-        dictionary_source = dictionary_path.read_text(encoding="utf-8-sig")
-        dictionary_entries = parse_pronunciation_dictionary(dictionary_source)
-        dictionary_hash = _text_hash(dictionary_source.lstrip("\ufeff"))
+    if (dictionary_path.exists() or auto_dictionary_path.exists()) and config.tts_provider == "edge":
+        # The manually attached dictionary wins over API-generated entries.
+        generated_source = auto_dictionary_path.read_text(encoding="utf-8-sig") if auto_dictionary_path.exists() else ""
+        manual_source = dictionary_path.read_text(encoding="utf-8-sig") if dictionary_path.exists() else ""
+        generated_entries = parse_pronunciation_dictionary(generated_source) if generated_source.strip() else []
+        manual_entries = parse_pronunciation_dictionary(manual_source) if manual_source.strip() else []
+        merged_readings = {written: reading for written, reading in generated_entries}
+        merged_readings.update({written: reading for written, reading in manual_entries})
+        dictionary_entries = sorted(merged_readings.items(), key=lambda item: -len(item[0]))
+        dictionary_hash = _text_hash(generated_source.lstrip("\ufeff") + "\n--manual--\n" + manual_source.lstrip("\ufeff"))
         applied = [_apply_pronunciation_dictionary(seg.text, dictionary_entries) for seg in segments]
         narration_texts = [item[0] for item in applied]
         replacement_counts = [item[1] for item in applied]
@@ -1765,7 +1981,7 @@ def _stage_tts_manifest_impl(
             f"  pronunciation dictionary: {len(dictionary_entries)} entries, "
             f"{total_replacements} replacements in {changed_segments}/{len(segments)} segments"
         )
-    elif dictionary_path.exists() and config.tts_provider != "edge":
+    elif (dictionary_path.exists() or auto_dictionary_path.exists()) and config.tts_provider != "edge":
         on_log("  pronunciation dictionary is attached but only applies when TTS provider=edge")
 
     def make_tts() -> TTSBackend:
@@ -2461,6 +2677,20 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_tit
         value = re.sub(pattern, replacement, value, flags=re.I)
     value = re.sub(r"(?i)\b(blood|gore|corpse|nude|naked|sexual|erotic|severed)\b", "", value)
     value = re.sub(r"\s{2,}", " ", value).strip(" ,.;")
+    if not allow_title_text:
+        # Remove camera directions that directly fight the mandatory safe
+        # framing below.  This matters for profiles that say both "complete
+        # heads" and "strong foreground protagonist" in the same prompt.
+        value = re.sub(
+            r"(?i)\b(?:extreme|dramatic|tight)\s+close[- ]?up(?:\s+portrait)?\b|\bclose[- ]?up\s+portrait\b",
+            "pulled-back medium-wide shot",
+            value,
+        )
+        value = re.sub(
+            r"(?i)\bstrong\s+foreground\s+protagonist\b|\boversized\s+foreground\s+(?:character|face)\b",
+            "clearly staged protagonist with comfortable surrounding space",
+            value,
+        )
     if allow_title_text:
         guard = (
             "Family-friendly cinematic cover illustration, adult-looking characters, symbolic emotional drama, "
@@ -2472,16 +2702,23 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_tit
             "Family-friendly cinematic anime illustration, adult-looking characters, symbolic emotional drama, "
             "fully clothed characters, clean composition, soft lighting, readable faces, text-free artwork"
         )
-    # Camera language from a story prompt often asks for dramatic close-ups.
-    # Put this constraint at the front so it remains effective even if a long
-    # prompt later has to be shortened for an image provider.
-    framing_guard = (
-        "Medium-wide 16:9 composition; every visible person has their complete head, face, forehead, and chin "
-        "inside the frame, with generous headroom and safe margins on every edge; no cropped head, face, or body "
-        "at the image boundary"
-    )
-    if not re.search(r"(?i)complete\s+(?:heads?|head)|generous\s+headroom|no\s+cropped\s+(?:heads?|faces?)", value):
-        value = f"{framing_guard}. {value}"
+    if not allow_title_text:
+        # Always put the hard camera constraint first.  A profile may contain a
+        # weaker phrase such as "complete faces" while also asking for a strong
+        # foreground close-up; the weaker phrase must not suppress this guard.
+        framing_guard = (
+            "Mandatory final-video crop-safe framing: the output will be enlarged and center-cropped to a full-screen "
+            "16:9 landscape frame regardless of the provider canvas ratio; compose every person, face, hand, and essential "
+            "story action entirely inside the central horizontal 16:9 safe band (for a square source, this is the middle "
+            "56 percent of its height); keep the upper and lower outside strips background-only, such as sky, wall, ceiling, "
+            "floor, or scenery; use a pulled-back medium-wide shot, never a close-up; the primary character occupies no more "
+            "than 50 percent of source-canvas height; show every visible person's entire hair crown, head, face, chin, "
+            "shoulders, and upper body inside the central safe band; keep all people and essential action at least 10 percent "
+            "away from every side edge; no person, hair, head, face, chin, hand, or key object may touch or cross the central "
+            "16:9 safe-band boundary"
+        )
+        if "central horizontal 16:9 safe band" not in value.lower():
+            value = f"{framing_guard}. {value}"
     if "family-friendly" not in value.lower():
         value = f"{value}. {guard}"
     return value[:1400]
@@ -2529,7 +2766,9 @@ def _image_cache_key(
     """
     return _stable_hash(
         {
-            "schema": 1,
+            # v4 restores full-screen cover cropping for every provider ratio.
+            # Old blurred-extension images must never be reused.
+            "schema": 4,
             "provider": str(route.get("provider") or "").strip().lower(),
             "base_url": str(route.get("base_url") or "").strip().rstrip("/"),
             "model": str(route.get("model") or "").strip(),
@@ -2543,6 +2782,134 @@ def _image_cache_key(
             ],
         }
     )
+
+
+def _valid_scene_images(job_dir: Path) -> list[tuple[int, Path]]:
+    images: list[tuple[int, Path]] = []
+    for path in sorted((job_dir / "images").glob("img_*.png")):
+        try:
+            index = int(path.stem.removeprefix("img_"))
+            if path.stat().st_size >= 100:
+                images.append((index, path))
+        except (OSError, ValueError):
+            continue
+    return images
+
+
+def image_fallback_info(job_id: str) -> dict:
+    """Report whether a partial image cache can finish a video without AI calls."""
+    job_dir = _safe_job_path(job_id)
+    rows = _read_json(job_dir / "plans.json", [])
+    total = len(rows) if isinstance(rows, list) else 0
+    available = _valid_scene_images(job_dir)
+    existing_indexes = {index for index, _ in available}
+    return {
+        "available_images": len(available),
+        "total_images": total,
+        "needs_fallback": bool(total and available and any(i not in existing_indexes for i in range(total))),
+    }
+
+
+def tts_completion_info(job_id: str) -> dict:
+    """Check whether compose-only has all narration audio it needs."""
+    job_dir = _safe_job_path(job_id)
+    segments = _load_job_segments(job_dir)
+    durations = _read_json(job_dir / "durations.json", [])
+    complete = bool(
+        segments
+        and isinstance(durations, list)
+        and len(durations) == len(segments)
+        and all(isinstance(value, (int, float)) and float(value) > 0.05 for value in durations)
+    )
+    imported = _job_imported_audio(job_dir)
+    if imported is not None:
+        complete = complete and imported[0].exists() and _audio_duration(imported[0]) > 0.05
+    elif complete:
+        complete = all((job_dir / "audio" / f"seg_{i:05d}.mp3").exists() for i in range(len(segments)))
+    return {"complete": complete, "segments": len(segments)}
+
+
+def _image_fallback_mode(job_dir: Path) -> str:
+    selection = _read_json(job_dir / IMAGE_SELECTION_FILE, {})
+    mode = str(selection.get("mode") or "") if isinstance(selection, dict) else ""
+    return mode if mode in {"cycle", "hold_last"} else ""
+
+
+def set_image_fallback_selection(job_id: str, mode: str) -> dict:
+    """Persist a no-API image reuse plan for normal and compose-only runs."""
+    if mode not in {"cycle", "hold_last"}:
+        raise ValueError(f"unsupported image fallback mode: {mode}")
+    job_dir = _safe_job_path(job_id)
+    info = image_fallback_info(job_id)
+    total = int(info["total_images"])
+    available = _valid_scene_images(job_dir)
+    if not total or not available:
+        raise RuntimeError("没有足够的分镜或已有图片，无法复用图片继续合成。")
+    by_index = dict(available)
+    reusable = [path for _, path in available]
+    last_path = available[-1][1]
+    result = [
+        by_index[i] if i in by_index else (last_path if mode == "hold_last" else reusable[i % len(reusable)])
+        for i in range(total)
+    ]
+    selection = {
+        "mode": mode,
+        "available_images": len(available),
+        "total_images": total,
+        "paths": [str(path.relative_to(job_dir)) for path in result],
+        "chosen_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(job_dir / IMAGE_SELECTION_FILE, selection)
+    request_path = job_dir / IMAGE_FAILURE_DECISION_FILE
+    request = _read_json(request_path, {})
+    if isinstance(request, dict) and request.get("status") == "awaiting_choice":
+        request["decision"] = mode
+        request["decided_at"] = selection["chosen_at"]
+        _write_json(request_path, request)
+    return selection
+
+
+def _wait_for_image_failure_choice(job_dir: Path, plans: list[ImagePlan], failure: ImageGenerationFailed, on_log: LogFn) -> list[Path]:
+    """Let the GUI choose how to reuse saved images without another API call."""
+    available = _valid_scene_images(job_dir)
+    if not available:
+        raise RuntimeError(f"图{failure.index + 1}生成失败，且没有可复用的已生成图片：{failure.error}")
+    request_path = job_dir / IMAGE_FAILURE_DECISION_FILE
+    request = {
+        "status": "awaiting_choice",
+        "failed_image_index": failure.index,
+        "available_images": len(available),
+        "total_images": len(plans),
+        "error": failure.error,
+        "requested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(request_path, request)
+    write_status(
+        job_dir,
+        stage="image_decision",
+        image_failure=request,
+        error="",
+    )
+    on_log(
+        f"  image generation paused after failure; {len(available)}/{len(plans)} usable images saved. "
+        "Waiting for a choice in the desktop app."
+    )
+    while True:
+        time.sleep(0.5)
+        decision = _read_json(request_path, {})
+        mode = str(decision.get("decision") or "").strip().lower() if isinstance(decision, dict) else ""
+        if mode == "skip":
+            request["status"] = "skipped"
+            _write_json(request_path, request)
+            raise ImageGenerationSkipped("图片生成失败后由用户跳过；任务保留，稍后可手动处理。")
+        if mode not in {"cycle", "hold_last"}:
+            continue
+        selection = set_image_fallback_selection(job_dir.name, mode)
+        request["status"] = "chosen"
+        request["decision"] = mode
+        _write_json(request_path, request)
+        on_log(f"  image fallback selected: {mode}; continuing composition without more image API calls")
+        return [job_dir / str(path) for path in selection["paths"]]
 
 
 def stage_storyboard_and_image(
@@ -2584,6 +2951,14 @@ def stage_storyboard_and_image(
     prompts_log: list[dict | None] = [None] * len(plans)
     paths: list[Path | None] = [None] * len(plans)
     write_lock = threading.Lock()
+    scene_negative_prompt = ", ".join(
+        part for part in (
+            str(config.llm_negative_prompt or "").strip(" ,"),
+            "cropped head, cut-off head, cropped face, face outside frame, forehead outside frame, "
+            "top of head outside frame, character touching image edge, extreme close-up, oversized foreground face, "
+            "portrait crop, partial person at image boundary",
+        ) if part
+    )
 
     def process_image(i: int, plan: ImagePlan) -> tuple[int, Path, str]:
         out = img_dir / f"img_{i:05d}.png"
@@ -2646,7 +3021,7 @@ def stage_storyboard_and_image(
         cache_key = _image_cache_key(
             route=generation_route,
             prompt=prompt,
-            negative_prompt=str(config.llm_negative_prompt or ""),
+            negative_prompt=scene_negative_prompt,
             width=config.image_width,
             height=config.image_height,
             reference_paths=reference_paths,
@@ -2691,7 +3066,7 @@ def stage_storyboard_and_image(
                     if scene_route["provider"] == "placeholder":
                         make_image_backend("placeholder").generate(
                             attempt_prompt,
-                            config.llm_negative_prompt,
+                            scene_negative_prompt,
                             out,
                             width=config.image_width,
                             height=config.image_height,
@@ -2704,7 +3079,7 @@ def stage_storyboard_and_image(
                             if reference_paths:
                                 make_scene_reference_backend().generate_with_references(
                                     attempt_prompt,
-                                    config.llm_negative_prompt,
+                                    scene_negative_prompt,
                                     reference_paths,
                                     out,
                                     width=config.image_width,
@@ -2713,7 +3088,7 @@ def stage_storyboard_and_image(
                             else:
                                 make_image_backend().generate(
                                     attempt_prompt,
-                                    config.llm_negative_prompt,
+                                    scene_negative_prompt,
                                     out,
                                     width=config.image_width,
                                     height=config.image_height,
@@ -2754,13 +3129,14 @@ def stage_storyboard_and_image(
                 )
                 # Never silently turn an API failure into a completed color-
                 # screen video.  Leave a retryable failure marker and stop.
-                raise RuntimeError(f"图{i} 生成失败，已停止合成，重试时会重新请求 API：{error_text}")
+                raise ImageGenerationFailed(i, error_text)
         else:
             on_log(f"  image {i + 1}/{len(plans)} reuse cached file: {out}")
         return i, out, prompt
 
     completed = 0
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image") as pool:
+    pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="image")
+    try:
         future_labels = {pool.submit(process_image, i, plan): i for i, plan in enumerate(plans)}
         pending = set(future_labels)
         while pending:
@@ -2779,6 +3155,22 @@ def stage_storyboard_and_image(
                     _write_json(job_dir / "prompts.json", [p for p in prompts_log if p is not None])
                 on_log(f"  image progress {completed}/{len(plans)}: {prompt[:80]}...")
                 on_prog(completed / max(1, len(plans)))
+    except ImageGenerationFailed as failure:
+        # Do not wait for queued work after a failure: the GUI can decide to
+        # finish with files already on disk, avoiding another full restart.
+        for future in future_labels:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        if job_dir.name == "_prefetch_images":
+            raise RuntimeError(f"图{failure.index + 1} 生成失败：{failure.error}") from failure
+        return _wait_for_image_failure_choice(job_dir, plans, failure, on_log)
+    except Exception:
+        for future in future_labels:
+            future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
     final_paths = [p for p in paths if p is not None]
     if len(final_paths) != len(plans):
@@ -3003,6 +3395,29 @@ def _cover_excerpt(novel: Novel, segments: list[Segment], limit: int = 900) -> s
     return text[: max(80, int(limit))]
 
 
+def _cover_crop_safe_prompt(prompt: str) -> str:
+    """Keep the actual cover content safe for the provider-to-16:9 center crop."""
+    value = " ".join(str(prompt or "").split()).strip()
+    value = re.sub(
+        r"(?i)\b(?:extreme|dramatic|tight)\s+close[- ]?up(?:\s+portrait)?\b|\bclose[- ]?up\s+portrait\b",
+        "medium-wide character composition",
+        value,
+    )
+    value = re.sub(
+        r"(?i)\bdramatic\s+character\s+close[- ]?up\b",
+        "medium-wide character composition",
+        value,
+    )
+    guard = (
+        "Mandatory final-cover crop-safe framing: the provider image may be enlarged and center-cropped to a full-screen "
+        "16:9 landscape cover. Keep every face, entire head, hair crown, chin, hands, important object, and the exact "
+        "title typography completely inside the central horizontal 16:9 safe band; for a square source, use only its middle "
+        "56 percent of height for meaningful content. The top and bottom outside strips must contain background-only scenery. "
+        "Use a medium-wide composition with generous edge margins; no cropped head, face, hand, person, title, or key object."
+    )
+    return f"{guard}. {value}"
+
+
 def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _noop) -> str:
     title = _clean_display_title(novel.title)
     excerpt = _cover_excerpt(novel, segments)
@@ -3042,8 +3457,10 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
             if title not in prompt:
                 prompt = f'Title context: "{title}". {prompt}'
             return _policy_safe_image_prompt(
-                f'{prompt}. Render the exact title text "{title}" as the main readable cover title in the image. '
-                f'Do not add other text, logos, captions, UI, or watermarks.',
+                _cover_crop_safe_prompt(
+                    f'{prompt}. Render the exact title text "{title}" as the main readable cover title in the image. '
+                    f'Do not add other text, logos, captions, UI, or watermarks.'
+                ),
                 fallback_text=excerpt,
                 allow_title_text=True,
             )
@@ -3051,7 +3468,11 @@ def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _
             on_log(f"  WARN cover prompt LLM failed: {exc}; use template prompt")
     if title not in fallback:
         fallback = f'Render the exact title text "{title}" as the main readable cover title. {fallback}'
-    return _policy_safe_image_prompt(fallback, fallback_text=excerpt, allow_title_text=True)
+    return _policy_safe_image_prompt(
+        _cover_crop_safe_prompt(fallback),
+        fallback_text=excerpt,
+        allow_title_text=True,
+    )
 
 
 def _cover_negative_prompt() -> str:
@@ -3065,6 +3486,11 @@ def _cover_negative_prompt() -> str:
         if "title text" in lower or "readable text" in lower:
             continue
         filtered.append(item)
+    filtered.extend([
+        "cropped head", "cut-off head", "cropped face", "face outside frame",
+        "forehead outside frame", "title outside frame", "cropped typography",
+        "person touching image edge", "extreme close-up", "portrait crop",
+    ])
     return ", ".join(item for item in filtered if item)
 
 
@@ -3284,7 +3710,7 @@ def stage_cover(
     provider = cover_backend["provider"]
     expected_hash = _stable_hash(
         {
-            "schema": "cover_v2_prompt_generated_title",
+            "schema": "cover_v3_crop_safe_fullscreen",
             "title": title,
             "excerpt_hash": _text_hash(excerpt),
             "provider": provider,
@@ -3827,16 +4253,21 @@ def resume_compose_only(job_id: str, on_log: LogFn = _noop) -> Path:
             highlight_action=str(row.get("highlight_action") or ""),
         ))
     plans.sort(key=lambda p: p.image_index)
-    images = [job_dir / "images" / f"img_{i:05d}.png" for i in range(len(plans))]
+    selection = _read_json(job_dir / IMAGE_SELECTION_FILE, {})
+    selected_paths = selection.get("paths") if isinstance(selection, dict) else None
+    if isinstance(selected_paths, list) and len(selected_paths) == len(plans):
+        images = [job_dir / str(path) for path in selected_paths]
+    else:
+        images = [job_dir / "images" / f"img_{i:05d}.png" for i in range(len(plans))]
     if len(plans) != len(images) or any(not path.exists() for path in images):
         raise RuntimeError("合成所需图片不完整；不会自动出图，请先检查图片缓存。")
     durations = _read_json(job_dir / "durations.json", [])
     if not isinstance(durations, list) or len(durations) != len(segments):
         raise RuntimeError("缺少或无效 durations.json，无法仅重试合成。")
     imported = _job_imported_audio(job_dir)
-    audios = [imported[0]] if imported else [job_dir / "audio_full.mp3"]
+    audios = [imported[0]] if imported else [job_dir / "audio" / f"seg_{i:05d}.mp3" for i in range(len(segments))]
     if any(not path.exists() for path in audios):
-        raise RuntimeError("缺少合成所需音频，无法仅重试合成。")
+        raise RuntimeError("配音尚未完成；请先选择补完 TTS 后再合成。")
     on_log("== compose-only retry: reuse existing images and audio; no image generation ==")
     return stage_compose(audios, [float(value) for value in durations], segments, plans, images, job_dir, on_log)
     audio_full = job_dir / "audio_full.mp3"
@@ -3994,7 +4425,10 @@ def run_full(
         character_analysis = timed("4b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
         progress("tts", 0.15, title=novel.title)
 
-        overlap_images = bool(config.get("pipeline_overlap_tts_images", True))
+        # A user-selected fallback means this resumed job must spend effort on
+        # missing TTS only; it must never start another image API request.
+        image_fallback_mode = _image_fallback_mode(job_dir)
+        overlap_images = bool(config.get("pipeline_overlap_tts_images", True)) and not image_fallback_mode
         if overlap_images:
             log("  overlap enabled: prefetch storyboard/images while TTS is running")
             estimated_durs = [_estimated_speech_duration(s.text) for s in segments]
@@ -4078,16 +4512,22 @@ def run_full(
             _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
             progress("images", 0.50, title=novel.title)
 
-            images = timed(
-                "6_images_final",
-                stage_storyboard_and_image,
-                plans,
-                job_dir,
-                character_analysis,
-                story_context,
-                on_log=log,
-                on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
-            )
+            if image_fallback_mode:
+                selection = set_image_fallback_selection(job_id, image_fallback_mode)
+                images = [job_dir / str(path) for path in selection["paths"]]
+                log(f"  reuse selected partial images ({image_fallback_mode}); skip image API")
+                progress("images", 0.88, title=novel.title)
+            else:
+                images = timed(
+                    "6_images_final",
+                    stage_storyboard_and_image,
+                    plans,
+                    job_dir,
+                    character_analysis,
+                    story_context,
+                    on_log=log,
+                    on_prog=lambda p: progress("images", 0.50 + p * 0.38, title=novel.title),
+                )
         _finalize_highlight_timeline(plans, segments, durs, job_dir, on_log=log)
         _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
         progress("cover", 0.89, title=novel.title)
@@ -4095,6 +4535,13 @@ def run_full(
         progress("compose", 0.90, title=novel.title, cover=str(cover or ""))
 
         video = timed("8_compose", stage_compose, audios, durs, segments, plans, images, job_dir, on_log=log)
+        exported_directory = export_completed_video(
+            video,
+            cover,
+            novel.title,
+            str(metadata.get("short_title", "") or ""),
+            on_log=log,
+        )
         youtube_url = ""
         if bool(config.upload_enabled):
             progress("upload", 0.96, title=novel.title, short_title=metadata.get("short_title", ""), video=str(video), cover=str(cover or ""))
@@ -4106,6 +4553,7 @@ def run_full(
             "job_id": job_id,
             "job_dir": str(job_dir),
             "video": str(video),
+            "exported_directory": str(exported_directory or ""),
             "cover": str(cover or ""),
             "title": novel.title,
             "short_title": metadata.get("short_title", ""),
@@ -4126,6 +4574,12 @@ def run_full(
         )
         start_next_queued_job(exclude_job_id=job_id, on_log=log)
         return result
+    except ImageGenerationSkipped as exc:
+        safe_exc = redact_secret_text(exc)
+        log(f"任务跳过: {safe_exc}")
+        progress("failed", load_status(job_id).get("progress", 0), error=safe_exc, worker_pid=None, finished_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+        start_next_queued_job(exclude_job_id=job_id, on_log=log)
+        return {"job_id": job_id, "skipped": True, "error": safe_exc}
     except Exception as exc:
         safe_exc = redact_secret_text(exc)
         log(f"ERROR 失败: {safe_exc}\n{redact_secret_text(traceback.format_exc())}")

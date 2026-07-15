@@ -126,7 +126,12 @@ class TTSBackend:
     # ── voicevox（本地） ─────────────────────────────────
     def _synth_voicevox(self, text: str, out_path: Path):
         base = self.base_url or "http://127.0.0.1:50021"
-        speaker = int(self.voice) if str(self.voice).isdigit() else 1
+        # The GUI uses short, memorable numeric codes for the small curated
+        # VOICEVOX list.  Convert those to VOICEVOX's immutable speaker IDs
+        # before calling its local API.  A raw VOICEVOX speaker ID still works.
+        code = re.match(r"\s*(\d+)", str(self.voice))
+        selected_id = int(code.group(1)) if code else 1
+        speaker = VOICEVOX_FREQUENT_VOICE_IDS.get(selected_id, selected_id)
         # 1) audio_query
         q = http_post(f"{base}/audio_query", params={"text": text, "speaker": speaker}, timeout=min(60.0, self.timeout_seconds))
         q.raise_for_status()
@@ -314,3 +319,27 @@ EDGE_MULTI_VOICES = [
 ]
 
 EDGE_JA_VOICES = EDGE_MULTI_VOICES
+
+# GUI codes: first digit = gender (1 female / 2 male), second = character,
+# third = style.  Values are translated to VOICEVOX's own speaker IDs above.
+VOICEVOX_FREQUENT_VOICE_IDS = {
+    111: 2, 112: 0, 113: 6, 114: 4, 115: 36, 116: 37,  # 四国めたん
+    121: 8,  # 春日部つむぎ
+    131: 10,  # 雨晴はう
+    211: 11, 212: 39, 213: 40, 214: 41,  # 玄野武宏
+}
+
+VOICEVOX_FREQUENT_VOICES = [
+    "111｜女｜四国めたん｜普通",
+    "112｜女｜四国めたん｜甘甜",
+    "113｜女｜四国めたん｜傲娇",
+    "114｜女｜四国めたん｜性感",
+    "115｜女｜四国めたん｜耳语",
+    "116｜女｜四国めたん｜低语",
+    "121｜女｜春日部つむぎ｜普通",
+    "131｜女｜雨晴はう｜普通",
+    "211｜男｜玄野武宏｜普通",
+    "212｜男｜玄野武宏｜喜悦",
+    "213｜男｜玄野武宏｜傲娇",
+    "214｜男｜玄野武宏｜悲伤",
+]

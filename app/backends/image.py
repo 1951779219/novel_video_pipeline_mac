@@ -61,12 +61,16 @@ def _image_model_hint(model: str) -> str:
 
 
 def _fit_generated_image(img: Image.Image, width: int, height: int) -> Image.Image:
-    return ImageOps.fit(
-        img.convert("RGB"),
-        (max(1, int(width)), max(1, int(height))),
-        method=Image.LANCZOS,
-        centering=(0.5, 0.5),
-    )
+    """Fill the video canvas with a crop-safe center crop, never letterbox.
+
+    Some compatible APIs ignore the requested landscape size and return a
+    square or portrait image. A recap video must still fill the 16:9 frame, so
+    each response is enlarged to cover and center-cropped. The scene prompt
+    reserves this central landscape band for all important subjects.
+    """
+    source = ImageOps.exif_transpose(img).convert("RGB")
+    target = (max(1, int(width)), max(1, int(height)))
+    return ImageOps.fit(source, target, method=Image.LANCZOS, centering=(0.5, 0.5))
 
 
 class ImageBackend:
@@ -244,9 +248,16 @@ class ImageBackend:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         model = self.model or "gpt-image-1"
+        # The OpenAI image API has no separate negative-prompt field.  Putting
+        # an SD/ComfyUI negative list into the natural-language prompt made
+        # policy-sensitive words (for example gore or nudity) part of every
+        # request, including the pipeline's deliberately safe retry.
+        # Keep negative prompts for backends that support them, but never send
+        # them through this OpenAI-compatible request shape.
+        request_prompt = str(prompt or "")
         payload = {
             "model": model,
-            "prompt": prompt,
+            "prompt": request_prompt,
             "size": _openai_image_size(model, w, h),
             "n": 1,
         }
@@ -260,9 +271,10 @@ class ImageBackend:
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
         model = self.model or "gpt-image-1"
+        # See _gen_openai: an OpenAI-compatible edit request does not support
+        # a negative prompt, so do not turn restricted-word exclusions into
+        # positive prompt text.
         edit_prompt = str(prompt or "")
-        if negative:
-            edit_prompt = f"{edit_prompt}\nAvoid: {negative}"
         data = {
             "model": model,
             "prompt": edit_prompt,

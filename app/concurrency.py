@@ -8,6 +8,8 @@ the owning PID is still alive.
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -28,9 +30,27 @@ def pid_alive(pid: int | None) -> bool:
     if os.name != "nt":
         try:
             os.kill(pid, 0)
-            return True
         except OSError:
             return False
+        # `kill(pid, 0)` also succeeds for a zombie.  That is especially
+        # visible on macOS when the GUI has not reaped a just-stopped worker:
+        # treating it as alive makes Stop wait forever and blocks a resume.
+        if sys.platform == "darwin":
+            try:
+                state = subprocess.run(
+                    ["ps", "-o", "stat=", "-p", str(pid)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=1,
+                    check=False,
+                ).stdout.strip().upper()
+                if state.startswith("Z"):
+                    return False
+            except (OSError, subprocess.SubprocessError):
+                # Keep the conservative answer if `ps` itself is unavailable.
+                pass
+        return True
     try:
         import ctypes
 

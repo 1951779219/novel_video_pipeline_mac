@@ -283,8 +283,8 @@ def build_video(
     motion = _normalize_motion(motion)
     # Panning a 16:9 source requires overscan.  Keep the user's chosen motion,
     # but use a gentle movement when safe framing is enabled.
-    motion_overscan = 1.06 if safe_framing else 1.22
-    zoom_amount = 0.04 if safe_framing else 0.10
+    motion_overscan = 1.03 if safe_framing else 1.22
+    zoom_amount = 0.025 if safe_framing else 0.10
     if (long_mode or not ken_burns) and motion in {"", "none", "static"}:
         _build_video_from_image_list(
             images=images,

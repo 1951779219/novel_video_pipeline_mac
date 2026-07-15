@@ -49,8 +49,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 1
     finally:
-        pr.append_log(job_dir, f"== worker pid={os.getpid()} stopped ==")
         pr.clear_worker_pid(args.job_id, os.getpid())
+        # Clear our durable PID before dispatching.  Otherwise the capacity
+        # check still counts this just-finished process and a one-at-a-time
+        # batch can never advance to its next queued job.
+        pr.start_next_queued_job(
+            exclude_job_id=args.job_id,
+            on_log=lambda message: pr.append_log(job_dir, message),
+        )
+        pr.append_log(job_dir, f"== worker pid={os.getpid()} stopped ==")
 
 
 if __name__ == "__main__":
