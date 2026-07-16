@@ -90,7 +90,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "match the current paragraph. The prompt must include: main event with an action verb, protagonist or relationship, "
         "conflict/tension, camera language, lighting, mood, palette, and one symbolic story detail. Avoid static landscape shots; "
         "make every image feel like a story moment from the same production. Use adult-looking characters, cinematic anime/editorial "
-        "illustration style, and policy-safe symbolic drama. No readable text, UI, logos, watermarks, gore, nudity, sexual content, "
+        "illustration style, and policy-safe symbolic drama. Render absolutely no writing of any kind: no letters, words, Japanese, "
+        "Chinese, numbers, signage, book pages, speech bubbles, captions, typography, UI, logos, or watermarks; leave all props blank. "
+        "No gore, nudity, sexual content, "
         "or explicit violence. Output ONLY the prompt, no quotes, no numbering."
     ),
     "llm_storyboard_user_template": (
@@ -109,13 +111,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "visible story action, strong visual hierarchy, expressive adult-looking characters, dramatic lighting, "
         "restrained 4-6 color palette, medium-wide 16:9 composition, every visible person's complete head and face "
         "fully inside the frame with generous top headroom and safe edge margins, no cropped heads or faces, "
-        "clean composition, no readable text."
+        "clean composition. Absolutely no visible writing or glyphs anywhere: no letters, words, Japanese, Chinese, numbers, "
+        "signage, book pages, speech bubbles, captions, typography, UI, logos, or watermarks; all documents, signs, screens and "
+        "magical effects must be blank or abstract."
     ),
     "llm_image_style_suffix": "anime style, detailed, cinematic lighting, masterpiece",
     # Keep this compatible with SD/ComfyUI backends without putting policy
     # trigger words in a reusable setting.  OpenAI-compatible backends do not
     # receive this list because their API has no negative-prompt field.
-    "llm_negative_prompt": "low resolution, anatomy errors, malformed hands, unreadable text, watermark, logo, UI overlay, duplicate limbs, cropped face, cropped head",
+    "llm_negative_prompt": "low resolution, anatomy errors, malformed hands, text, letters, words, writing, Japanese characters, Chinese characters, numbers, typography, signage, book pages, speech bubbles, captions, watermark, logo, UI overlay, duplicate limbs, cropped face, cropped head",
 
     # 视频生图解决方案1：把秒数作为图片数量预算，每个预算窗口只选择一个旁白高光点。
     "storyboard_highlight_enabled": True,
@@ -201,12 +205,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "narrate_chapter_headings": False,
     "ai_rewrite_batch_chars": 3500,
     "ai_rewrite_prompt": (
-        "你是小说推文视频的洗稿改写编辑。"
-        "请把输入的小说正文改写成适合中文/日文推文长视频旁白的版本："
-        "保留原剧情、人物关系、事件顺序、情绪转折和关键设定，不新增剧情，不改变结局；"
-        "去掉生硬网页痕迹、重复废话、作者口癖和不适合朗读的表达；"
-        "语言更顺、更有悬念和画面感，适合 TTS 朗读；"
-        "保持段落分隔，不要输出标题、解释、编号、标签或 JSON，只输出改写后的正文。"
+        "你是小说视频旁白的文本编辑。处理原创或已获得改编授权的文本。"
+        "将输入正文整理为适合中文/日文长视频 TTS 朗读的版本。"
+        "必须完整保留主线与关键细节：人物关系、事件顺序、场景推进、对话信息、情绪变化、"
+        "世界设定、能力规则、伏笔、冲突、反转和结局均不得遗漏、合并或改写成概述。"
+        "不要压缩、总结、提纲化或大幅缩短原文；除去明确重复、网页残留、乱码和不适合朗读的装饰符号外，"
+        "篇幅应尽量接近输入文本。不得新增剧情、颠倒事件、改变人物立场、能力、关系或结局。"
+        "如需替换人名、地名、国家、组织、称号或其他专有名词，先在内部建立一对一对应表，"
+        "全文（包括昵称、敬称、代词指代和回忆段落）必须严格一致，不得遗漏、混用或改变人物关系。"
+        "语言应自然连贯、有画面感，保留段落分隔并适合 TTS 朗读。"
+        "只输出正文，不要标题、说明、编号、替换表、标签或 JSON。"
     ),
     # Make the rewritten script safe to display and narrate before it is split.
     "tts_clean_rewritten_text": True,
@@ -219,6 +227,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tts_voice": "ja-JP-NanamiNeural",
     "tts_rate": "+0%",
     "tts_volume": 1.0,
+    "voicevox_speed_scale": 0.90,
+    "voicevox_intonation_scale": 0.85,
+    "voicevox_pause_scale": 1.25,
     "tts_model": "tts-1",
     "tts_api_key": "",
     "tts_base_url": "",  # voicevox: http://localhost:50021 ; openai: https://api.openai.com/v1 ; etc
@@ -671,16 +682,32 @@ class Config:
         )
         return cleaned
 
+    def profile_settings(self, name: str) -> tuple[str, dict]:
+        """Return a saved profile without changing the GUI's active profile."""
+        cleaned = _safe_profile_name(name)
+        path = self._profile_path(cleaned)
+        if not path.exists():
+            raise FileNotFoundError(f"配置方案不存在：{cleaned}")
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise ValueError(f"配置方案无法读取：{cleaned}（{exc}）") from exc
+        if not isinstance(saved, dict):
+            raise ValueError(f"配置方案格式无效：{cleaned}")
+        data = dict(DEFAULT_SETTINGS)
+        data.update(saved)
+        _apply_compat_migrations(data, saved)
+        data["active_profile"] = cleaned
+        return cleaned, data
+
     def load_profile(self, name: str) -> str:
         cleaned = _safe_profile_name(name)
         path = self._profile_path(cleaned)
-        data = dict(DEFAULT_SETTINGS)
         if path.exists():
-            saved = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(saved, dict):
-                data.update(saved)
-                _apply_compat_migrations(data, saved)
-        data["active_profile"] = cleaned
+            _, data = self.profile_settings(cleaned)
+        else:
+            data = dict(DEFAULT_SETTINGS)
+            data["active_profile"] = cleaned
         self._data = data
         return cleaned
 

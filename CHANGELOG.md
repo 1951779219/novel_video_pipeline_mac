@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.26-mac-update
+
+- Added stricter no-text scene prompt defaults, rewrite fidelity safeguards, and Japanese-language preservation.
+- Added VOICEVOX speed, intonation, and pause controls, plus an option to pin a saved profile to selected queued jobs.
+- Added retry-from-clean workflow that regenerates narration while reusing existing images without image API calls.
+- Kept API keys out of every task and release JSON file; workers receive them only through their process environment.
+
 ## v1.0.25-mac-update
 
 - Added one-pass batch import and automatic pairing for body TXT files, matching MP3 narration, and matching pronunciation dictionaries.

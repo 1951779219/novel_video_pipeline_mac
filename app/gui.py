@@ -452,8 +452,10 @@ class PipelineGUI:
         self.job_tree.bind("<Control-Button-1>", self._show_job_context_menu)
         self.job_context_menu = tk.Menu(self.root, tearoff=False)
         for label, command in (
+            ("套用当前方案到选中任务", self._apply_profile_to_selected_jobs),
             ("启动选中", self._start_selected),
             ("仅重试合成", self._compose_selected),
+            ("重试（生图除外）", self._retry_from_clean_reuse_images),
             ("停止选中", self._stop_selected_jobs),
             ("清除图片缓存", self._clear_selected_media_cache),
             ("指定段配音修复", self._retry_tts_segments),
@@ -501,6 +503,7 @@ class PipelineGUI:
         footer = ttk.Frame(parent)
         footer.pack(side=tk.BOTTOM, fill=tk.X, pady=(6, 0))
         ttk.Button(footer, text="保存到当前方案", style="Primary.TButton", command=self._save_profile).pack(side=tk.RIGHT)
+        ttk.Button(footer, text="套用此方案到选中任务", command=self._apply_profile_to_selected_jobs).pack(side=tk.RIGHT, padx=(0, 6))
 
         scroll_area = ttk.Frame(parent)
         scroll_area.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -963,6 +966,50 @@ class PipelineGUI:
         check("高风险新词自动注音（Edge，调用文本 API）", "tts_auto_pronunciation_enabled")
         row("自动注音最多候选词", "tts_auto_pronunciation_max_terms", "40")
 
+        tuning_box = ttk.Frame(section_parent, relief=tk.GROOVE, borderwidth=1, padding=(6, 4))
+        tuning_box.pack(fill=tk.X, pady=(8, 2))
+        tuning_header = ttk.Frame(tuning_box)
+        tuning_header.pack(fill=tk.X)
+        tuning_title = ttk.Label(
+            tuning_header,
+            text="▶  VOICEVOX 高级调音（仅 VOICEVOX 生效）",
+            font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold"),
+            cursor="hand2",
+        )
+        tuning_title.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tuning_content = ttk.Frame(tuning_box, padding=(8, 5, 0, 0))
+
+        def toggle_voicevox_tuning(_event=None):
+            if tuning_content.winfo_manager():
+                tuning_content.pack_forget()
+                tuning_title.configure(text="▶  VOICEVOX 高级调音（仅 VOICEVOX 生效）")
+            else:
+                tuning_content.pack(fill=tk.X)
+                tuning_title.configure(text="▼  VOICEVOX 高级调音（仅 VOICEVOX 生效）")
+            canvas.after_idle(lambda: canvas.configure(scrollregion=canvas.bbox("all")))
+            return "break"
+
+        tuning_header.bind("<Button-1>", toggle_voicevox_tuning)
+        tuning_title.bind("<Button-1>", toggle_voicevox_tuning)
+        ttk.Label(
+            tuning_content,
+            text="默认值更舒缓、停顿更自然。语速越低越慢；抑扬 1.0 为标准；停顿越高越长。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        def tuning_row(label: str, key: str, default: str):
+            line = ttk.Frame(tuning_content)
+            line.pack(fill=tk.X, pady=3)
+            ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
+            var = tk.StringVar(value=str(config.get(key, default)))
+            ttk.Entry(line, textvariable=var, width=30).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self.vars[key] = var
+
+        tuning_row("语速倍率", "voicevox_speed_scale", "0.90")
+        tuning_row("抑扬倍率", "voicevox_intonation_scale", "0.85")
+        tuning_row("间隔长度倍率", "voicevox_pause_scale", "1.25")
+
         section("洗稿")
         check("AI 洗稿改写", "ai_rewrite_enabled")
         check("保留章节标题并朗读（第X话）", "narrate_chapter_headings")
@@ -1189,6 +1236,7 @@ class PipelineGUI:
         }
         float_keys = {
             "tts_volume", "tts_waveform_min_rms_db", "tts_waveform_max_silence_ratio",
+            "voicevox_speed_scale", "voicevox_intonation_scale", "voicevox_pause_scale",
             "pacing_seconds_per_image", "video_motion_cycle_seconds",
             "video_transition_duration", "cover_title_area_ratio",
             "video_subtitle_outline", "video_subtitle_shadow", "video_subtitle_spacing",
@@ -1249,6 +1297,24 @@ class PipelineGUI:
     def _save_profile(self):
         profile_name = self._apply_config_form(save_profile=True)
         messagebox.showinfo("已保存", f"已保存到配置方案：{profile_name}")
+
+    def _apply_profile_to_selected_jobs(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先在任务列表多选任务，再套用方案。")
+            return
+        profile_name = str(self.profile_var.get()).strip() or "配置1"
+        try:
+            applied_profile, count = pr.apply_profile_to_jobs(ids, profile_name)
+        except Exception as exc:
+            messagebox.showerror("套用方案失败", str(exc))
+            return
+        self._refresh_jobs()
+        messagebox.showinfo(
+            "已套用方案",
+            f"已将「{applied_profile}」固定到 {count} 个任务。\n\n"
+            "这些任务之后自动排队启动时，会继续使用各自固定的方案。",
+        )
 
     def _on_profile_selected(self, _event=None):
         """Apply the profile immediately when it is chosen from the drop-down."""
@@ -2712,6 +2778,29 @@ class PipelineGUI:
         self._refresh_jobs()
         if errors:
             messagebox.showerror("清除失败", "\n".join(errors))
+
+    def _retry_from_clean_reuse_images(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            return
+        message = (
+            "会从洗稿、朗读净化和切片重新开始，并重做全部配音、字幕和成片。\n"
+            "已有图片会被复用，不会调用任何生图 API；新音频会按现有图片数量平均分配画面时长。继续吗？"
+        )
+        if not messagebox.askyesno("重试（生图除外）", message):
+            return
+        if not self._stop_jobs_for_tts_operation(ids, "重试（生图除外）"):
+            return
+        errors = []
+        for job_id in ids:
+            try:
+                pr.reset_from_clean_reuse_images(job_id)
+                self._start_job(job_id)
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("重试失败", "\n".join(errors))
 
     def _stop_jobs_for_tts_operation(self, ids: list[str], action: str) -> bool:
         running = [job_id for job_id in ids if pr.load_status(job_id).get("worker_alive")]

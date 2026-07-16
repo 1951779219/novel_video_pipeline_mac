@@ -135,12 +135,24 @@ class TTSBackend:
         # 1) audio_query
         q = http_post(f"{base}/audio_query", params={"text": text, "speaker": speaker}, timeout=min(60.0, self.timeout_seconds))
         q.raise_for_status()
+        query = q.json()
+        speed = _bounded_extra_float(self.extra, "voicevox_speed_scale", 0.90, 0.50, 2.00)
+        intonation = _bounded_extra_float(self.extra, "voicevox_intonation_scale", 0.85, 0.00, 2.00)
+        pause_scale = _bounded_extra_float(self.extra, "voicevox_pause_scale", 1.25, 0.50, 2.00)
+        query["speedScale"] = speed
+        query["intonationScale"] = intonation
+        query["prePhonemeLength"] = float(query.get("prePhonemeLength") or 0.1) * pause_scale
+        query["postPhonemeLength"] = float(query.get("postPhonemeLength") or 0.1) * pause_scale
+        for phrase in query.get("accent_phrases") or []:
+            pause_mora = phrase.get("pause_mora") if isinstance(phrase, dict) else None
+            if isinstance(pause_mora, dict) and isinstance(pause_mora.get("vowel_length"), (int, float)):
+                pause_mora["vowel_length"] *= pause_scale
         # 2) synthesis
         s = http_post(
             f"{base}/synthesis",
             params={"speaker": speaker},
             headers={"Content-Type": "application/json"},
-            content=q.content,
+            json=query,
             timeout=self.timeout_seconds,
         )
         s.raise_for_status()
@@ -228,6 +240,13 @@ class TTSBackend:
 # ─────────────────────────────────────────────────────────
 # 工具
 # ─────────────────────────────────────────────────────────
+
+def _bounded_extra_float(extra: dict, key: str, default: float, minimum: float, maximum: float) -> float:
+    try:
+        value = float(extra.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 def _volume_multiplier(value) -> float:
     text = str(value if value is not None else "1.0").strip()

@@ -66,6 +66,7 @@ LogFn = Callable[[str], None]
 ProgFn = Callable[[float], None]
 IMAGE_FAILURE_DECISION_FILE = "image_failure_decision.json"
 IMAGE_SELECTION_FILE = "image_selection.json"
+SETTINGS_SNAPSHOT_FILE = "settings_snapshot.json"
 
 
 class ImageGenerationFailed(RuntimeError):
@@ -637,14 +638,9 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
 
     # Freeze all settings for this worker.  A later GUI profile switch must not
     # change an already launched (or auto-started) job's AI prompts or routes.
-    settings_snapshot = job_dir / "settings_snapshot.json"
-    snapshot_settings = config.as_dict()
-    for key in API_KEY_FIELDS:
-        snapshot_settings.pop(key, None)
-    settings_snapshot.write_text(
-        json.dumps(snapshot_settings, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    settings_snapshot = job_dir / SETTINGS_SNAPSHOT_FILE
+    if not settings_snapshot.exists():
+        _write_settings_snapshot(job_dir, config.as_dict())
 
     command = [
         sys.executable,
@@ -699,6 +695,38 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
     write_status(job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.0, worker_pid=process.pid)
     append_log(job_dir, f"worker pid={process.pid}")
     return job_id, int(process.pid)
+
+
+def _write_settings_snapshot(job_dir: Path, settings: dict) -> Path:
+    """Store non-secret settings once, so a queued job is profile-pinned."""
+    snapshot_settings = dict(settings)
+    for key in API_KEY_FIELDS:
+        snapshot_settings.pop(key, None)
+    path = job_dir / SETTINGS_SNAPSHOT_FILE
+    temp_path = job_dir / f".{SETTINGS_SNAPSHOT_FILE}.{os.getpid()}.tmp"
+    temp_path.write_text(json.dumps(snapshot_settings, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp_path, path)
+    return path
+
+
+def apply_profile_to_jobs(job_ids: Iterable[str], profile_name: str) -> tuple[str, int]:
+    """Pin a saved configuration profile to queued tasks without switching the UI."""
+    cleaned, settings = config.profile_settings(profile_name)
+    targets = [str(job_id) for job_id in job_ids]
+    for job_id in targets:
+        status = load_status(job_id)
+        if status.get("worker_alive"):
+            raise RuntimeError(f"任务正在运行，不能套用方案：{job_id}")
+        if not job_dir_for(job_id).exists():
+            raise FileNotFoundError(f"任务不存在：{job_id}")
+    for job_id in targets:
+        job_dir = job_dir_for(job_id)
+        if not job_dir.exists():
+            raise FileNotFoundError(f"任务不存在：{job_id}")
+        _write_settings_snapshot(job_dir, settings)
+        write_status(job_dir, assigned_profile=cleaned)
+        append_log(job_dir, f"assigned configuration profile: {cleaned}")
+    return cleaned, len(targets)
 
 
 def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = _noop) -> tuple[str, int] | None:
@@ -1027,6 +1055,12 @@ def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None =
     if not rewritten.strip():
         on_log("  WARN AI 洗稿结果为空，已保留原文")
         return source
+    if _rewrite_changed_japanese_to_non_japanese(source, rewritten):
+        on_log("  WARN AI 洗稿将日文改成了非日文，已保留原文")
+        return source
+    if len(rewritten) < len(source) * 0.90:
+        on_log("  WARN AI 洗稿明显缩短了原文，已保留原文")
+        return source
 
     report = {
         "enabled": True,
@@ -1044,9 +1078,19 @@ def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None =
     return rewritten
 
 
+def _rewrite_changed_japanese_to_non_japanese(source: str, rewritten: str) -> bool:
+    """Reject translations when a Japanese narration must remain Japanese."""
+    source_kana = len(re.findall(r"[ぁ-ゖァ-ヺ]", source))
+    if source_kana < 100:
+        return False
+    rewritten_kana = len(re.findall(r"[ぁ-ゖァ-ヺ]", rewritten))
+    return rewritten_kana < max(50, int(source_kana * 0.45))
+
+
 _NARRATION_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>]+", re.I)
 _NARRATION_DECORATION_RE = re.compile(r"[《》〈〉「」『』“”‘’\"'（）()［］\[\]【】〔〕{}｛｝]")
 _NARRATION_EMOJI_RE = re.compile(r"[\U0001F000-\U0001FAFF\U00002700-\U000027BF\U0000FE0F]")
+_VOICEVOX_LINE_END_RE = re.compile(r"[。！？!?；;…」』]\s*$")
 
 
 def _clean_rewritten_narration_text(text: str, on_log: LogFn = _noop, job_dir: Path | None = None) -> str:
@@ -1054,13 +1098,22 @@ def _clean_rewritten_narration_text(text: str, on_log: LogFn = _noop, job_dir: P
     source = str(text or "")
     value = _NARRATION_URL_RE.sub("", source)
     value = _NARRATION_EMOJI_RE.sub("", value)
-    value = _NARRATION_DECORATION_RE.sub("", value)
     value = re.sub(r"[\u200b-\u200d\ufeff]", "", value)
     value = re.sub(r"[#$＃＊*•●◆◇▪▫]+", "", value)
-    value = re.sub(r"(?:\.{2,}|…+)", "。", value)
-    value = re.sub(r"[—―－〜～]+", "，", value)
-    value = re.sub(r"[，,]{2,}", "，", value)
-    value = re.sub(r"[。]{2,}", "。", value)
+    if config.tts_provider == "voicevox":
+        # VOICEVOX understands Japanese quotation marks and the long-vowel mark.
+        # Keep them intact, but make a bare line break an actual spoken pause.
+        value = re.sub(r"(?:\.{2,}|…{2,})", "…", value)
+        value = re.sub(r"[—―－〜～]+", "、", value)
+        value = re.sub(r"[，,]{2,}", "、", value)
+        value = re.sub(r"[。]{2,}", "。", value)
+        value = _voicevox_add_line_stops(value)
+    else:
+        value = _NARRATION_DECORATION_RE.sub("", value)
+        value = re.sub(r"(?:\.{2,}|…+)", "。", value)
+        value = re.sub(r"[—―－〜～]+", "，", value)
+        value = re.sub(r"[，,]{2,}", "，", value)
+        value = re.sub(r"[。]{2,}", "。", value)
     value = re.sub(r"[ \t]+\n", "\n", value)
     value = re.sub(r"\n{3,}", "\n\n", value).strip()
     if job_dir is not None:
@@ -1069,6 +1122,17 @@ def _clean_rewritten_narration_text(text: str, on_log: LogFn = _noop, job_dir: P
     if removed:
         on_log(f"  朗读净化完成：清理 {removed} 个装饰/异常字符")
     return value
+
+
+def _voicevox_add_line_stops(text: str) -> str:
+    """Convert meaningful bare line breaks into sentence stops for VOICEVOX."""
+    lines: list[str] = []
+    for line in str(text or "").splitlines():
+        trimmed = line.rstrip()
+        if trimmed and not _VOICEVOX_LINE_END_RE.search(trimmed):
+            trimmed += "。"
+        lines.append(trimmed)
+    return "\n".join(lines)
 
 
 _JP_RISK_TOKEN_RE = re.compile(r"[\u3400-\u9fff々〆ヶァ-ヴー]{2,}")
@@ -1256,6 +1320,9 @@ def _tts_config_hash() -> str:
             "voice": config.tts_voice,
             "rate": config.tts_rate,
             "volume": config.get("tts_volume", 1.0),
+            "voicevox_speed_scale": config.get("voicevox_speed_scale", 0.90),
+            "voicevox_intonation_scale": config.get("voicevox_intonation_scale", 0.85),
+            "voicevox_pause_scale": config.get("voicevox_pause_scale", 1.25),
             "model": config.get("tts_model", "tts-1"),
             "emotion": config.get("tts_emotion", ""),
             "base_url": config.tts_base_url,
@@ -1602,6 +1669,9 @@ def _tts_backend_payload(segment_timeout_seconds: float, text: str, out_path: Pa
             "emotion": config.tts_emotion,
             "model": config.get("tts_model", "tts-1"),
             "timeout_seconds": segment_timeout_seconds,
+            "voicevox_speed_scale": config.get("voicevox_speed_scale", 0.90),
+            "voicevox_intonation_scale": config.get("voicevox_intonation_scale", 0.85),
+            "voicevox_pause_scale": config.get("voicevox_pause_scale", 1.25),
         },
         "volume": config.get("tts_volume", 1.0),
         "text": text,
@@ -1825,6 +1895,34 @@ def _clear_downstream_after_tts_change(job_dir: Path) -> None:
         video_path.with_name(video_path.stem + ".tmp" + video_path.suffix).unlink(missing_ok=True)
 
 
+def reset_from_clean_reuse_images(job_id: str) -> dict:
+    """Redo cleanup and narration while keeping all generated scene images."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再重新洗稿和配音。")
+    job_dir = _safe_job_path(job_id)
+    images = _valid_scene_images(job_dir)
+    if not images:
+        raise RuntimeError("没有可复用的图片，无法执行“生图除外”重试。")
+    _write_json(job_dir / IMAGE_SELECTION_FILE, {
+        "mode": "cycle",
+        "force_even_pacing": True,
+        "available_images": len(images),
+        "chosen_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    audio_dir = job_dir / "audio"
+    if audio_dir.exists():
+        shutil.rmtree(audio_dir)
+    for name in (
+        "text_rewritten.txt", "text_rewrite_report.json", "text_tts_ready.txt",
+        "segments.json", "tts_auto_pronunciation_report.json",
+    ):
+        (job_dir / name).unlink(missing_ok=True)
+    _clear_downstream_after_tts_change(job_dir)
+    write_status(job_dir, stage="queued", progress=0.10, worker_pid=None, error="", video="", youtube_url="")
+    append_log(job_dir, f"reset from clean with {len(images)} cached images; image API disabled")
+    return {"job_id": job_id, "images": len(images)}
+
+
 def _refresh_tts_manifest_header(manifest: dict, total: int) -> None:
     manifest.update(
         {
@@ -1996,6 +2094,9 @@ def _stage_tts_manifest_impl(
                 "emotion": config.tts_emotion,
                 "model": config.get("tts_model", "tts-1"),
                 "timeout_seconds": segment_timeout_seconds,
+                "voicevox_speed_scale": config.get("voicevox_speed_scale", 0.90),
+                "voicevox_intonation_scale": config.get("voicevox_intonation_scale", 0.85),
+                "voicevox_pause_scale": config.get("voicevox_pause_scale", 1.25),
             },
             volume=config.get("tts_volume", 1.0),
         )
@@ -2332,15 +2433,18 @@ def stage_pacing(
     segments: list[Segment],
     durations: list[float],
     on_log: LogFn = _noop,
+    fixed_count_override: int | None = None,
 ) -> list[ImagePlan]:
-    on_log(f"[4/6] 图音配比: mode={config.pacing_mode}")
+    mode = "fixed_count" if fixed_count_override else config.pacing_mode
+    fixed_count = fixed_count_override or config.pacing_fixed_count
+    on_log(f"[4/6] 图音配比: mode={mode}")
     plans = plan_images(
         segments,
         durations,
-        mode=config.pacing_mode,
+        mode=mode,
         seconds_per_image=config.pacing_seconds_per_image,
         sentences_per_image=config.pacing_sentences_per_image,
-        fixed_count=config.pacing_fixed_count,
+        fixed_count=fixed_count,
     )
     avg = sum(p.duration for p in plans) / max(1, len(plans))
     on_log(f"  OK 需要 {len(plans)} 张图，平均 {avg:.1f}s/张")
@@ -3705,6 +3809,12 @@ def stage_cover(
     raw_path = cover_dir / "cover_raw.png"
     out_path = cover_dir / "cover.jpg"
     manifest_path = cover_dir / "cover_manifest.json"
+    if _image_fallback_mode(job_dir):
+        if out_path.exists() and out_path.stat().st_size > 1000:
+            on_log(f"  reuse cover without image API: {out_path}")
+            return out_path
+        on_log("  skip cover generation: image-reuse retry does not call image API")
+        return None
     excerpt = _cover_excerpt(novel, segments)
     cover_backend = _cover_backend_settings()
     provider = cover_backend["provider"]
@@ -4428,6 +4538,7 @@ def run_full(
         # A user-selected fallback means this resumed job must spend effort on
         # missing TTS only; it must never start another image API request.
         image_fallback_mode = _image_fallback_mode(job_dir)
+        even_image_count = len(_valid_scene_images(job_dir)) if image_fallback_mode else None
         overlap_images = bool(config.get("pipeline_overlap_tts_images", True)) and not image_fallback_mode
         if overlap_images:
             log("  overlap enabled: prefetch storyboard/images while TTS is running")
@@ -4508,7 +4619,10 @@ def run_full(
             )
             progress("pacing", 0.45, title=novel.title)
 
-            plans = timed("4_pacing_final", stage_pacing, segments, durs, on_log=log)
+            plans = timed(
+                "4_pacing_final", stage_pacing, segments, durs, on_log=log,
+                fixed_count_override=even_image_count,
+            )
             _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
             progress("images", 0.50, title=novel.title)
 
