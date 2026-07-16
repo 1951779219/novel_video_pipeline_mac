@@ -31,6 +31,16 @@ PROTECTED_DATA_ITEMS = (
     "chrome_debug_profiles",
     "updates",
 )
+API_KEY_FIELDS = (
+    "ai_api_key",
+    "llm_api_key",
+    "tts_api_key",
+    "image_api_key",
+    "cover_api_key",
+    "character_reference_api_key",
+    "scene_reference_api_key",
+)
+DEFAULT_PROFILE_NAME = "配置1"
 
 
 def log(handle, message: str) -> None:
@@ -84,6 +94,43 @@ def backup_user_config(target: Path, backup_dir: Path, handle) -> None:
         else:
             copy_file(src, dst)
         log(handle, f"Backed up data/{name} -> {dst}")
+
+
+def _blank_api_keys(path: Path) -> bool:
+    """Blank sensitive values in one JSON config file without exposing them."""
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    changed = False
+    for key in API_KEY_FIELDS:
+        if data.get(key):
+            data[key] = ""
+            changed = True
+    if changed:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    return changed
+
+
+def clear_default_profile_api_keys(target: Path, handle) -> None:
+    """Ensure the default profile is always distributed as a blank-key template."""
+    data_dir = target / "data"
+    profile_path = data_dir / "profiles" / f"{DEFAULT_PROFILE_NAME}.json"
+    if _blank_api_keys(profile_path):
+        log(handle, "Cleared API keys from the default profile 配置1")
+
+    settings_path = data_dir / "settings.json"
+    try:
+        settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
+    except Exception:
+        settings = {}
+    if isinstance(settings, dict) and str(settings.get("active_profile") or "").strip() == DEFAULT_PROFILE_NAME:
+        if _blank_api_keys(settings_path):
+            log(handle, "Cleared API keys from active default settings 配置1")
 
 
 def copy_data_defaults(payload: Path, target: Path, handle) -> None:
@@ -151,6 +198,7 @@ def apply_update(zip_path: Path, target: Path, version: str, wait: float) -> Pat
         payload = find_payload_root(extract_dir)
         log(handle, f"Payload: {payload}")
 
+        clear_default_profile_api_keys(target, handle)
         backup_user_config(target, backup_dir, handle)
 
         for dirname in COPY_DIRS:

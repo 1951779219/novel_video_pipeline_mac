@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.0.27-mac-update
+
+- Fixed retained API keys in the default 配置1 profile: applying an update now clears every API key in 配置1 and in current settings when 配置1 is active.
+- Leaves all non-default profiles unchanged while keeping API keys out of release and task JSON files.
+
 ## v1.0.26-mac-update
 
 - Added stricter no-text scene prompt defaults, rewrite fidelity safeguards, and Japanese-language preservation.
