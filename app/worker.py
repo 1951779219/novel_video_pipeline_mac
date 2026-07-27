@@ -14,6 +14,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--compose-only", action="store_true", help="only rebuild the final video from cached artifacts")
+    parser.add_argument("--marketing-cover-only", action="store_true", help="only rebuild titles, synopses and cover")
     args = parser.parse_args(argv)
 
     job_dir = pr.job_dir_for(args.job_id)
@@ -21,7 +22,16 @@ def main(argv: list[str] | None = None) -> int:
     pr.write_status(job_dir, job_id=args.job_id, worker_pid=os.getpid(), stage="worker_starting")
     pr.append_log(job_dir, f"== worker pid={os.getpid()} starting ==")
     try:
-        if args.compose_only:
+        if args.marketing_cover_only:
+            cover = pr.regenerate_job_marketing_and_cover(
+                args.job_id, on_log=lambda message: pr.append_log(job_dir, message), allow_running=True
+            )
+            status = pr.load_status(args.job_id, include_worker=False)
+            pr.write_status(
+                job_dir, job_id=args.job_id, worker_pid=None, stage="completed", progress=1.0,
+                cover=str(cover), video=str(status.get("video") or ""), error="",
+            )
+        elif args.compose_only:
             pr.write_status(job_dir, job_id=args.job_id, worker_pid=os.getpid(), stage="compose", progress=0.90, error="")
             video = pr.resume_compose_only(args.job_id, on_log=lambda message: pr.append_log(job_dir, message))
             pr.write_status(
@@ -38,7 +48,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception as exc:
         pr.append_log(job_dir, f"== worker failed: {exc} ==")
-        if args.compose_only:
+        if args.compose_only or args.marketing_cover_only:
             pr.write_status(
                 job_dir,
                 job_id=args.job_id,

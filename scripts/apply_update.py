@@ -13,7 +13,7 @@ import zipfile
 from pathlib import Path
 
 
-COPY_DIRS = ("app", "docs", "scripts")
+COPY_DIRS = ("app", "docs", "scripts", "prompts")
 COPY_FILES = (
     "AGENTS.md",
     "README.md",
@@ -39,6 +39,7 @@ API_KEY_FIELDS = (
     "cover_api_key",
     "character_reference_api_key",
     "scene_reference_api_key",
+    "pronunciation_dictionary_api_key",
 )
 DEFAULT_PROFILE_NAME = "配置1"
 

@@ -96,7 +96,8 @@ def _ease_progress_expr(
 
 def _video_encoder_args(encoder: str, preset: str = "veryfast", quality: int | float = 20) -> list[str]:
     enc = str(encoder or "libx264").strip().lower()
-    quality_value = str(max(1, min(51, int(float(quality or 20)))))
+    quality_number = max(1, min(51, int(float(quality or 20))))
+    quality_value = str(quality_number)
     if enc in {"h264_nvenc", "nvenc", "nvidia"}:
         nv_preset = str(preset or "p4")
         if nv_preset in {"veryfast", "fast", "medium", "slow"}:
@@ -107,7 +108,12 @@ def _video_encoder_args(encoder: str, preset: str = "veryfast", quality: int | f
     if enc in {"h264_amf", "amf", "amd"}:
         return ["-c:v", "h264_amf", "-quality", "speed", "-qp_i", quality_value, "-qp_p", quality_value, "-pix_fmt", "yuv420p"]
     if enc in {"h264_videotoolbox", "videotoolbox", "apple"}:
-        return ["-c:v", "h264_videotoolbox", "-q:v", quality_value, "-pix_fmt", "yuv420p"]
+        # The GUI exposes CRF-style quality (lower is better). VideoToolbox's
+        # q:v scale has the opposite direction (higher is better).  Passing 20
+        # through unchanged produced ~0.5 Mbps 1080p output on Apple Silicon.
+        # Convert the 1..51 UI scale linearly to VideoToolbox's 100..1 scale.
+        videotoolbox_quality = round(100 - ((quality_number - 1) * 99 / 50))
+        return ["-c:v", "h264_videotoolbox", "-q:v", str(videotoolbox_quality), "-pix_fmt", "yuv420p"]
     x264_preset = str(preset or "veryfast").strip().lower()
     if x264_preset not in {"ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"}:
         x264_preset = "veryfast"
@@ -273,7 +279,6 @@ def build_video(
     video_encoder: str = "libx264",
     video_encoder_preset: str = "veryfast",
     video_encoder_quality: int | float = 20,
-    safe_framing: bool = True,
 ):
     if len(images) != len(image_durations):
         raise ValueError("images 和 image_durations 数量不一致")
@@ -281,10 +286,8 @@ def build_video(
         raise ValueError("没有可合成的视频图片")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     motion = _normalize_motion(motion)
-    # Panning a 16:9 source requires overscan.  Keep the user's chosen motion,
-    # but use a gentle movement when safe framing is enabled.
-    motion_overscan = 1.03 if safe_framing else 1.22
-    zoom_amount = 0.025 if safe_framing else 0.10
+    motion_overscan = 1.22
+    zoom_amount = 0.10
     if (long_mode or not ken_burns) and motion in {"", "none", "static"}:
         _build_video_from_image_list(
             images=images,

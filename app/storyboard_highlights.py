@@ -12,7 +12,7 @@ from app.stages.stage2_clean import Segment
 STORY_CONTEXT_SYSTEM_PROMPT = """
 你是长篇旁白视频的故事背景编辑。请从采样文本中提取只用于画面判断的稳定背景，必须只输出 JSON。
 不要创作原文没有的剧情，不要把不同年代、地点或人物合并成同一场景。
-输出字段：story_summary（主线简述）、genre、era_and_world、primary_story_setting、
+输出字段：story_summary（主线简述）、title_brief（供视频标题生成使用的事实简报，须涵盖主角处境、关键关系、主要事件、已明确的秘密或反转；限600字以内）、genre、era_and_world、primary_story_setting、
 recurring_settings（数组）、main_characters（数组，每项含 name/aliases/role）、
 relationship_context（数组）、continuity_rules（数组）。
 """.strip()
@@ -34,13 +34,27 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     text = str(raw or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
     text = re.sub(r"\s*```$", "", text)
+    value: Any = None
     try:
         value = json.loads(text)
+        # Some compatibility gateways JSON-encode the assistant text twice.
+        if isinstance(value, str):
+            value = json.loads(value)
     except Exception:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
+        # Decode the first complete JSON object instead of slicing from the
+        # first opening brace to the last closing brace.  The latter fails on
+        # otherwise-valid JSON followed by commentary or another object.
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", text):
+            try:
+                candidate, _ = decoder.raw_decode(text[match.start():])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(candidate, dict):
+                value = candidate
+                break
+        if value is None:
             raise ValueError("LLM did not return a JSON object")
-        value = json.loads(text[start : end + 1])
     if not isinstance(value, dict):
         raise ValueError("LLM JSON response is not an object")
     return value
@@ -67,6 +81,7 @@ def normalize_story_context(value: Any) -> dict[str, Any]:
     list_keys = ("recurring_settings", "relationship_context", "continuity_rules")
     out: dict[str, Any] = {
         "story_summary": str(data.get("story_summary") or "").strip(),
+        "title_brief": str(data.get("title_brief") or "").strip(),
         "genre": str(data.get("genre") or "").strip(),
         "era_and_world": str(data.get("era_and_world") or "").strip(),
         "primary_story_setting": str(data.get("primary_story_setting") or "").strip(),

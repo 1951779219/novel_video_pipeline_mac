@@ -42,7 +42,7 @@ GUI 的“API 设置与 Key”区域顶部有一组统一接口字段，并在�
 - `ai_api_enabled`：开启后，文本生成和 OpenAI 兼容生图默认共用统一接口。
 - `ai_api_base_url`：统一 Base URL/中转地址，例如 `https://你的中转站/v1`。
 - `ai_api_key`：统一 API Key，只需要填一次。
-- `ai_api_text_model`：洗稿、短标题、人设分析、分镜提示词、封面分析使用的文本模型。
+- `ai_api_text_model`：洗稿、标题/概梗候选、人设分析、分镜提示词、封面分析使用的文本模型。
 - `ai_api_image_model`：剧情图、封面、人设图、剧情参考图使用的图片模型。
 
 GUI 中所有 API Key 默认用黑点遮挡；可通过输入框右侧的小眼睛临时显示/隐藏，或点击“复制”直接复制完整 Key。
@@ -58,35 +58,38 @@ GUI 中所有 API Key 默认用黑点遮挡；可通过输入框右侧的小眼�
 - 人设图使用人设分析得到的角色提示词 + `character_reference_prompt_suffix`。
 - 剧情图使用通用前缀、段落分析提示词、人设锁和视觉主题。
 - 剧情参考图如果有参考图，会走 OpenAI 兼容图片编辑接口；没有参考图则走普通提示词生图。
-- 封面会自动取文章标题和正文摘要，经过 `cover_prompt_template` / `cover_ai_analysis_prompt` 后，把“标题作为图片内容的一部分”交给图片模型生成。
+- 标题阶段用 `marketing_candidates_prompt` 从开头、中段、结尾生成 3 个标题、2 个概梗和内容标签，但不生成 `【朗読・小説】` 前缀；封面再把全部候选经过 `cover_prompt_template` / `cover_ai_analysis_prompt` 和 GUI 中可编辑的 `cover_poster_method_prompt` 生成一条成品提示词。程序不会再偷偷加载另一份固定封面方法。
 
 GUI 里的 `人设图 workflow(仅 ComfyUI)`、`剧情参考 workflow(仅 ComfyUI)` 和全局 `image_workflow` 只给 ComfyUI 使用。Provider 选择 `openai` / `custom` / `same_as_image` 时，不需要填写 workflow；只要统一接口或模块自己的 Base URL、API Key、模型名正确即可。
 
 | 字段 | 用途 | 可用变量 |
 | --- | --- | --- |
 | `ai_rewrite_prompt` | 洗稿/改写文章，替代旧的“扫文清理”逻辑 | `{text}` 由代码分批传入 |
-| `short_title_prompt` | 自动生成短说明标题 | 输入文章标题和正文摘要 |
+| `marketing_candidates_prompt` | 生成3个标题、2个概梗和内容标签，不含 `【朗読・小説】` | 开头、中段、结尾抽样与全篇简报 |
 | `character_analysis_prompt` | 分析主角、配角、人设、视觉主题 | 原文或截断后的文章内容 |
 | `character_reference_prompt_suffix` | 生成人设参考图时追加的风格限制 | 人设 JSON 中的角色字段 |
 | `llm_image_prompt_prefix` | 每张剧情图的通用前缀 | 会拼到剧情图提示词前 |
 | `llm_storyboard_prompt` | 剧情图 AI 分析的系统提示词 | 控制分镜图分析规则 |
 | `llm_storyboard_user_template` | 剧情图 AI 分析的用户模板 | `{prefix}`, `{style}`, `{index}`, `{text}` |
-| `cover_prompt_template` | 封面生成的主模板 | `{title}`, `{excerpt}`, `{style}`, `{custom}` |
+| `cover_prompt_template` | 封面生成的题材模板 | `{title}`, `{excerpt}`, `{titles}`, `{synopses}`, `{style}`, `{custom}` |
 | `cover_custom_prompt` | 封面模板里的自定义方向 | 由 `{custom}` 引用 |
-| `cover_ai_analysis_prompt` | 封面 AI 分析模板 | 标题和正文摘要 |
-| `youtube_title_template` | YouTube 上传标题模板 | `{clean_title}`, `{title}`, `{short_title}`, `{intro}` |
+| `cover_ai_analysis_prompt` | 封面题材 AI 分析模板 | 全部标题和概梗 |
+| `cover_poster_method_prompt` | 封面的完整制作方法，可在 GUI 直接编辑 | 不再叠加隐藏文件 |
+| `youtube_title_template` | YouTube 上传标题模板；模板优先，剩余字数才补生成标签 | `{candidate_title}`, `{short_title}`, `{clean_title}`, `{title}`, `{intro}`, `{author}`, `{tags}`, `{job_id}` |
 | `youtube_description` | YouTube 上传说明模板 | 同上传标题上下文 |
 | `browser_ad_suitability_template` | YouTube 广告分级问卷选择模板 | JSON，见上传文档 |
 
 ## 封面提示词怎么改
 
-封面现在不是把标题作为后期文本盖到图片上，而是把标题和正文摘要一起交给图片模型，让模型在画面里生成标题和主体视觉。推荐改法：
+封面不是把标题作为后期文本盖到图片上，而是先用全部标题和概梗策划一条封面提示词，再让图片模型生成主体视觉和分层日语文字。推荐改法：
 
 1. 在 GUI 的封面区域修改 `cover_prompt_template`。
-2. 保留 `{title}`，这样任务标题会进入封面生成提示词。
-3. 用 `{excerpt}` 让模型理解剧情气质。
-4. 用 `{custom}` 承接可变风格，比如“悬疑反转”“古风权谋”。
-5. 保存配置后，如果旧封面缓存还在，使用 GUI 的“清理媒体缓存”或删除任务目录里的 `cover/` 后重跑封面阶段。
+2. 优先保留 `{titles}` 和 `{synopses}`，让模型比较全部发布候选；旧模板仍可使用 `{title}` 和 `{excerpt}`。
+3. 在 GUI 的“封面完整方法（可编辑）”中统一管理事件画面、主标题、强调词、副标题、拟声词、文字颜色、描边以及三国专用排版；这就是运行时使用的完整方法。
+4. 用 `{custom}` 承接题材画风，比如“少女漫画恋爱”“异世界觉醒”“三国权谋”。
+5. 保存配置后，可直接使用 GUI 的“重新生成封面”。旧任务若缺少新候选文件，程序会先补生成 3 个标题和 2 个概梗，再制作封面。
+
+图片接口返回的原始文件会保存在 `cover/cover_provider_raw.png`。封面提示词只要求真正的横向16:9构图，不写固定像素尺寸，也不描述任何比例转换或中央裁切方案；标准化结果保存在 `cover/cover_raw.png`，实际尺寸取GUI的封面宽高设置。
 
 示例可看 `docs/tweet_prompt_templates.md`。
 

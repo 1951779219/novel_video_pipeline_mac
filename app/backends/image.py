@@ -26,8 +26,29 @@ from app.utils.http import http_get, http_post
 from app.utils.secrets import clean_api_key, redact_secret_text
 
 
-def _openai_image_size(model: str, width: int, height: int) -> str:
+def _valid_gpt_image_2_size(width: int, height: int) -> bool:
+    width = int(width or 0)
+    height = int(height or 0)
+    if width <= 0 or height <= 0 or width % 16 or height % 16:
+        return False
+    long_edge, short_edge = max(width, height), min(width, height)
+    pixels = width * height
+    return long_edge <= 3840 and long_edge / short_edge <= 3 and 655_360 <= pixels <= 8_294_400
+
+
+def _openai_image_size(
+    model: str,
+    width: int,
+    height: int,
+    request_width: int = 0,
+    request_height: int = 0,
+) -> str:
     text = str(model or "").lower()
+    if "gpt-image-2" in text:
+        if _valid_gpt_image_2_size(request_width, request_height):
+            return f"{int(request_width)}x{int(request_height)}"
+        if _valid_gpt_image_2_size(width, height):
+            return f"{int(width)}x{int(height)}"
     if width == height:
         return "1024x1024"
     if "gpt-image" in text or "gemini" in text:
@@ -61,12 +82,10 @@ def _image_model_hint(model: str) -> str:
 
 
 def _fit_generated_image(img: Image.Image, width: int, height: int) -> Image.Image:
-    """Fill the video canvas with a crop-safe center crop, never letterbox.
+    """Normalize a provider response to the configured output canvas.
 
-    Some compatible APIs ignore the requested landscape size and return a
-    square or portrait image. A recap video must still fill the 16:9 frame, so
-    each response is enlarged to cover and center-cropped. The scene prompt
-    reserves this central landscape band for all important subjects.
+    With a compliant provider this is only a resize (or a no-op). If a provider
+    ignores the requested dimensions, fill the canvas instead of adding bars.
     """
     source = ImageOps.exif_transpose(img).convert("RGB")
     target = (max(1, int(width)), max(1, int(height)))
@@ -76,7 +95,9 @@ def _fit_generated_image(img: Image.Image, width: int, height: int) -> Image.Ima
 class ImageBackend:
     def __init__(self, provider: str, base_url: str = "", api_key: str = "",
                  model: str = "", steps: int = 25, cfg: float = 7.0,
-                 workflow_path: str = "", timeout_seconds: int | float = 300):
+                 workflow_path: str = "", timeout_seconds: int | float = 300,
+                 preserve_source: bool = False, request_width: int = 0,
+                 request_height: int = 0):
         self.provider = str(provider or "placeholder").lower()
         self.base_url = base_url.rstrip("/") if base_url else ""
         self.api_key = clean_api_key(api_key)
@@ -85,6 +106,9 @@ class ImageBackend:
         self.cfg = cfg
         self.workflow_path = workflow_path
         self.timeout_seconds = max(60.0, float(timeout_seconds or 300))
+        self.preserve_source = bool(preserve_source)
+        self.request_width = int(request_width or 0)
+        self.request_height = int(request_height or 0)
 
     def generate(self, prompt: str, negative: str, out_path: Path,
                  width: int = 1080, height: int = 1920) -> Path:
@@ -258,10 +282,14 @@ class ImageBackend:
         payload = {
             "model": model,
             "prompt": request_prompt,
-            "size": _openai_image_size(model, w, h),
+            "size": _openai_image_size(model, w, h, self.request_width, self.request_height),
             "n": 1,
         }
-        img = _fit_generated_image(self._post_openai_image(url, headers, payload), w, h)
+        img = self._post_openai_image(url, headers, payload)
+        if not self.preserve_source:
+            img = _fit_generated_image(img, w, h)
+        else:
+            img = ImageOps.exif_transpose(img).convert("RGB")
         img.save(out_path, "PNG")
 
     def _gen_openai_edit(self, prompt, negative, reference_paths, out_path, w, h):
@@ -278,7 +306,7 @@ class ImageBackend:
         data = {
             "model": model,
             "prompt": edit_prompt,
-            "size": _openai_image_size(model, w, h),
+            "size": _openai_image_size(model, w, h, self.request_width, self.request_height),
             "n": "1",
         }
         files = []
@@ -289,7 +317,11 @@ class ImageBackend:
                 handles.append(handle)
                 mime = mimetypes.guess_type(str(path))[0] or "image/png"
                 files.append(("image", (Path(path).name, handle, mime)))
-            img = _fit_generated_image(self._post_openai_image_multipart(url, headers, data, files), w, h)
+            img = self._post_openai_image_multipart(url, headers, data, files)
+            if not self.preserve_source:
+                img = _fit_generated_image(img, w, h)
+            else:
+                img = ImageOps.exif_transpose(img).convert("RGB")
             img.save(out_path, "PNG")
         finally:
             for handle in handles:
@@ -362,8 +394,13 @@ class ImageBackend:
         else:
             img_bytes = http_get(data["url"], timeout=min(120.0, self.timeout_seconds)).content
             img = Image.open(io.BytesIO(img_bytes))
-        # Fit to the configured canvas without distorting the generated artwork.
-        img = _fit_generated_image(img, w, h)
+        # Scene images fill the configured canvas. Covers may preserve the
+        # provider's complete source so typography can be adapted without
+        # cutting the top or bottom off.
+        if not self.preserve_source:
+            img = _fit_generated_image(img, w, h)
+        else:
+            img = ImageOps.exif_transpose(img).convert("RGB")
         img.save(out_path, "PNG")
 
     def _gen_custom(self, prompt, negative, out_path, w, h):

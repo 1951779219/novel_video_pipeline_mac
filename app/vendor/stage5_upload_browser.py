@@ -18,6 +18,7 @@ import time
 import socket
 import subprocess
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -296,6 +297,17 @@ def _launch_chrome(config, on_log: Callable, profile_name: str = "") -> bool:
         return False
 
 
+def _use_local_playwright_upload() -> bool:
+    """Whether to replace the signed-in debug Chrome with a new local one.
+
+    Keep this disabled.  Reusing the exact debug Chrome preserves the channel
+    login selected in the GUI.  Large local files are injected with CDP by
+    :func:`_set_local_file_via_cdp`, avoiding Playwright's 50 MB transfer cap
+    without changing browser sessions.
+    """
+    return False
+
+
 def _clean_chrome_debug_profile_cache(profile_dir: Path, on_log: Callable | None = None):
     """
     Clear stale YouTube Studio frontend caches in the dedicated debug profile
@@ -412,6 +424,9 @@ def _legacy_profile(config) -> dict:
         "description": getattr(config, "youtube_description", ""),
         "cover_prompt": getattr(config, "cover_prompt", ""),
         "ad_suitability_template": getattr(config, "browser_ad_suitability_template", ""),
+        "schedule_enabled": bool(getattr(config, "youtube_schedule_enabled", False)),
+        "scheduled_at": str(getattr(config, "youtube_scheduled_at", "") or ""),
+        "schedule_timezone": str(getattr(config, "youtube_schedule_timezone", "Asia/Tokyo") or "Asia/Tokyo"),
     }
 
 
@@ -439,6 +454,9 @@ def _normalize_profile(config, profile: dict, idx: int = 0) -> dict:
     merged["title_template"] = str(merged.get("title_template") or "")
     merged["description"] = str(merged.get("description") or "")
     merged["cover_prompt"] = str(merged.get("cover_prompt") or "")
+    merged["schedule_enabled"] = _bool_profile_value(merged.get("schedule_enabled"), False)
+    merged["scheduled_at"] = str(merged.get("scheduled_at") or "")
+    merged["schedule_timezone"] = str(merged.get("schedule_timezone") or "Asia/Tokyo")
     return merged
 
 
@@ -499,6 +517,9 @@ def upload_via_browser(job, config, video_path: Path, title: str,
     ad_start      = int(profile.get("ad_start", 0))
     upload_policy = str(profile.get("upload_policy", "BTRA")).strip() or "BTRA"
     visibility    = str(profile.get("visibility", "PUBLIC")).strip().upper() or "PUBLIC"
+    schedule_enabled = bool(profile.get("schedule_enabled", False))
+    scheduled_at = str(profile.get("scheduled_at") or "")
+    schedule_timezone = str(profile.get("schedule_timezone") or "Asia/Tokyo")
     desc_override = profile.get("description", "")
     chrome_profile = str(profile.get("chrome_profile") or getattr(config, "browser_chrome_profile", "Default") or "Default").strip()
     ad_suitability_template = normalize_ad_suitability_template(
@@ -519,7 +540,15 @@ def upload_via_browser(job, config, video_path: Path, title: str,
             on_log("上传已取消")
             return None
 
-        if force_profile_launch and _browser_attempt == 1:
+        if _use_local_playwright_upload():
+            # The profile cannot be opened by Chrome and Playwright at the
+            # same time.  Stop a stale debug Chrome before opening the local
+            # persistent context below; cookies and the signed-in account are
+            # preserved in the profile directory.
+            _kill_chrome(_chrome_debug_profile_dir(config, chrome_profile))
+            time.sleep(1)
+            on_log("使用本机上传浏览器（支持大于 50MB 的视频文件）...")
+        elif force_profile_launch and _browser_attempt == 1:
             on_log(f"切换到账号资料「{chrome_profile}」...")
             _kill_chrome(_chrome_debug_profile_dir(config, chrome_profile))
             time.sleep(1)
@@ -527,8 +556,10 @@ def upload_via_browser(job, config, video_path: Path, title: str,
                 on_log(f"❌ 无法启动账号资料「{chrome_profile}」")
                 return None
 
-        # 检查调试端口是否可连
-        if not _is_port_open(_DEBUG_PORT):
+        # Windows continues to use the established debug-Chrome workflow.
+        # macOS/Linux use a local persistent Playwright context instead so
+        # selecting a local video is not limited to 50 MB.
+        if not _use_local_playwright_upload() and not _is_port_open(_DEBUG_PORT):
             if auto_restart and _browser_attempt == 1:
                 on_log(f"⚠️ 未检测到 Chrome 调试端口 {_DEBUG_PORT}，尝试自动启动...")
                 if not _launch_chrome(config, on_log, chrome_profile):
@@ -550,14 +581,16 @@ def upload_via_browser(job, config, video_path: Path, title: str,
             on_log("上传已取消")
             return None
 
-        on_log(f"检测到 Chrome 调试端口，正在连接...")
+        if not _use_local_playwright_upload():
+            on_log(f"检测到 Chrome 调试端口，正在连接...")
         on_progress(22)
 
         result = _run_upload_session(
             job, config, video_path, title, cover_path,
             flow, ad_interval, ad_start, upload_policy, visibility,
             desc_override, delays, stall_timeout_min, ad_suitability_template,
-            on_log, on_progress,
+            on_log, on_progress, chrome_profile,
+            schedule_enabled, scheduled_at, schedule_timezone,
         )
 
         if job.is_cancelled():
@@ -567,11 +600,15 @@ def upload_via_browser(job, config, video_path: Path, title: str,
         if result == _STALL:
             on_log(f"⚠️ 上传卡住超过 {stall_timeout_min} 分钟（第 {_browser_attempt} 次），重启 Chrome...")
             if auto_restart:
-                if not _restart_chrome(config, on_log, chrome_profile):
-                    on_log("❌ 无法重启 Chrome，放弃")
-                    return None
-                on_log("  等待 YouTube Studio 加载完成...")
-                time.sleep(10)
+                if _use_local_playwright_upload():
+                    on_log("  将重新创建本机上传会话...")
+                    time.sleep(3)
+                else:
+                    if not _restart_chrome(config, on_log, chrome_profile):
+                        on_log("❌ 无法重启 Chrome，放弃")
+                        return None
+                    on_log("  等待 YouTube Studio 加载完成...")
+                    time.sleep(10)
                 continue
             else:
                 on_log("❌ 上传超时，已禁用自动重启")
@@ -579,10 +616,14 @@ def upload_via_browser(job, config, video_path: Path, title: str,
         elif result == "CHROME_CRASH":
             on_log(f"⚠️ Chrome 连接断开（第 {_browser_attempt} 次），重启...")
             if auto_restart:
-                if not _restart_chrome(config, on_log, chrome_profile):
-                    on_log("❌ 无法重启 Chrome，放弃")
-                    return None
-                time.sleep(10)
+                if _use_local_playwright_upload():
+                    on_log("  将重新创建本机上传会话...")
+                    time.sleep(3)
+                else:
+                    if not _restart_chrome(config, on_log, chrome_profile):
+                        on_log("❌ 无法重启 Chrome，放弃")
+                        return None
+                    time.sleep(10)
                 continue
             else:
                 on_log("❌ Chrome 崩溃，已禁用自动重启")
@@ -602,7 +643,8 @@ def upload_via_browser(job, config, video_path: Path, title: str,
 def _run_upload_session(job, config, video_path, title, cover_path,
                         flow, ad_interval, ad_start, upload_policy, visibility,
                         desc_override, delays, stall_timeout_min, ad_suitability_template,
-                        on_log, on_progress):
+                        on_log, on_progress, chrome_profile,
+                        schedule_enabled=False, scheduled_at="", schedule_timezone="Asia/Tokyo"):
     """
     单次 Playwright 会话：连接 Chrome，尝试上传，返回 video_id / None / _STALL / 'CHROME_CRASH'
     """
@@ -612,14 +654,44 @@ def _run_upload_session(job, config, video_path, title, cover_path,
         return None
 
     with sync_playwright() as pw:
-        on_log(f"连接到 Chrome (localhost:{_DEBUG_PORT})...")
-        try:
-            browser = pw.chromium.connect_over_cdp(f"http://localhost:{_DEBUG_PORT}")
-        except Exception as e:
-            on_log(f"❌ 连接 Chrome 失败: {e}")
-            return "CHROME_CRASH"
-
-        ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+        browser = None
+        if _use_local_playwright_upload():
+            # We are already inside sync_playwright().  Do not call
+            # _find_chrome_exe() here: its fallback opens a second synchronous
+            # Playwright manager, which is rejected while this one is active.
+            chrome_path = Path(pw.chromium.executable_path)
+            if not chrome_path.exists():
+                on_log("❌ 未找到 Chrome 可执行文件")
+                return "CHROME_CRASH"
+            chrome = str(chrome_path)
+            profile_dir = _chrome_debug_profile_dir(config, chrome_profile)
+            try:
+                on_log("启动本机 Chrome 上传会话...")
+                ctx = pw.chromium.launch_persistent_context(
+                    str(profile_dir), executable_path=chrome, headless=False,
+                    args=["--no-first-run", "--no-default-browser-check"],
+                    # The debug Chrome used for channel login stores Google
+                    # cookies with the real macOS keychain.  Playwright's
+                    # defaults switch to a mock/basic password store, making
+                    # those same cookies unreadable and showing a fresh login
+                    # page.  Keep the system keychain for this persistent
+                    # account profile.
+                    ignore_default_args=[
+                        "--password-store=basic",
+                        "--use-mock-keychain",
+                    ],
+                )
+            except Exception as e:
+                on_log(f"❌ 启动本机 Chrome 失败: {e}")
+                return "CHROME_CRASH"
+        else:
+            on_log(f"连接到 Chrome (localhost:{_DEBUG_PORT})...")
+            try:
+                browser = pw.chromium.connect_over_cdp(f"http://localhost:{_DEBUG_PORT}")
+            except Exception as e:
+                on_log(f"❌ 连接 Chrome 失败: {e}")
+                return "CHROME_CRASH"
+            ctx = browser.contexts[0] if browser.contexts else browser.new_context()
 
         try:
             page = None
@@ -658,6 +730,9 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                         ban_check=ban_check, flow=flow, desc_override=desc_override,
                         delays=delays, stall_timeout_min=stall_timeout_min,
                         ad_suitability_template=ad_suitability_template,
+                        schedule_enabled=schedule_enabled,
+                        scheduled_at=scheduled_at,
+                        schedule_timezone=schedule_timezone,
                     )
                 except _UploadPolicyConfirmError as e:
                     on_log(f"  ⚠️ {e}，刷新浏览器后重新走上传流程...")
@@ -708,10 +783,13 @@ def _do_upload(page, job, config, video_path: Path, title: str,
                on_log: Callable, on_progress: Callable,
                ban_check: bool = False,
                flow: str = "simple",
-               desc_override: str = "",
+               desc_override: str | None = None,
                delays: "_Delays" = None,
                stall_timeout_min: int = 10,
-               ad_suitability_template: dict | None = None) -> Optional[str]:
+               ad_suitability_template: dict | None = None,
+               schedule_enabled: bool = False,
+               scheduled_at: str = "",
+               schedule_timezone: str = "Asia/Tokyo") -> Optional[str]:
     from playwright.sync_api import TimeoutError as PWTimeout
 
     if delays is None:
@@ -721,8 +799,9 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     UPLOAD_TIMEOUT = 1_800_000  # 30 分钟
     LOGIN_WAIT = 300_000        # 5 分钟等待登录
 
-    # 描述：优先用方案覆盖值，否则用 config 默认
-    desc = desc_override if desc_override else getattr(config, "youtube_description", "")
+    # An explicitly blank description is valid and must not fall back to a
+    # bundled/default template during upload.
+    desc = getattr(config, "youtube_description", "") if desc_override is None else desc_override
     upload_state = {
         "complete": False,
         "last_pct": -1,
@@ -918,18 +997,23 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     step_progress(70)
 
     # 公开范围页已经出现时先选好目标范围，不等上传 100%。
-    # YouTube 允许先选范围，等左下角上传/检查就绪后再点发布或保存。
-    _select_upload_visibility(page, visibility, on_log)
+    # 定时测试走 YouTube 的「安排时间」卡片；关闭时完整保留原逻辑。
+    if schedule_enabled:
+        if not _select_upload_schedule(page, scheduled_at, schedule_timezone, on_log):
+            return None
+    else:
+        _select_upload_visibility(page, visibility, on_log)
 
     # ── 步骤12：等待上传完成并发布 ────────────────────────
     if job.is_cancelled():
         on_log("上传已取消")
         return None
-    on_log("等待视频上传完成并发布...")
+    on_log("等待视频上传完成并预定..." if schedule_enabled else "等待视频上传完成并发布...")
     video_id = _wait_for_upload_and_publish(
         page, job, visibility, on_log, on_progress, UPLOAD_TIMEOUT,
         stall_timeout_min=stall_timeout_min,
         upload_state=upload_state,
+        schedule_enabled=schedule_enabled,
     )
 
     if video_id is None:
@@ -939,7 +1023,7 @@ def _do_upload(page, job, config, video_path: Path, title: str,
     if video_id == _STALL:
         return _STALL
 
-    done_label = "发布" if visibility == "PUBLIC" else "保存"
+    done_label = "预定" if schedule_enabled else ("发布" if visibility == "PUBLIC" else "保存")
     on_log(f"✓ 视频已{done_label}，video_id: {video_id}")
     step_progress(100)
 
@@ -2209,6 +2293,79 @@ def _click_precheck_publish_dialog(page) -> Optional[dict]:
         return None
 
 
+def _click_schedule_checking_notice(page) -> Optional[dict]:
+    """Acknowledge the occasional scheduled-publish checks notice.
+
+    YouTube can show “我们仍在检查你的内容” after Schedule is clicked.  The
+    reservation does not continue to the success/share dialog until the
+    operator clicks “知道了” (Got it).
+    """
+    try:
+        return page.evaluate("""async () => {
+            function visible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+            }
+            function clean(text) {
+                return (text || '').replace(/\s+/g, ' ').trim();
+            }
+            const bodyText = clean(document.body.innerText || document.body.textContent || '');
+            const titleVisible =
+                bodyText.includes('我们仍在检查你的内容') ||
+                bodyText.includes('我們仍在檢查你的內容') ||
+                /we(?:'|’)re still checking your content/i.test(bodyText) ||
+                /we are still checking your content/i.test(bodyText);
+            if (!titleVisible) return { visible: false, clicked: false, dismissed: true };
+
+            // The label varies by Studio language/build.  In the macOS
+            // Chromium build this dialog is currently rendered as "OK".
+            const labels = ['知道了', '知道瞭', '确定', 'OK', 'Got it', 'Understood'];
+            const candidates = Array.from(document.querySelectorAll(
+                'button, ytcp-button, tp-yt-paper-button, [role="button"]'
+            ));
+            const button = candidates.find(el => {
+                if (!visible(el)) return false;
+                const text = clean(el.innerText || el.textContent || '');
+                const aria = clean(el.getAttribute('aria-label') || '');
+                return labels.some(label => text === label || aria === label);
+            });
+            if (!button) {
+                return { visible: true, clicked: false, dismissed: false, reason: 'button_not_found' };
+            }
+
+            const inner = button.matches('button, [role="button"]')
+                ? button
+                : (button.querySelector('button, [role="button"]') || button);
+            try { inner.scrollIntoView({ block: 'center', inline: 'center' }); } catch (_) {}
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                try {
+                    const EventClass = type.startsWith('pointer') && window.PointerEvent ? PointerEvent : MouseEvent;
+                    inner.dispatchEvent(new EventClass(type, {
+                        bubbles: true, cancelable: true, composed: true, view: window,
+                        pointerId: 1, pointerType: 'mouse', isPrimary: true, button: 0
+                    }));
+                } catch (_) {}
+            }
+            try { inner.click(); } catch (_) {}
+            if (inner !== button) {
+                try { button.click(); } catch (_) {}
+            }
+            await new Promise(resolve => setTimeout(resolve, 700));
+            const after = clean(document.body.innerText || document.body.textContent || '');
+            const dismissed = !(
+                after.includes('我们仍在检查你的内容') ||
+                after.includes('我們仍在檢查你的內容') ||
+                /we(?:'|’)re still checking your content/i.test(after) ||
+                /we are still checking your content/i.test(after)
+            );
+            return { visible: !dismissed, clicked: true, dismissed, method: 'schedule-got-it' };
+        }""")
+    except Exception:
+        return None
+
+
 def _close_still_processing_dialog(page) -> Optional[dict]:
     """Close YouTube's still-processing upload dialog with the exact close button."""
     from playwright.sync_api import TimeoutError as PWTimeout
@@ -2359,6 +2516,158 @@ def _close_still_processing_dialog(page) -> Optional[dict]:
         return None
 
 
+def _schedule_date_labels(value: datetime) -> list[str]:
+    month_en = value.strftime("%b")
+    month_en_full = value.strftime("%B")
+    return [
+        f"{value.year}年{value.month}月{value.day}日",
+        f"{value.year}/{value.month}/{value.day}",
+        f"{value.month}/{value.day}/{value.year}",
+        f"{month_en} {value.day}, {value.year}",
+        f"{month_en_full} {value.day}, {value.year}",
+        f"{value.day} {month_en} {value.year}",
+    ]
+
+
+def _schedule_date_text_matches(text: str, value: datetime) -> bool:
+    compact = re.sub(r"\s+", "", str(text or "")).lower()
+    for label in _schedule_date_labels(value):
+        if re.sub(r"\s+", "", label).lower() in compact:
+            return True
+    numbers = [int(part) for part in re.findall(r"\d+", compact)]
+    return numbers[:3] == [value.year, value.month, value.day]
+
+
+def _select_upload_schedule(page, scheduled_at: str, timezone_name: str,
+                            on_log: Callable) -> bool:
+    """Expand Studio's Schedule card and set its date/time controls.
+
+    The date trigger opens a calendar whose top field is a real
+    ``tp-yt-paper-input``.  Fill that field exactly like the operator does:
+    select all, paste the desired date, then confirm.  Stop before Schedule if
+    Studio does not echo the exact target date back into the trigger.
+    """
+    try:
+        target = datetime.strptime(str(scheduled_at or ""), "%Y-%m-%dT%H:%M")
+    except ValueError:
+        on_log("  ❌ 定时发布时间格式不正确")
+        return False
+
+    on_log(f"设置定时发布：{target:%Y-%m-%d %H:%M}（{timezone_name}）...")
+    schedule_root = page.locator('ytcp-video-visibility-select #second-container').first
+    try:
+        schedule_root.wait_for(state="visible", timeout=10_000)
+        title = schedule_root.locator('#visibility-title').first
+        if title.is_visible(timeout=2_000):
+            title.click()
+        else:
+            schedule_root.click()
+        page.wait_for_timeout(500)
+    except Exception as exc:
+        on_log(f"  ❌ 未找到“安排时间”卡片: {exc}")
+        return False
+
+    date_trigger = schedule_root.locator('ytcp-dropdown-trigger').first
+    try:
+        date_trigger.wait_for(state="visible", timeout=8_000)
+        current_date_text = date_trigger.inner_text(timeout=3_000).strip()
+    except Exception as exc:
+        on_log(f"  ❌ 未找到发布日期按钮: {exc}")
+        return False
+
+    on_log(f"  当前日期为“{current_date_text}”，打开日期输入面板...")
+    target_date_formats = [
+        f"{target.year}年{target.month}月{target.day}日",
+        f"{target.year}/{target.month:02d}/{target.day:02d}",
+    ]
+    date_set = False
+    last_date_text = current_date_text
+    for date_text in target_date_formats:
+        try:
+            date_trigger.click(timeout=5_000)
+            page.wait_for_timeout(400)
+
+            # 图2：日历弹窗顶部的真实输入框。时间框仍在下方可见，
+            # 因此排除值/占位符中带冒号的输入框。
+            date_input = None
+            focused = page.locator('input:focus').first
+            try:
+                focused_value = focused.input_value(timeout=800)
+                if ":" not in focused_value:
+                    date_input = focused
+            except Exception:
+                pass
+            if date_input is None:
+                inputs = page.locator('tp-yt-paper-input input:visible, input:visible')
+                for index in range(min(inputs.count(), 30)):
+                    candidate = inputs.nth(index)
+                    try:
+                        value = candidate.input_value(timeout=800)
+                    except Exception:
+                        continue
+                    placeholder = str(candidate.get_attribute("placeholder") or "")
+                    if ":" in value or ":" in placeholder:
+                        continue
+                    if re.search(r"\d{4}.*\d{1,2}.*\d{1,2}", value) or "年" in value or "/" in value:
+                        date_input = candidate
+                        break
+            if date_input is None:
+                raise RuntimeError("calendar date input not found")
+
+            date_input.click()
+            date_input.press("Meta+A" if sys.platform == "darwin" else "Control+A")
+            page.keyboard.insert_text(date_text)
+            date_input.press("Enter")
+            page.wait_for_timeout(600)
+
+            last_date_text = date_trigger.inner_text(timeout=3_000).strip()
+            if _schedule_date_text_matches(last_date_text, target):
+                on_log(f"  ✓ 已按指定格式填写发布日期：{last_date_text}")
+                date_set = True
+                break
+            on_log(f"  日期格式“{date_text}”未被页面接受，尝试备用格式...")
+        except Exception as exc:
+            on_log(f"  日期格式“{date_text}”填写失败: {exc}")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+    if not date_set:
+        on_log(f"  ❌ 日期输入后校验失败，页面显示：{last_date_text}；已在点击预定前停止")
+        return False
+
+    time_input = None
+    try:
+        inputs = schedule_root.locator('tp-yt-paper-input input:visible, input:visible')
+        for index in range(min(inputs.count(), 20)):
+            candidate = inputs.nth(index)
+            value = candidate.input_value(timeout=1_000)
+            placeholder = str(candidate.get_attribute("placeholder") or "")
+            aria = str(candidate.get_attribute("aria-label") or "")
+            if ":" in value or ":" in placeholder or "时间" in aria or "time" in aria.lower():
+                time_input = candidate
+                break
+        if time_input is None:
+            raise RuntimeError("time input not found")
+        time_input.click()
+        time_input.press("Meta+A" if sys.platform == "darwin" else "Control+A")
+        page.keyboard.insert_text(target.strftime("%H:%M"))
+        time_input.press("Tab")
+        page.wait_for_timeout(400)
+        actual_time = time_input.input_value(timeout=2_000).strip()
+        if actual_time[:5] != target.strftime("%H:%M"):
+            on_log(f"  ❌ 时间输入后校验失败，页面显示：{actual_time}")
+            return False
+        on_log(f"  ✓ 已设置发布时间：{actual_time}")
+    except Exception as exc:
+        on_log(f"  ❌ 设置发布时间失败，已停止预定: {exc}")
+        return False
+
+    on_log(f"  ✓ 定时信息填写完成；时区使用 YouTube Studio 当前页面设置（目标 {timezone_name}）")
+    return True
+
+
 def _select_upload_visibility(page, visibility: str, on_log: Callable) -> bool:
     from playwright.sync_api import TimeoutError as PWTimeout
 
@@ -2403,11 +2712,123 @@ def _select_upload_visibility(page, visibility: str, on_log: Callable) -> bool:
         return False
 
 
+def _find_enabled_upload_action_button(page, schedule_enabled: bool,
+                                       visibility: str = "PUBLIC"):
+    """Return Studio's currently visible and enabled publish action button.
+
+    Newer Studio builds render the real action as a native ``button`` inside
+    ``ytcp-button-shape``.  Older builds exposed ``ytcp-button#done-button``.
+    Check the native button first so an already-enabled Schedule button is not
+    left waiting on an obsolete host selector.
+    """
+    if schedule_enabled:
+        selectors = (
+            'button[aria-label="预定"]',
+            'button[aria-label="Schedule"]',
+            'ytcp-button-shape button:has-text("预定")',
+            'ytcp-button-shape button:has-text("Schedule")',
+            '#done-button button',
+            'ytcp-button#done-button',
+        )
+    elif (visibility or "").strip().upper() == "PUBLIC":
+        selectors = (
+            'button[aria-label="发布"]',
+            'button[aria-label="Publish"]',
+            'ytcp-button-shape button:has-text("发布")',
+            'ytcp-button-shape button:has-text("Publish")',
+            '#done-button button',
+            'ytcp-button#done-button',
+        )
+    else:
+        selectors = (
+            'button[aria-label="保存"]',
+            'button[aria-label="Save"]',
+            'ytcp-button-shape button:has-text("保存")',
+            'ytcp-button-shape button:has-text("Save")',
+            '#done-button button',
+            'ytcp-button#done-button',
+        )
+
+    for selector in selectors:
+        try:
+            candidates = page.locator(selector)
+            for index in range(min(candidates.count(), 8)):
+                candidate = candidates.nth(index)
+                if candidate.is_visible(timeout=500) and candidate.is_enabled(timeout=500):
+                    return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _click_upload_action_button(page, button, label: str) -> bool:
+    """Click the upload dialog's final action despite transient UI overlays."""
+    try:
+        button.scroll_into_view_if_needed(timeout=2_000)
+    except Exception:
+        pass
+
+    try:
+        button.click(timeout=5_000)
+        return True
+    except Exception:
+        pass
+
+    # Studio frequently swaps the button host while checks are starting.  A
+    # real mouse click at the current native button's centre survives that
+    # host replacement better than retrying the stale locator.
+    try:
+        box = button.bounding_box()
+        if box and box.get("width", 0) > 0 and box.get("height", 0) > 0:
+            page.mouse.click(
+                box["x"] + box["width"] / 2,
+                box["y"] + box["height"] / 2,
+            )
+            page.wait_for_timeout(500)
+            return True
+    except Exception:
+        pass
+
+    # Last fallback: reacquire the visible native action by its accessible
+    # label, then dispatch the click in the page.
+    try:
+        clicked = page.evaluate("""(wanted) => {
+            function visible(el) {
+                if (!el || !el.getBoundingClientRect) return false;
+                const r = el.getBoundingClientRect();
+                return r.width > 0 && r.height > 0 &&
+                    getComputedStyle(el).visibility !== 'hidden';
+            }
+            const labels = wanted === '预定'
+                ? ['预定', 'Schedule']
+                : (wanted === '发布' ? ['发布', 'Publish'] : ['保存', 'Save']);
+            const buttons = Array.from(document.querySelectorAll(
+                'ytcp-button-shape button, ytcp-button button, button'
+            ));
+            const target = buttons.find(btn => {
+                if (!visible(btn)) return false;
+                const text = (btn.innerText || btn.textContent || '').trim();
+                const aria = (btn.getAttribute('aria-label') || '').trim();
+                return labels.includes(text) || labels.includes(aria);
+            });
+            if (!target) return false;
+            target.click();
+            return true;
+        }""", label)
+        if clicked:
+            page.wait_for_timeout(500)
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                                   on_progress: Callable,
                                   upload_timeout: int,
                                   stall_timeout_min: int = 10,
-                                  upload_state: dict = None) -> Optional[str]:
+                                  upload_state: dict = None,
+                                  schedule_enabled: bool = False) -> Optional[str]:
     from playwright.sync_api import TimeoutError as PWTimeout
 
     upload_state = upload_state or {}
@@ -2431,6 +2852,18 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
         if (time.time() - start) > upload_timeout / 1000:
             on_log("❌ 上传超时")
             return None
+
+        # YouTube allows Schedule while upload/check processing continues.
+        # Once date/time are valid and the real native button is enabled, click
+        # it immediately instead of waiting for the progress text to reach 100%.
+        if schedule_enabled:
+            publish_btn = _find_enabled_upload_action_button(
+                page, schedule_enabled=True, visibility=visibility
+            )
+            if publish_btn is not None:
+                last_activity = time.time()
+                on_log("预定按钮已可用，立即预定（不等待后台处理完成）")
+                break
 
         # 卡住检测：stall_timeout_min 分钟无任何进度变化
         if not upload_complete and stall_sec > 0 and (time.time() - last_activity) > stall_sec:
@@ -2483,43 +2916,54 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                 last_pct = max(last_pct, int(upload_state.get("app_pct", 82)))
             break
 
-        try:
-            publish_btn = page.locator(
-                'ytcp-button#done-button:has-text("发布"), '
-                'ytcp-button:has-text("Publish"), '
-                'ytcp-button#done-button'
-            ).first
-            if publish_btn.is_enabled(timeout=2000):
-                last_activity = time.time()
-                break
-        except PWTimeout:
-            pass
+        publish_btn = _find_enabled_upload_action_button(
+            page, schedule_enabled=False, visibility=visibility
+        )
+        if publish_btn is not None:
+            last_activity = time.time()
+            break
 
         page.wait_for_timeout(2000)
 
     _emit_upload_progress(upload_state, 83, on_progress)
-    on_log("上传完毕，准备点击发布/保存...")
+    on_log("上传完毕，准备点击预定..." if schedule_enabled else "上传完毕，准备点击发布/保存...")
 
-    _action_label = "发布" if (visibility or "").strip().upper() == "PUBLIC" else "保存"
+    _action_label = "预定" if schedule_enabled else ("发布" if (visibility or "").strip().upper() == "PUBLIC" else "保存")
     on_log(f"点击{_action_label}...")
     _publish_clicked = False
     _publish_clicked_at = 0.0
+    publish_btn = None
+    _button_deadline = time.time() + 60
+    while time.time() < _button_deadline and publish_btn is None:
+        publish_btn = _find_enabled_upload_action_button(
+            page, schedule_enabled=schedule_enabled, visibility=visibility
+        )
+        if publish_btn is None:
+            page.wait_for_timeout(500)
+    if publish_btn is None:
+        on_log(f"⚠️ {_action_label}按钮在60秒内仍不可用")
+        if schedule_enabled:
+            # The video upload dialog can briefly replace the Schedule button
+            # with a checking overlay.  Retrying the entire upload here can
+            # create duplicate videos, so stop for a Studio review instead.
+            on_log("⚠️ 已进入预定步骤但未确认按钮状态；为避免重复上传，不会重新上传此文件")
+            return "SCHEDULE_UNCONFIRMED"
+        return None
     try:
-        publish_btn = page.locator(
-            'ytcp-button#done-button:has-text("发布"), '
-            'ytcp-button:has-text("Publish"), '
-            'ytcp-button#done-button'
-        ).first
-        publish_btn.click(timeout=180_000)
+        if not _click_upload_action_button(page, publish_btn, _action_label):
+            raise PWTimeout(f"{_action_label} click was not accepted")
         _publish_clicked = True
         _publish_clicked_at = time.time()
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(800)
     except PWTimeout:
-        on_log(f"⚠️ {_action_label}按钮长时间不可用")
+        on_log(f"⚠️ {_action_label}按钮已显示可用，但点击未被页面接受")
+        if schedule_enabled:
+            on_log("⚠️ 已尝试预定；为避免重复上传，不会重新上传此文件，请到 Studio 检查")
+            return "SCHEDULE_UNCONFIRMED"
         return None
 
     # 处理确认弹窗（"我们仍在检查你的视频" → 再次点击弹窗里的"发布"）
-    confirm_result = _click_precheck_publish_dialog(page)
+    confirm_result = None if schedule_enabled else _click_precheck_publish_dialog(page)
     if confirm_result and confirm_result.get("clicked"):
         if confirm_result.get("dismissed"):
             on_log("检测到检查确认弹窗，已点击发布并关闭弹窗")
@@ -2530,15 +2974,22 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
     elif confirm_result and confirm_result.get("visible"):
         on_log("检测到检查确认弹窗，等待弹窗里的发布按钮可用...")
 
+    if schedule_enabled:
+        schedule_notice = _click_schedule_checking_notice(page)
+        if schedule_notice and schedule_notice.get("clicked"):
+            on_log("检测到“我们仍在检查你的内容”，已点击“知道了”")
+            page.wait_for_timeout(1200)
+
     video_id = None
-    _dialog_closed = False  # 标记弹窗是否已成功关闭（弹窗关闭=发布完成）
+    _dialog_closed = False  # 标记弹窗是否已成功关闭（弹窗关闭=发布/预约完成）
 
     # 处理"正在检查/正在处理"弹窗：完整流程可能会检查较久，持续重试弹窗里的发布按钮。
     # 背景：点"确认发布"后 YouTube 需要数秒才弹出此弹窗，且弹窗存在时 URL 不会跳转
-    on_log("等待发布后弹窗或页面跳转...")
+    on_log("等待预约成功弹窗..." if schedule_enabled else "等待发布后弹窗或页面跳转...")
     _still_processing_deadline = time.time() + 600
     _precheck_wait_logged = False
     _last_precheck_click_log = 0.0
+    _schedule_notice_wait_logged = False
     while time.time() < _still_processing_deadline:
         _dialog_visible = page.evaluate("""() => {
             const d = document.querySelector('ytcp-uploads-still-processing-dialog');
@@ -2571,7 +3022,20 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
             page.wait_for_timeout(2000)
             continue
 
-        confirm_result = _click_precheck_publish_dialog(page)
+        if schedule_enabled:
+            schedule_notice = _click_schedule_checking_notice(page)
+            if schedule_notice and schedule_notice.get("clicked"):
+                on_log("检测到预约检查提示，已点击“知道了”，继续等待预约成功弹窗...")
+                page.wait_for_timeout(1500)
+                continue
+            if schedule_notice and schedule_notice.get("visible"):
+                if not _schedule_notice_wait_logged:
+                    on_log("检测到预约检查提示，正在等待“知道了”按钮出现...")
+                    _schedule_notice_wait_logged = True
+                page.wait_for_timeout(1500)
+                continue
+
+        confirm_result = None if schedule_enabled else _click_precheck_publish_dialog(page)
         if confirm_result and confirm_result.get("clicked"):
             _publish_clicked_at = time.time()
             if confirm_result.get("dismissed"):
@@ -2606,7 +3070,7 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
             return { href: href };
         }""")
         if _share_info:
-            on_log("检测到发布成功分享弹窗，提取视频ID并关闭...")
+            on_log("检测到预约成功分享弹窗，提取视频ID并关闭..." if schedule_enabled else "检测到发布成功分享弹窗，提取视频ID并关闭...")
             _href = _share_info.get("href") or ""
             if _href:
                 m = re.search(r"youtu\.be/([A-Za-z0-9_-]{11})|shorts/([A-Za-z0-9_-]{11})|v=([A-Za-z0-9_-]{11})", _href)
@@ -2625,7 +3089,7 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
             }""")
             on_log(f"  关闭分享弹窗: {closed}")
             page.wait_for_timeout(1500)
-            on_log("  ✓ 已关闭分享弹窗，视频已发布")
+            on_log("  ✓ 已关闭分享弹窗，视频已预约" if schedule_enabled else "  ✓ 已关闭分享弹窗，视频已发布")
             _dialog_closed = True
             break
 
@@ -2675,12 +3139,16 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
                     });
                 }""")
                 if not _upload_dialog_visible:
-                    on_log("上传发布窗口已关闭，按发布成功处理")
+                    on_log("上传窗口已关闭，按预约成功处理" if schedule_enabled else "上传发布窗口已关闭，按发布成功处理")
                     _dialog_closed = True
                     break
             except Exception:
                 pass
         page.wait_for_timeout(1000)
+
+    if schedule_enabled and _publish_clicked and not video_id and not _dialog_closed:
+        on_log("  ⚠️ 已点击预定，但在等待时间内没有确认到预约成功弹窗")
+        return "SCHEDULE_UNCONFIRMED"
 
     # 方法1：等待 URL 跳转到 /video/VIDEO_ID（弹窗已关闭则跳过此等待）
     if not video_id and not _dialog_closed:
@@ -2714,7 +3182,11 @@ def _wait_for_upload_and_publish(page, job, visibility: str, on_log: Callable,
 
     # 弹窗已关闭说明发布成功，即使取不到 video_id 也不算失败
     if not video_id and _dialog_closed:
-        video_id = "published"
+        video_id = "scheduled" if schedule_enabled else "published"
+    if schedule_enabled and not video_id and _publish_clicked:
+        # Do not let the outer retry loop upload a duplicate after Schedule was
+        # clicked but Studio's success dialog could not be confirmed.
+        video_id = "SCHEDULE_UNCONFIRMED"
 
     return video_id
 
@@ -2954,8 +3426,13 @@ def _select_file_with_playwright(page, video_path: Path, on_log: Callable, timeo
             on_log(f"  ✗ 无法设置上传文件: {exc}")
             return False
     except Exception as exc:
-        on_log(f"  ✗ 文件选择失败: {exc}")
-        return False
+        if "Cannot transfer files larger than 50Mb" in str(exc):
+            on_log("  检测到大视频，改用浏览器本机路径选择...")
+            if not _set_local_file_via_cdp(page, video_path, on_log):
+                return False
+        else:
+            on_log(f"  ✗ 文件选择失败: {exc}")
+            return False
 
     try:
         page.wait_for_selector(
@@ -2967,6 +3444,62 @@ def _select_file_with_playwright(page, video_path: Path, on_log: Callable, timeo
     except PWTimeout:
         on_log("  ✗ 文件选择后标题框未出现，将触发重试")
         return False
+
+
+def _set_local_file_via_cdp(page, video_path: Path, on_log: Callable) -> bool:
+    """Set a file path on the browser host without transferring file bytes.
+
+    ``connect_over_cdp`` is marked remote by Playwright and ``set_files`` then
+    tries to copy the whole file through its protocol, which has a 50 MB cap.
+    The Chrome instance and this application are on the same Mac, so Chrome's
+    native CDP command can safely receive the resolved local path directly.
+    """
+    session = None
+    object_id = ""
+    try:
+        session = page.context.new_cdp_session(page)
+        expression = r"""
+(() => {
+  const findFileInput = root => {
+    if (!root || !root.querySelectorAll) return null;
+    const direct = root.querySelector('input[type="file"]');
+    if (direct) return direct;
+    for (const element of root.querySelectorAll('*')) {
+      if (element.shadowRoot) {
+        const nested = findFileInput(element.shadowRoot);
+        if (nested) return nested;
+      }
+    }
+    return null;
+  };
+  return findFileInput(document);
+})()
+"""
+        evaluated = session.send("Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": False,
+            "awaitPromise": True,
+        })
+        result = evaluated.get("result") or {}
+        object_id = str(result.get("objectId") or "")
+        if not object_id or result.get("subtype") == "null":
+            on_log("  ✗ 浏览器本机路径选择失败：未找到视频文件框")
+            return False
+        session.send("DOM.setFileInputFiles", {
+            "objectId": object_id,
+            "files": [str(Path(video_path).expanduser().resolve())],
+        })
+        on_log("  ✓ 大视频已通过本机路径选中")
+        return True
+    except Exception as exc:
+        on_log(f"  ✗ 浏览器本机路径选择失败: {exc}")
+        return False
+    finally:
+        if session is not None and object_id:
+            try:
+                session.send("Runtime.releaseObject", {"objectId": object_id})
+            except Exception:
+                pass
 
 
 def _try_select_file_once(page, video_path: Path, on_log: Callable, timeout: int) -> bool:

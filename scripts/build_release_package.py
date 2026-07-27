@@ -23,7 +23,7 @@ COPY_FILES = (
     "requirements.txt",
     "update.bat",
 )
-COPY_DIRS = ("app", "docs", "scripts")
+COPY_DIRS = ("app", "docs", "scripts", "prompts")
 IGNORE_DIRS = {"__pycache__", ".git", ".venv", "dist"}
 IGNORE_SUFFIXES = {".pyc", ".pyo"}
 IGNORE_FILES = {".DS_Store"}

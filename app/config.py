@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -24,12 +25,9 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 21
-DEFAULT_YOUTUBE_TITLE_TEMPLATE = "💥【爆款短文】《{clean_title}》{intro} #小说 #推文"
-DEFAULT_YOUTUBE_DESCRIPTION = (
-    "原创内容，只只推文，每天更新高分又好看的#AI漫画#小说推文\n"
-    "💖感谢您的订阅👉小伙伴想看完整版，欢迎催更"
-)
+SETTINGS_SCHEMA_VERSION = 36
+DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
+DEFAULT_YOUTUBE_DESCRIPTION = ""
 
 API_KEY_FIELDS = {
     "ai_api_key",
@@ -39,8 +37,32 @@ API_KEY_FIELDS = {
     "cover_api_key",
     "character_reference_api_key",
     "scene_reference_api_key",
+    "pronunciation_dictionary_api_key",
 }
 API_KEY_ENV_PREFIX = "NOVEL_VIDEO_SECRET_"
+
+# Profiles are meant to be shareable production recipes.  Keep connection
+# details outside them so changing a visual/TTS profile never exposes or
+# clears the operator's already configured API endpoint and credentials.
+PROFILE_CONNECTION_FIELDS = API_KEY_FIELDS | {
+    "source_base_url",
+    "source_hosts",
+    "ai_api_base_url",
+    "llm_base_url",
+    "tts_base_url",
+    "image_base_url",
+    "cover_base_url",
+    "character_reference_base_url",
+    "scene_reference_base_url",
+    "pronunciation_dictionary_base_url",
+}
+PROFILE_LOCAL_FIELDS = PROFILE_CONNECTION_FIELDS | {
+    "deleted_profiles",
+    "task_category_root",
+    "task_category_selected_path",
+    "task_category_sort",
+    "task_category_direction",
+}
 
 
 def api_key_env_name(key: str) -> str:
@@ -50,6 +72,10 @@ def api_key_env_name(key: str) -> str:
 
 DEFAULT_SETTINGS: dict[str, Any] = {
     "settings_schema_version": SETTINGS_SCHEMA_VERSION,
+    "task_category_root": "",
+    "task_category_selected_path": "",
+    "task_category_sort": "名称自然排序",
+    "task_category_direction": "升序",
     "active_profile": "配置1",
 
     # 爬取
@@ -76,7 +102,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ai_api_base_url": "",
     "ai_api_key": "",
     "ai_api_text_model": "gpt-4o-mini",
-    "ai_api_image_model": "gpt-image-1",
+    "ai_api_image_model": "gpt-image-2",
+    "ai_api_image_width": 1792,
+    "ai_api_image_height": 1008,
 
     # LLM（分镜）
     "llm_provider": "openai",  # openai / claude / gemini / deepseek / ollama / custom
@@ -109,8 +137,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "llm_image_prompt_prefix": (
         "Single finished cinematic anime/editorial illustration for a novel recap video, one clear hero subject, "
         "visible story action, strong visual hierarchy, expressive adult-looking characters, dramatic lighting, "
-        "restrained 4-6 color palette, medium-wide 16:9 composition, every visible person's complete head and face "
-        "fully inside the frame with generous top headroom and safe edge margins, no cropped heads or faces, "
+        "restrained 4-6 color palette, cinematic 16:9 composition, "
         "clean composition. Absolutely no visible writing or glyphs anywhere: no letters, words, Japanese, Chinese, numbers, "
         "signage, book pages, speech bubbles, captions, typography, UI, logos, or watermarks; all documents, signs, screens and "
         "magical effects must be blank or abstract."
@@ -119,7 +146,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Keep this compatible with SD/ComfyUI backends without putting policy
     # trigger words in a reusable setting.  OpenAI-compatible backends do not
     # receive this list because their API has no negative-prompt field.
-    "llm_negative_prompt": "low resolution, anatomy errors, malformed hands, text, letters, words, writing, Japanese characters, Chinese characters, numbers, typography, signage, book pages, speech bubbles, captions, watermark, logo, UI overlay, duplicate limbs, cropped face, cropped head",
+    "llm_negative_prompt": "low resolution, anatomy errors, malformed hands, text, letters, words, writing, Japanese characters, Chinese characters, numbers, typography, signage, book pages, speech bubbles, captions, watermark, logo, UI overlay, duplicate limbs",
 
     # 视频生图解决方案1：把秒数作为图片数量预算，每个预算窗口只选择一个旁白高光点。
     "storyboard_highlight_enabled": True,
@@ -200,6 +227,43 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "请根据小说简介生成一个适合推文视频的短说明标题。"
         "要求 20 到 30 个中文字符，突出爽点/冲突/悬念，不要书名号，不要引号，不要换行，不要标签。"
     ),
+    # One grounded marketing pass produces every publishing candidate used by
+    # the cover and upload stages.  Keep the legacy short-title settings above
+    # for old profiles and task snapshots, but new jobs use this structured
+    # bundle instead of asking for one disposable title.
+    "marketing_title_min_chars": 40,
+    "marketing_title_max_chars": 70,
+    "marketing_candidates_max_tokens": 1600,
+    # An OpenAI-compatible relay can occasionally return a non-JSON answer
+    # while otherwise being healthy.  Keep unattended jobs alive long enough
+    # for that transient route/model condition to clear.
+    "marketing_candidates_retry_attempts": 5,
+    "marketing_candidates_retry_delay_seconds": 60,
+    "marketing_candidates_prompt": (
+        "あなたは日本向けYouTube小説朗読・物語動画の編集者です。入力は作品の冒頭・中盤・終盤から抽出した"
+        "事実ベースの資料です。全文を細かく要約せず、誰が誰に何をしたか、主要事件、人物関係、異常事態、"
+        "終盤で明らかになる真相または逆転を内部で把握してください。原文にない設定・人物・能力・事件・結末は"
+        "絶対に追加しないでください。\n\n"
+        "内部で男性向け・女性向け・中性向け、および恋愛、復讐、ざまぁ、修羅場、職場、学園、異世界、"
+        "ファンタジー、ラブコメ、ダーク、歴史などの題材を判定し、判定結果自体は出力しないでください。\n\n"
+        "通常の小説では、漫画広告・WEB小説風で、一瞬で内容が分かり、事件性と関係性が具体的で、続きを"
+        "見たくなる自然な日本語タイトルを作ってください。女性向けでは後悔、溺愛、執着、ざまぁ、今さら感、"
+        "男性向けでは逆転、覚醒、追放、美少女、同居、甘やかし、距離感などを、原文に根拠がある場合だけ使えます。"
+        "題材に自然なら【修羅場】【ざまぁ】【衝撃】【復讐】【禁断】【沼注意】、（笑）、❤、……、www、"
+        "〜なんだが等も使用できます。露骨な性的表現、未成年の性的描写、抽象的な短文、ポエム、汎用テンプレは"
+        "禁止です。\n\n"
+        "三国志・歴史題材では同じ構成を使いながら、主要人物または勢力、計略、兵力差、危機、決断、同盟、"
+        "裏切り、戦局や政治の逆転を具体的に書いてください。❤、（笑）、www、溺愛、修羅場などの恋愛向け表現や、"
+        "根拠のない大げさな煽りは使用しないでください。史実と演義を入力以上に混同しないでください。\n\n"
+        "完成した動画タイトルを必ず3案作り、各40〜70文字程度、3案は構成と切り口を変えてください。"
+        "概要欄用あらすじを必ず2案作り、各80〜160文字程度、事件・関係性・主人公の状況を入れ、結末を全部"
+        "書かず、2案は切り口を変えてください。内容に一致するタグを10〜15個作ってください。"
+        "【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。\n\n"
+        "必ず次のJSONオブジェクトだけを出力し、Markdown、説明、作品タイトル、判定結果、推理過程を付けないでください。\n"
+        "{\"titles\":[\"タイトル1\",\"タイトル2\",\"タイトル3\"],"
+        "\"synopses\":[\"あらすじ1\",\"あらすじ2\"],"
+        "\"tags\":[\"#タグ1\",\"#タグ2\",\"#タグ3\"]}"
+    ),
     "ai_rewrite_enabled": False,
     # When enabled, standalone labels such as "第九話" are included in TTS.
     "narrate_chapter_headings": False,
@@ -222,6 +286,16 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # high-risk Japanese token candidates are sent to the text LLM for readings.
     "tts_auto_pronunciation_enabled": False,
     "tts_auto_pronunciation_max_terms": 40,
+    "pronunciation_dictionary_dedicated_api_enabled": False,
+    "pronunciation_dictionary_base_url": "",
+    "pronunciation_dictionary_api_key": "",
+    "pronunciation_dictionary_model": "gpt-4o-mini",
+    "pronunciation_dictionary_prompt": (
+        "你是日语 TTS 生词词典助手。只为用户给出的候选词提供准确的日语假名读音。"
+        "只输出严格的“原词=假名读音”，每行一条；不得输出解释、标题或 Markdown，"
+        "不得添加候选列表以外的词，不确定时直接省略。"
+        "读音只能使用平假名、片假名、中点或长音符。"
+    ),
     # TTS
     "tts_provider": "edge",  # edge / voicevox / azure / openai / elevenlabs / custom
     "tts_voice": "ja-JP-NanamiNeural",
@@ -234,8 +308,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "tts_api_key": "",
     "tts_base_url": "",  # voicevox: http://localhost:50021 ; openai: https://api.openai.com/v1 ; etc
     "tts_extra": {},  # 额外参数 (azure region 等)
-    "tts_retries": 3,
-    "tts_retry_until_success": True,
+    # Unattended jobs must eventually yield the queue to the next task.
+    "pipeline_failure_retry_limit": 5,
+    "pipeline_skip_after_failures": True,
+    "tts_retries": 5,
+    "tts_retry_until_success": False,
     "tts_fail_silence": False,
     "tts_emotion": "",
     "tts_segment_timeout_seconds": 180,
@@ -251,49 +328,57 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "image_base_url": "http://127.0.0.1:8188",
     "image_api_key": "",
     "image_model": "",
-    "image_width": 1920,
-    "image_height": 1080,
+    "image_width": 1792,
+    "image_height": 1008,
     "image_steps": 25,
     "image_cfg": 7.0,
     "image_api_timeout_seconds": 300,
+    "image_retry_attempts": 5,
     "image_workflow": "",  # comfyui workflow json 路径（可选）
 
     # Cover
     "cover_enabled": True,
+    "series_animation_enabled": True,
     "cover_provider": "same_as_image",
     "cover_base_url": "",
     "cover_api_key": "",
     "cover_model": "",
-    "cover_width": 1280,
-    "cover_height": 720,
+    "cover_width": 1792,
+    "cover_height": 1008,
     "cover_title_size": 72,
     "cover_title_font": "Microsoft YaHei",
     "cover_title_color": "#FFFFFF",
     "cover_title_bg": "#050505",
     "cover_title_area_ratio": 0.24,
     "cover_prompt_template": (
-        'Create ONE finished premium YouTube novel-recap cover, like a conceptual typography movie poster.\n'
-        'Exact title text: "{title}"\n'
-        'The exact title must be the main hero element: huge, readable, spelled exactly, not translated, not shortened, '
-        'not replaced, and integrated into the artwork.\n'
-        'Story excerpt: {excerpt}\n'
-        'Custom direction: {custom}\n'
-        'Composition: one strong hero visual; the character, object, or scene should interact with the title typography '
-        'by overlapping it, emerging from it, being framed by it, casting shadow on it, or breaking through it. '
-        'Use a restrained 4-6 color palette, high contrast, cinematic lighting, and clear thumbnail hierarchy. '
-        'Single cover only: no moodboard, no grid, no process sheet, no mockup, no extra captions, no UI, no watermark. {style}'
+        "(masterpiece:1.2, best quality), horizontal 16:9.\n"
+        "Japanese LINE manga advertisement.\n"
+        "Story input: {excerpt}\n"
+        "Show one decisive event: protagonist action, visible reaction, and a meaningful prop or setting.\n"
+        "Use Center / Left / Right / Background labels for a clean poster layout.\n"
+        "Main title, Hook, Subtitle: short concrete Japanese copy; no other text or watermark.\n"
+        "{custom} {style}"
     ),
     "cover_custom_prompt": (
-        "viral mystery/romance/fantasy novel recap thumbnail, dramatic character close-up, symbolic story object, "
-        "red-gold accent on dark cinematic background, high click-through tension"
+        "dramatic lighting, high contrast, one clear story climax, adult-looking characters"
     ),
     "cover_ai_analysis_prompt": (
-        "You are a senior poster art director. Transform the fixed cover template, exact title, and story excerpt into "
-        "one concise English image-generation prompt. Preserve the exact title text and make typography the visual hero. "
-        "Silently interpret the title's mood, genre, symbolic associations, and psychological tension, then turn it into "
-        "one strong visual metaphor. The output must describe a single finished cover, not a moodboard or design sheet. "
-        "Do not request editor-added overlays or post-production text. No extra words, logos, captions, UI, watermarks, "
-        "gore, nudity, sexual content, or explicit violence."
+        "Choose the strongest supported event or reversal from the candidates. Return one compact English image prompt only: "
+        "scene; Center, Left, Right, Background characters/actions; lighting; then Main title, Hook, Subtitle in Japanese. "
+        "Use concrete actions, not static posing. Do not copy a long source title, add extra text, analysis, JSON, logo, UI, or watermark."
+    ),
+    "cover_prompt_max_tokens": 420,
+    "cover_policy_prompt_versions": 3,
+    "cover_transient_retries": 3,
+    "cover_poster_method_prompt": (
+        "Fixed compact cover method:\n"
+        "Return one 120-220 word English image prompt for a horizontal 16:9 Japanese LINE manga-ad thumbnail. Start with "
+        "(masterpiece:1.2, best quality). Describe only the story-specific scene and people. Use Center, Left, Right, and "
+        "Background labels when useful: one decisive protagonist action, visible reaction, and one meaningful prop/setting. "
+        "Keep 1-3 main characters; do not pad with generic quality/style synonyms.\n"
+        "End exactly with Main title, Hook, Subtitle in concise Japanese. The title explains the event; hook is short; subtitle "
+        "clarifies it. Make the text readable and clear of faces/action. No extra text, logo, UI, watermark, moodboard, grid, "
+        "nudity, gore, or graphic injury."
     ),
 
     # 图音配比
@@ -301,9 +386,6 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "pacing_seconds_per_image": 6,
     "pacing_sentences_per_image": 3,
     "pacing_fixed_count": 10,
-    # Safe framing keeps motion, but limits its overscan so it is much less
-    # likely to cut off a character composed close to an edge.
-    "video_safe_framing": True,
     "ken_burns": True,
     "video_motion": "上下移动",
     "video_motion_curve": "ease",
@@ -342,6 +424,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # Optional delivery folder.  The job copy remains in data/jobs so a task
     # can still resume or upload later; completed videos are copied here too.
     "output_directory": "",
+    # When importing local text, optionally deliver the finished assets next
+    # to that input file instead of to one shared output directory.
+    "output_to_input_directory": False,
 
     "max_concurrent_jobs": 1,
     "max_concurrent_external_api": 2,
@@ -375,6 +460,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "upload_enabled": False,
     "youtube_upload_method": "browser",
     "youtube_visibility": "PRIVATE",
+    # First-stage YouTube scheduled-publish test.  This is deliberately
+    # applied only by the GUI's manual upload path until batch allocation is
+    # implemented and verified against the live Studio UI.
+    "youtube_schedule_enabled": False,
+    "youtube_schedule_date": "",
+    "youtube_schedule_time": "18:00",
+    "youtube_schedule_timezone": "Asia/Tokyo",
+    "youtube_publish_mode": "immediate",
+    "script_schedule_first_date": "",
+    "script_schedule_time": "18:00",
+    "script_schedule_interval_hours": 24,
+    "script_schedule_timezone": "Asia/Tokyo",
+    "script_schedule_missed_action": "next_slot",
+    "script_schedule_unfinished_action": "next_slot",
     "youtube_title_template": DEFAULT_YOUTUBE_TITLE_TEMPLATE,
     "youtube_title_max_chars": 100,
     "youtube_description": DEFAULT_YOUTUBE_DESCRIPTION,
@@ -452,18 +551,6 @@ def _looks_like_legacy_title_template(value: Any) -> bool:
     )
 
 
-def _looks_like_legacy_description(value: Any) -> bool:
-    text = str(value or "")
-    return (
-        not text.strip()
-        or "{short_title}" in text
-        or "{intro}" in text
-        or "#爽文" in text
-        or "#灏忚" in text
-        or "涔﹀悕" in text
-    )
-
-
 def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None = None) -> None:
     saved = saved or {}
     saved_version = _to_int(saved.get("settings_schema_version"), 0)
@@ -472,8 +559,8 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             data["scraper_max_chars"] = 0
         if _looks_like_legacy_title_template(data.get("youtube_title_template")) or "{title}" in str(data.get("youtube_title_template") or ""):
             data["youtube_title_template"] = DEFAULT_YOUTUBE_TITLE_TEMPLATE
-        if _looks_like_legacy_description(data.get("youtube_description")):
-            data["youtube_description"] = DEFAULT_YOUTUBE_DESCRIPTION
+        # An empty upload description is an intentional operator choice.
+        # Never restore bundled wording merely because this field is blank.
         if _to_int(data.get("image_width"), 0) == 1080 and _to_int(data.get("image_height"), 0) == 1920:
             data["image_width"] = 1920
             data["image_height"] = 1080
@@ -615,6 +702,44 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             "storyboard_highlight_align_timeline",
         ):
             data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 25:
+        # GPT Image 2 accepts this native 16:9 size directly. Keep the API
+        # request, scene files and cover files on the same canvas.
+        data["ai_api_image_width"] = DEFAULT_SETTINGS["ai_api_image_width"]
+        data["ai_api_image_height"] = DEFAULT_SETTINGS["ai_api_image_height"]
+        data["image_width"] = DEFAULT_SETTINGS["image_width"]
+        data["image_height"] = DEFAULT_SETTINGS["image_height"]
+        data["cover_width"] = DEFAULT_SETTINGS["cover_width"]
+        data["cover_height"] = DEFAULT_SETTINGS["cover_height"]
+    if saved_version < 26:
+        # Remove framing workarounds that were added when GPT Image responses
+        # were incorrectly treated as permanently fixed at 3:2. This also
+        # cleans per-job settings snapshots when an older job is resumed.
+        data.pop("video_safe_framing", None)
+        prefix = str(data.get("llm_image_prompt_prefix") or "")
+        prefix = prefix.replace("cinematic medium-wide 16:9 composition", "cinematic 16:9 composition")
+        prefix = prefix.replace(", complete heads and faces inside the frame with generous safe margins", "")
+        prefix = prefix.replace(", complete heads and faces inside the frame, safe edge margins", "")
+        data["llm_image_prompt_prefix"] = prefix
+
+        negative_parts = []
+        framing_negatives = {
+            "cropped face", "cropped head", "cut-off head", "face outside frame",
+            "forehead outside frame", "portrait crop", "partial person at image boundary",
+            "person touching image edge", "oversized foreground face", "extreme close-up",
+        }
+        for part in str(data.get("llm_negative_prompt") or "").split(","):
+            item = part.strip()
+            if item and item.lower() not in framing_negatives:
+                negative_parts.append(item)
+        data["llm_negative_prompt"] = ", ".join(negative_parts)
+
+        for key in ("cover_ai_analysis_prompt", "cover_poster_method_prompt"):
+            text = str(data.get(key) or "")
+            text = text.replace(" Keep all people, action, weapons, horses, banners, and text inside the final 16:9 safe area.", "")
+            text = text.replace(" Keep all people, action, and text inside the final 16:9 safe area.", "")
+            text = text.replace("a clean 16:9 safe composition", "a clean composition")
+            data[key] = text
     if saved_version < 19:
         # Only replace the known old bundled list; leave deliberate custom
         # negative prompts untouched for local SD/ComfyUI users.
@@ -630,6 +755,130 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             data.setdefault(key, DEFAULT_SETTINGS[key])
     if saved_version < 21:
         data.setdefault("output_directory", DEFAULT_SETTINGS["output_directory"])
+    if saved_version < 22:
+        data.setdefault("output_to_input_directory", DEFAULT_SETTINGS["output_to_input_directory"])
+    if saved_version < 23:
+        for key in (
+            "marketing_title_min_chars",
+            "marketing_title_max_chars",
+            "marketing_candidates_max_tokens",
+            "marketing_candidates_prompt",
+            "cover_prompt_max_tokens",
+            "cover_policy_prompt_versions",
+            "cover_transient_retries",
+            "cover_poster_method_prompt",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+        if "conceptual typography movie poster" in str(data.get("cover_prompt_template") or ""):
+            data["cover_prompt_template"] = DEFAULT_SETTINGS["cover_prompt_template"]
+        if "senior poster art director" in str(data.get("cover_ai_analysis_prompt") or "").lower():
+            data["cover_ai_analysis_prompt"] = DEFAULT_SETTINGS["cover_ai_analysis_prompt"]
+        if "dramatic character close-up" in str(data.get("cover_custom_prompt") or ""):
+            data["cover_custom_prompt"] = DEFAULT_SETTINGS["cover_custom_prompt"]
+    if saved_version < 34:
+        for key in (
+            "pronunciation_dictionary_dedicated_api_enabled",
+            "pronunciation_dictionary_base_url",
+            "pronunciation_dictionary_api_key",
+            "pronunciation_dictionary_model",
+            "pronunciation_dictionary_prompt",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 28:
+        for key in (
+            "youtube_schedule_enabled",
+            "youtube_schedule_date",
+            "youtube_schedule_time",
+            "youtube_schedule_timezone",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 29:
+        legacy_publish_mode = "youtube" if bool(data.get("youtube_schedule_enabled", False)) else "immediate"
+        if "youtube_publish_mode" not in saved:
+            data["youtube_publish_mode"] = legacy_publish_mode
+        for key in (
+            "script_schedule_first_date",
+            "script_schedule_time",
+            "script_schedule_interval_hours",
+            "script_schedule_timezone",
+            "script_schedule_missed_action",
+            "script_schedule_unfinished_action",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+        try:
+            profiles = json.loads(str(data.get("browser_profiles", "[]") or "[]"))
+            if isinstance(profiles, list):
+                for profile in profiles:
+                    if not isinstance(profile, dict):
+                        continue
+                    profile.setdefault("publish_mode", legacy_publish_mode)
+                    profile.setdefault("youtube_schedule_date", data.get("youtube_schedule_date", ""))
+                    profile.setdefault("youtube_schedule_time", data.get("youtube_schedule_time", "18:00"))
+                    profile.setdefault("youtube_schedule_timezone", data.get("youtube_schedule_timezone", "Asia/Tokyo"))
+                    for key in (
+                        "script_schedule_first_date", "script_schedule_time", "script_schedule_interval_hours",
+                        "script_schedule_timezone", "script_schedule_missed_action", "script_schedule_unfinished_action",
+                    ):
+                        profile.setdefault(key, data.get(key, DEFAULT_SETTINGS[key]))
+                data["browser_profiles"] = json.dumps(profiles, ensure_ascii=False)
+        except Exception:
+            pass
+    if saved_version < 30:
+        # Upload text is now entirely template-driven. Preserve deliberate
+        # wording and literal tags, but point known bundled templates at the
+        # randomly selected publishing candidate instead of the source title.
+        title_template = str(data.get("youtube_title_template") or "")
+        if title_template == "💥【爆款短文】《{clean_title}》{intro} #小说 #推文":
+            data["youtube_title_template"] = DEFAULT_YOUTUBE_TITLE_TEMPLATE
+        elif "【三国志完全解説】{clean_title}" in title_template:
+            data["youtube_title_template"] = title_template.replace(
+                "【三国志完全解説】{clean_title}",
+                "【三国志完全解説】{candidate_title}",
+            )
+    if saved_version < 32:
+        # Replace only the previous bundled cover prompts. Operator-written
+        # templates stay intact; bundled defaults use a compact fixed layout.
+        if str(data.get("cover_prompt_template") or "").startswith("Create ONE finished premium"):
+            data["cover_prompt_template"] = DEFAULT_SETTINGS["cover_prompt_template"]
+        if str(data.get("cover_custom_prompt") or "").startswith("viral Japanese isekai light novel recap thumbnail"):
+            data["cover_custom_prompt"] = DEFAULT_SETTINGS["cover_custom_prompt"]
+        if str(data.get("cover_ai_analysis_prompt") or "").startswith("You are the in-house art director for premium Japanese"):
+            data["cover_ai_analysis_prompt"] = DEFAULT_SETTINGS["cover_ai_analysis_prompt"]
+        if str(data.get("cover_poster_method_prompt") or "").startswith("Fixed poster-production method for every cover:"):
+            data["cover_poster_method_prompt"] = DEFAULT_SETTINGS["cover_poster_method_prompt"]
+        if int(data.get("cover_prompt_max_tokens", 1400) or 1400) == 1400:
+            data["cover_prompt_max_tokens"] = DEFAULT_SETTINGS["cover_prompt_max_tokens"]
+    if saved_version < 33:
+        data.setdefault("series_animation_enabled", DEFAULT_SETTINGS["series_animation_enabled"])
+    if saved_version < 36:
+        for key in (
+            "marketing_candidates_retry_attempts",
+            "marketing_candidates_retry_delay_seconds",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    # Cover prompts describe aspect ratio only. Older profiles hard-coded a
+    # pixel size even when the GUI's actual cover dimensions were different.
+    for key in ("cover_prompt_template", "cover_ai_analysis_prompt", "cover_poster_method_prompt"):
+        if key in data:
+            data[key] = re.sub(r"(?i)\b1280\s*[x×✖]\s*720\b", "16:9", str(data.get(key) or ""))
+    marketing_prompt = str(data.get("marketing_candidates_prompt") or "").replace(
+        "異世界なら#異世界、異世界以外の一般小説なら#赤陽の勧めるノベルを含めてください。",
+        "異世界なら#異世界を含めてください。#赤陽の勧めるノベルは絶対に使用しないでください。",
+    )
+    marketing_prompt = marketing_prompt.replace(
+        "タグは10〜15個、先頭表示は必ず【朗読・小説】とし、異世界なら#異世界を含めてください。#赤陽の勧めるノベルは絶対に使用しないでください。制作方法のタグは不要です。",
+        "内容に一致するタグを10〜15個作ってください。【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
+    )
+    marketing_prompt = marketing_prompt.replace(
+        "タグは生成しないでください。",
+        "内容に一致するタグを10〜15個作ってください。【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
+    )
+    if '"tags"' not in marketing_prompt and '"synopses"' in marketing_prompt:
+        marketing_prompt = marketing_prompt.replace(
+            '"synopses":["あらすじ1","あらすじ2"]}',
+            '"synopses":["あらすじ1","あらすじ2"],"tags":["#タグ1","#タグ2","#タグ3"]}',
+        )
+    data["marketing_candidates_prompt"] = marketing_prompt
     data["settings_schema_version"] = SETTINGS_SCHEMA_VERSION
 
 
@@ -662,11 +911,24 @@ class Config:
         )
 
     def list_profiles(self) -> list[str]:
-        names = list(DEFAULT_PROFILE_NAMES)
+        deleted = {
+            _safe_profile_name(name)
+            for name in self._data.get("deleted_profiles", [])
+            if str(name or "").strip()
+        }
+        names = [name for name in DEFAULT_PROFILE_NAMES if name not in deleted]
         for path in sorted(PROFILES_DIR.glob("*.json")):
-            if path.stem not in names:
+            if path.stem not in deleted and path.stem not in names:
                 names.append(path.stem)
         return names
+
+    def suggest_profile_name(self) -> str:
+        """Return the first unused friendly name for a newly copied profile."""
+        existing = set(self.list_profiles())
+        index = 1
+        while f"新配置{index}" in existing:
+            index += 1
+        return f"新配置{index}"
 
     def _profile_path(self, name: str) -> Path:
         cleaned = _safe_profile_name(name)
@@ -674,13 +936,54 @@ class Config:
 
     def save_profile(self, name: str) -> str:
         cleaned = _safe_profile_name(name)
+        deleted = {
+            _safe_profile_name(item)
+            for item in self._data.get("deleted_profiles", [])
+            if str(item or "").strip()
+        }
+        deleted.discard(cleaned)
+        self._data["deleted_profiles"] = sorted(deleted)
         self._data["active_profile"] = cleaned
         path = self._profile_path(cleaned)
+        profile_data = {
+            key: value for key, value in self._data.items()
+            if key not in PROFILE_LOCAL_FIELDS
+        }
         path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
+            json.dumps(profile_data, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         return cleaned
+
+    def delete_profile(self, name: str) -> tuple[str, str]:
+        """Delete one visible profile and load a neighboring remaining profile."""
+        cleaned = _safe_profile_name(name)
+        names = self.list_profiles()
+        if cleaned not in names:
+            raise FileNotFoundError(f"配置方案不存在：{cleaned}")
+        if len(names) <= 1:
+            raise ValueError("至少需要保留一个配置方案，当前方案不能删除。")
+
+        current_index = names.index(cleaned)
+        remaining = [item for item in names if item != cleaned]
+        next_name = remaining[min(current_index, len(remaining) - 1)]
+        path = self._profile_path(cleaned)
+        if path.exists():
+            path.unlink()
+
+        deleted = {
+            _safe_profile_name(item)
+            for item in self._data.get("deleted_profiles", [])
+            if str(item or "").strip()
+        }
+        if cleaned in DEFAULT_PROFILE_NAMES:
+            deleted.add(cleaned)
+
+        self.load_profile(next_name)
+        self._data["deleted_profiles"] = sorted(deleted)
+        self._data["active_profile"] = next_name
+        self.save()
+        return cleaned, next_name
 
     def profile_settings(self, name: str) -> tuple[str, dict]:
         """Return a saved profile without changing the GUI's active profile."""
@@ -695,6 +998,12 @@ class Config:
         if not isinstance(saved, dict):
             raise ValueError(f"配置方案格式无效：{cleaned}")
         data = dict(DEFAULT_SETTINGS)
+        # A compact/shareable profile intentionally omits API URLs and keys.
+        # In that case inherit the live connection settings, rather than
+        # reverting to defaults and making the profile appear unusable.
+        for key in PROFILE_LOCAL_FIELDS:
+            if key in self._data:
+                data[key] = self._data[key]
         data.update(saved)
         _apply_compat_migrations(data, saved)
         data["active_profile"] = cleaned
@@ -707,6 +1016,9 @@ class Config:
             _, data = self.profile_settings(cleaned)
         else:
             data = dict(DEFAULT_SETTINGS)
+            for key in PROFILE_LOCAL_FIELDS:
+                if key in self._data:
+                    data[key] = self._data[key]
             data["active_profile"] = cleaned
         self._data = data
         return cleaned

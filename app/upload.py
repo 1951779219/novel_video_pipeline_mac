@@ -63,6 +63,9 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
                        auto_restart: bool = True,
                        stall_timeout_min: int = 10,
                        op_speed: str = "normal",
+                       schedule_enabled: bool = False,
+                       scheduled_at: str = "",
+                       schedule_timezone: str = "Asia/Tokyo",
                        on_log: Callable = print,
                        on_progress: Callable = lambda x: None) -> Optional[str]:
     """visibility: PUBLIC / UNLISTED / PRIVATE"""
@@ -82,6 +85,9 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
         browser_upload_all_profiles=bool(upload_all_profiles),
         browser_ad_suitability_template=ad_suitability_template or "",
         youtube_description=description,
+        youtube_schedule_enabled=bool(schedule_enabled),
+        youtube_scheduled_at=str(scheduled_at or ""),
+        youtube_schedule_timezone=str(schedule_timezone or "Asia/Tokyo"),
     )
     profile = {
         "name": browser_active_profile or "novel",
@@ -93,6 +99,9 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
         "visibility": visibility,
         "description": description,
         "ad_suitability_template": ad_suitability_template or "",
+        "schedule_enabled": bool(schedule_enabled),
+        "scheduled_at": str(scheduled_at or ""),
+        "schedule_timezone": str(schedule_timezone or "Asia/Tokyo"),
     }
     try:
         return mod.upload_via_browser(

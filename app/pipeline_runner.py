@@ -13,12 +13,14 @@ import re
 import shlex
 import shutil
 import signal
+import secrets
 import subprocess
 import sys
 import time
 import traceback
 import threading
 import unicodedata
+from datetime import datetime, timedelta
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import asdict
 from pathlib import Path
@@ -66,6 +68,7 @@ LogFn = Callable[[str], None]
 ProgFn = Callable[[float], None]
 IMAGE_FAILURE_DECISION_FILE = "image_failure_decision.json"
 IMAGE_SELECTION_FILE = "image_selection.json"
+TTS_REDO_REUSE_IMAGES_FILE = "tts_redo_reuse_images.json"
 SETTINGS_SNAPSHOT_FILE = "settings_snapshot.json"
 
 
@@ -80,6 +83,7 @@ class ImageGenerationFailed(RuntimeError):
 
 class ImageGenerationSkipped(RuntimeError):
     """The operator chose to leave an image-failed job for later handling."""
+
 
 def _parallel_limit(config_key: str, default: int, total: int, hard_cap: int = 16) -> int:
     try:
@@ -127,6 +131,24 @@ def _llm_route_settings() -> dict:
 
 def _can_call_text_llm() -> bool:
     route = _llm_route_settings()
+    return bool(route["api_key"]) or route["provider"] in {"ollama", "custom"}
+
+
+def _pronunciation_dictionary_route_settings() -> dict:
+    """Use the existing text route unless the operator enables dictionary overrides."""
+    route = _llm_route_settings()
+    if not bool(config.get("pronunciation_dictionary_dedicated_api_enabled", False)):
+        return route
+    return {
+        "provider": route["provider"],
+        "base_url": str(config.get("pronunciation_dictionary_base_url", "") or route["base_url"]).strip(),
+        "api_key": str(config.get("pronunciation_dictionary_api_key", "") or route["api_key"]).strip(),
+        "model": str(config.get("pronunciation_dictionary_model", "") or route["model"]).strip(),
+    }
+
+
+def _can_call_pronunciation_dictionary_llm() -> bool:
+    route = _pronunciation_dictionary_route_settings()
     return bool(route["api_key"]) or route["provider"] in {"ollama", "custom"}
 
 
@@ -234,6 +256,7 @@ def export_completed_video(
     cover_path: Path | None,
     title: str,
     short_title: str = "",
+    source_path: str = "",
     on_log: LogFn = _noop,
 ) -> Path | None:
     """Export one completed task as a self-contained delivery folder.
@@ -242,6 +265,24 @@ def export_completed_video(
     for resume and optional YouTube upload.  The delivery folder is an
     additional stable hand-off package for workflows where publishing is off.
     """
+    source = Path(str(source_path or "")).expanduser()
+    if bool(config.get("output_to_input_directory", False)) and source.is_file():
+        try:
+            destination_dir = source.parent.resolve()
+            base = safe_job_name(source.stem, fallback="article")
+            shutil.copy2(video_path, destination_dir / f"{base}.mp4")
+            if cover_path is not None and cover_path.exists():
+                shutil.copy2(cover_path, destination_dir / f"{base}_cover{cover_path.suffix.lower() or '.jpg'}")
+            title_lines = [f"系列标题：{title.strip() or video_path.stem}"]
+            if short_title.strip():
+                title_lines.append(f"本集标题：{short_title.strip()}")
+            (destination_dir / f"{base}_标题.txt").write_text("\n".join(title_lines) + "\n", encoding="utf-8")
+            on_log(f"  OK 成品已输出回原文件夹: {destination_dir}")
+            return destination_dir
+        except Exception as exc:
+            on_log(f"  ⚠️ 输出回原文件夹失败（任务内成品仍保留）: {exc}")
+            return None
+
     configured = str(config.get("output_directory", "") or "").strip()
     if not configured:
         return None
@@ -400,6 +441,7 @@ def load_status(job_id: str, *, include_worker: bool = True) -> dict:
 
 _STAGE_LABELS = {
     "queued": "等待启动",
+    "paused": "已暂停",
     "starting": "启动中",
     "scrape": "1/6 读取文本",
     "clean": "2/6 整理/洗稿切片",
@@ -620,27 +662,114 @@ def clear_job_media_cache(job_id: str) -> None:
     append_log(path, "media cache cleared: images/cover/final video will regenerate")
 
 
-def start_worker(input_text: str, job_id: str | None = None, resume: bool = False, compose_only: bool = False) -> tuple[str, int]:
-    """Start a detached worker process and return (job_id, pid)."""
+def reset_full_job(job_id: str) -> dict:
+    """Reset every generated stage while preserving operator-owned inputs.
+
+    The settings snapshot is intentionally removed so the next start freezes
+    the configuration currently visible in the GUI. Imported narration and a
+    manually attached pronunciation dictionary are user inputs, not caches.
+    """
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再执行全部重试。")
+    path = _safe_job_path(job_id)
+    if not path.exists():
+        raise FileNotFoundError(f"任务不存在：{job_id}")
+
+    imported_audio = (path / IMPORTED_AUDIO_MANIFEST).exists()
+    for name in ("images", "_prefetch_images", "cover", "characters", "_clips"):
+        target = path / name
+        if target.exists():
+            shutil.rmtree(target)
+
+    audio_dir = path / "audio"
+    if audio_dir.exists():
+        if imported_audio:
+            for child in audio_dir.iterdir():
+                if child.name != IMPORTED_AUDIO_FILENAME:
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink(missing_ok=True)
+        else:
+            shutil.rmtree(audio_dir)
+
+    generated_files = (
+        SETTINGS_SNAPSHOT_FILE,
+        IMAGE_FAILURE_DECISION_FILE,
+        IMAGE_SELECTION_FILE,
+        TTS_REDO_REUSE_IMAGES_FILE,
+        "novel.json", "metadata.json", "marketing_candidates.json",
+        "タイトル・あらすじ候補.txt", "タイトル・あらすじ・タグ候補.txt",
+        "upload_title_selection.json", "performance.json", "result.json", "upload_result.json",
+        "text_rewritten.txt", "text_rewrite_report.json", "text_tts_ready.txt",
+        "segments.json", "durations.json", "plans.json", "plans_prefetch.json", "prompts.json",
+        "story_visual_context.json", "character_profiles.json", "character_reference_manifest.json",
+        "tts_auto_pronunciation_dictionary.txt", "tts_auto_pronunciation_report.json",
+        "audio_full.mp3", "imported_audio_timing.json", "compose_manifest.json",
+        "subtitle.ass", "subtitle.srt",
+    )
+    for name in generated_files:
+        (path / name).unlink(missing_ok=True)
+    for video_path in {path / "final.mp4", video_output_path(path)}:
+        video_path.unlink(missing_ok=True)
+        video_path.with_name(video_path.stem + ".tmp" + video_path.suffix).unlink(missing_ok=True)
+
+    write_status(
+        path,
+        job_id=job_id,
+        stage="queued",
+        progress=0.0,
+        worker_pid=None,
+        error="",
+        video="",
+        cover="",
+        youtube_url="",
+        image_failure=None,
+    )
+    append_log(path, "full retry reset: all generated stages cleared; current GUI settings will be snapshotted")
+    return {"job_id": job_id, "imported_audio_preserved": imported_audio}
+
+
+def start_worker(
+    input_text: str,
+    job_id: str | None = None,
+    resume: bool = False,
+    compose_only: bool = False,
+    marketing_cover_only: bool = False,
+) -> tuple[str, int]:
+    """Start a detached worker, or durably queue it when capacity is full.
+
+    A queued result returns ``(job_id, 0)``. The requested launch mode is kept
+    in status.json so ``start_next_queued_job`` can dispatch it unchanged.
+    """
     job_id = job_id or new_job_id("pipeline")
     job_dir = job_dir_for(job_id)
     if job_dir.exists() and not resume:
         raise FileExistsError(f"job directory already exists: {job_dir}")
 
-    max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
-    running = count_running_workers()
-    if running >= max_jobs:
-        raise RuntimeError(
-            f"已达到最大并行任务数限制 ({running}/{max_jobs})，请等待当前任务完成后再启动新任务。"
-            "可在配置中调整 max_concurrent_jobs 提高上限。"
-        )
     job_dir.mkdir(parents=True, exist_ok=True)
 
-    # Freeze all settings for this worker.  A later GUI profile switch must not
-    # change an already launched (or auto-started) job's AI prompts or routes.
+    # Freeze settings before either launching or queueing. A later GUI profile
+    # switch must not change the queued job's prompts, routes, or TTS settings.
     settings_snapshot = job_dir / SETTINGS_SNAPSHOT_FILE
     if not settings_snapshot.exists():
         _write_settings_snapshot(job_dir, config.as_dict())
+
+    max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
+    running = count_running_workers()
+    if running >= max_jobs:
+        write_status(
+            job_dir,
+            job_id=job_id,
+            input=input_text,
+            stage="queued",
+            worker_pid=None,
+            error="",
+            queued_compose_only=bool(compose_only),
+            queued_marketing_cover_only=bool(marketing_cover_only),
+        )
+        append_log(job_dir, f"worker queued automatically: capacity {running}/{max_jobs}")
+        return job_id, 0
 
     command = [
         sys.executable,
@@ -656,6 +785,8 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
         command.append("--resume")
     if compose_only:
         command.append("--compose-only")
+    if marketing_cover_only:
+        command.append("--marketing-cover-only")
 
     env = os.environ.copy()
     env["PYTHONUTF8"] = "1"
@@ -679,7 +810,16 @@ def start_worker(input_text: str, job_id: str | None = None, resume: bool = Fals
     worker_log = job_dir / "worker.log"
     append_log(job_dir, f"configuration snapshot: {settings_snapshot.name} (profile={config.get('active_profile', '')})")
     append_log(job_dir, f"dispatch worker: {' '.join(command)}")
-    write_status(job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.0, worker_pid=None)
+    write_status(
+        job_dir,
+        job_id=job_id,
+        input=input_text,
+        stage="queued",
+        progress=0.0,
+        worker_pid=None,
+        queued_compose_only=False,
+        queued_marketing_cover_only=False,
+    )
     with worker_log.open("a", encoding="utf-8", buffering=1) as log_handle:
         process = subprocess.Popen(
             command,
@@ -745,7 +885,15 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
         if not input_text:
             continue
         try:
-            started = start_worker(input_text, job_id=job_id, resume=True)
+            started = start_worker(
+                input_text,
+                job_id=job_id,
+                resume=True,
+                compose_only=bool(st.get("queued_compose_only", False)),
+                marketing_cover_only=bool(st.get("queued_marketing_cover_only", False)),
+            )
+            if started[1] <= 0:
+                return None
             on_log(f"  auto-started waiting job {job_id} pid={started[1]}")
             return started
         except RuntimeError:
@@ -1047,8 +1195,9 @@ def _rewrite_story_text(text: str, on_log: LogFn = _noop, job_dir: Path | None =
         return source
 
     started_chars = len(source)
+    series_context = _series_context_for_job(job_dir, source, on_log)
     try:
-        rewritten = _ai_rewrite_paragraphs(paragraphs, on_log)
+        rewritten = _ai_rewrite_paragraphs(paragraphs, on_log, series_context=series_context)
     except Exception as exc:
         on_log(f"  WARN AI 洗稿失败，已保留原文: {exc}")
         return source
@@ -1174,7 +1323,7 @@ def _generate_auto_pronunciation_dictionary(text: str, on_log: LogFn = _noop, jo
     if config.tts_provider != "edge":
         on_log("  自动读音词典仅适用于 Edge TTS，已跳过")
         return
-    if not _can_call_text_llm():
+    if not _can_call_pronunciation_dictionary_llm():
         on_log("  自动读音词典已开启，但未配置文本 API；已跳过")
         return
     try:
@@ -1185,13 +1334,15 @@ def _generate_auto_pronunciation_dictionary(text: str, on_log: LogFn = _noop, jo
     if not candidates:
         on_log("  自动读音词典：未发现高风险日语词")
         return
-    system = (
-        "你是日语 TTS 读音词典助手。只为用户给出的候选词提供日语假名读音。"
-        "只输出严格的 `原词=假名读音`，每行一条；不得输出解释、标题、Markdown，"
-        "不得添加候选列表以外的词，不确定时直接省略该词。"
-        "读音只能使用平假名、片假名、中点或长音符。"
-    )
-    route = _llm_route_settings()
+    system = str(config.get("pronunciation_dictionary_prompt", "") or "").strip()
+    if not system:
+        system = (
+            "你是日语 TTS 生词词典助手。只为用户给出的候选词提供准确的日语假名读音。"
+            "只输出严格的“原词=假名读音”，每行一条；不得输出解释、标题或 Markdown，"
+            "不得添加候选列表以外的词，不确定时直接省略。"
+            "读音只能使用平假名、片假名、中点或长音符。"
+        )
+    route = _pronunciation_dictionary_route_settings()
     llm = LLMBackend(
         provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"], model=route["model"],
         system_prompt=system, temperature=0.0, max_tokens=max(200, min(1200, len(candidates) * 24)), timeout=90.0,
@@ -1212,7 +1363,15 @@ def _generate_auto_pronunciation_dictionary(text: str, on_log: LogFn = _noop, jo
         if written in candidate_set and written not in seen and _JP_READING_RE.fullmatch(reading or ""):
             seen.add(written)
             entries.append((written, reading))
-    _write_json(report_path, {"candidates": candidates, "entries": [{"written": w, "reading": r} for w, r in entries]})
+    _write_json(
+        report_path,
+        {
+            "candidates": candidates,
+            "entries": [{"written": w, "reading": r} for w, r in entries],
+            "model": route["model"],
+            "dedicated_api": bool(config.get("pronunciation_dictionary_dedicated_api_enabled", False)),
+        },
+    )
     if not entries:
         on_log(f"  自动读音词典：API 未返回可用条目（候选 {len(candidates)} 个）")
         return
@@ -1231,7 +1390,191 @@ def _split_rewrite_paragraphs(text: str) -> list[str]:
     return paragraphs
 
 
-def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn) -> str:
+SERIES_BIBLE_FILENAME = ".novel_video_series_bible.json"
+
+
+def series_animation_enabled_for_job(job_dir: Path | None) -> bool:
+    if not bool(config.get("series_animation_enabled", True)):
+        return False
+    if job_dir is None:
+        return True
+    status = _read_json(job_dir / "status.json", {})
+    return str(status.get("series_animation_mode") or "auto").strip().lower() != "single"
+
+
+def _series_context_for_job(job_dir: Path | None, text: str, on_log: LogFn) -> str:
+    """Load/update the durable naming bible shared by TXT files in one folder."""
+    if not series_animation_enabled_for_job(job_dir):
+        return ""
+    if job_dir is None:
+        return ""
+    status = _read_json(job_dir / "status.json", {})
+    source_path = Path(str(status.get("source_path") or status.get("input") or "")).expanduser()
+    if not source_path.is_file():
+        return ""
+    bible_path = source_path.parent / SERIES_BIBLE_FILENAME
+    bible = _read_json(bible_path, {})
+    if not isinstance(bible, dict):
+        bible = {}
+    bible.setdefault("source_folder", source_path.parent.name)
+    bible.setdefault("series_title", source_path.parent.name)
+    bible.setdefault("entities", [])
+    bible.setdefault("terms", [])
+    # A small, separate extraction call lets later parts add newly introduced
+    # characters without ever changing names already recorded by part 1.
+    if _can_call_text_llm():
+        try:
+            route = _llm_route_settings()
+            llm = LLMBackend(
+                provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"], model=route["model"],
+                system_prompt="You maintain a continuity bible for a Chinese novel adaptation.",
+                temperature=0.0, max_tokens=1400, timeout=90.0,
+            )
+            existing = json.dumps({"series_title": bible["series_title"], "entities": bible["entities"], "terms": bible["terms"]}, ensure_ascii=False)
+            request = (
+                "Return JSON only: {\"series_title\": string, \"entities\":[{\"source\":string,\"localized\":string,\"role\":string}],\"terms\":[{\"source\":string,\"localized\":string}]}. "
+                "Use Chinese localized names. Keep every existing source/localized mapping exactly unchanged; only add new names or terms visible in this excerpt. "
+                f"Existing bible: {existing}\nExcerpt:\n{text[:9000]}"
+            )
+            with external_api_slot(action="series continuity bible"):
+                addition = parse_json_object(llm.complete(llm.system_prompt, request, temperature=0.0))
+            if isinstance(addition, dict):
+                if str(addition.get("series_title") or "").strip() and bible["series_title"] == source_path.parent.name:
+                    bible["series_title"] = str(addition["series_title"]).strip()
+                for key in ("entities", "terms"):
+                    current = [item for item in bible.get(key, []) if isinstance(item, dict)]
+                    known = {str(item.get("source") or "").strip() for item in current}
+                    for item in addition.get(key, []):
+                        if not isinstance(item, dict):
+                            continue
+                        source_name = str(item.get("source") or "").strip()
+                        localized = str(item.get("localized") or "").strip()
+                        if source_name and localized and source_name not in known:
+                            current.append({"source": source_name, "localized": localized, **({"role": str(item.get("role") or "").strip()} if key == "entities" else {})})
+                            known.add(source_name)
+                    bible[key] = current
+        except Exception as exc:
+            on_log(f"  WARN 系列设定卡更新失败，将使用已有设定: {exc}")
+    bible["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        temp = bible_path.with_name(f".{bible_path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(bible, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, bible_path)
+    except Exception as exc:
+        on_log(f"  WARN 无法写入系列设定卡: {exc}")
+    _write_json(job_dir / "series_bible_used.json", bible)
+    mappings = []
+    for key in ("entities", "terms"):
+        mappings.extend(
+            f"{item.get('source')} → {item.get('localized')}" for item in bible.get(key, [])
+            if isinstance(item, dict) and item.get("source") and item.get("localized")
+        )
+    if mappings:
+        on_log(f"  系列设定卡：{bible.get('series_title')}，固定映射 {len(mappings)} 条")
+    return (
+        f"\n\n【跨分段系列设定卡（必须严格遵守）】\n系列中文名：{bible.get('series_title')}\n"
+        "以下原名必须始终替换为右侧中文名；不得重新命名、缩写或改用别名。新出现的专有名词也要保持前后一致。\n"
+        + "\n".join(mappings)
+    )
+
+
+def _apply_series_title_to_novel(novel: Novel, job_dir: Path, on_log: LogFn) -> None:
+    """Make cover/upload titles visibly related while preserving source files."""
+    status = _read_json(job_dir / "status.json", {})
+    source_path = Path(str(status.get("source_path") or status.get("input") or "")).expanduser()
+    if not source_path.is_file():
+        return
+    bible = _read_json(source_path.parent / SERIES_BIBLE_FILENAME, {})
+    series_title = str(bible.get("series_title") or source_path.parent.name).strip() if isinstance(bible, dict) else source_path.parent.name
+    if not series_title:
+        return
+    match = re.search(r"(?:[_-]|第)0*(\d{1,3})$", source_path.stem)
+    episode = int(match.group(1)) if match else 0
+    original_title = novel.title
+    novel.title = f"{series_title}｜第{episode}集" if episode else series_title
+    write_status(job_dir, source_title=original_title, series_title=series_title, series_episode=episode)
+    on_log(f"  系列标题：{novel.title}")
+
+
+def register_imported_series_job(job_id: str, source_value: str | Path) -> dict:
+    """Detect split-series membership immediately when a local TXT is imported."""
+    source = Path(str(source_value)).expanduser()
+    if not source.is_file():
+        return {}
+    match = re.search(r"(?:[_-]|第)0*(\d{1,3})$", source.stem)
+    if not match:
+        return {}
+    episode = int(match.group(1))
+    base_stem = source.stem[: match.start()].rstrip(" _-")
+    siblings: list[tuple[int, Path]] = []
+    for candidate in source.parent.glob(f"*{source.suffix}"):
+        sibling_match = re.search(r"(?:[_-]|第)0*(\d{1,3})$", candidate.stem)
+        if not sibling_match:
+            continue
+        sibling_base = candidate.stem[: sibling_match.start()].rstrip(" _-")
+        if unicodedata.normalize("NFKC", sibling_base) != unicodedata.normalize("NFKC", base_stem):
+            continue
+        siblings.append((int(sibling_match.group(1)), candidate))
+    if len(siblings) < 2:
+        return {}
+    total = max(value for value, _path in siblings)
+    series_title = source.parent.name.strip() or base_stem
+    payload = {
+        "series_title": series_title,
+        "series_episode": episode,
+        "series_total": total,
+        "series_group_key": _stable_hash({
+            "directory": str(source.parent.resolve()),
+            "base": unicodedata.normalize("NFKC", base_stem),
+        })[:20],
+    }
+    write_status(job_dir_for(job_id), **payload)
+    append_log(
+        job_dir_for(job_id),
+        f"series detected at import: {series_title} episode={episode}/{total}",
+    )
+    return payload
+
+
+def series_start_choice_info(job_id: str, selected_job_ids: Iterable[str] = ()) -> dict:
+    """Describe a partial-series launch that needs an operator choice."""
+    job_dir = job_dir_for(job_id)
+    group, expected = _series_group_job_dirs(job_dir)
+    if not bool(config.get("series_animation_enabled", True)) or expected < 2 or len(group) < 2:
+        return {}
+    selected = {str(value) for value in selected_job_ids}
+    group_ids = [path.name for path in group]
+    if selected and all(value in selected for value in group_ids):
+        return {}
+    status = _read_json(job_dir / "status.json", {})
+    if str(status.get("series_animation_mode") or "").strip().lower() in {"series", "single"}:
+        return {}
+    return {
+        "series_title": str(status.get("series_title") or job_dir.name),
+        "episode": int(status.get("series_episode") or 0),
+        "total": expected,
+        "group_job_ids": group_ids,
+    }
+
+
+def set_job_series_animation_mode(job_id: str, mode: str) -> None:
+    normalized = "series" if str(mode).lower() == "series" else "single"
+    job_dir = job_dir_for(job_id)
+    write_status(job_dir, series_animation_mode=normalized)
+    if normalized == "single":
+        metadata_path = job_dir / "metadata.json"
+        metadata = _read_json(metadata_path, {})
+        if isinstance(metadata, dict) and metadata_path.exists():
+            for key in (
+                "series_short_title", "series_part_label", "series_upload_prefix",
+                "series_cover_label", "series_display_title",
+            ):
+                metadata.pop(key, None)
+            _write_json(metadata_path, metadata)
+    append_log(job_dir, f"series animation launch mode: {normalized}")
+
+
+def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn, series_context: str = "") -> str:
     batch_chars = max(800, int(config.get("ai_rewrite_batch_chars", 3500) or 3500))
     max_tokens = max(1200, min(8192, int(batch_chars * 1.6)))
     route = _llm_route_settings()
@@ -1240,7 +1583,7 @@ def _ai_rewrite_paragraphs(paragraphs: list[str], on_log: LogFn) -> str:
         base_url=route["base_url"],
         api_key=route["api_key"],
         model=route["model"],
-        system_prompt=str(config.get("ai_rewrite_prompt", "") or ""),
+        system_prompt=str(config.get("ai_rewrite_prompt", "") or "") + str(series_context or ""),
         style_suffix="",
         temperature=0.45,
         max_tokens=max_tokens,
@@ -1285,6 +1628,18 @@ def _strip_llm_fences(text: str) -> str:
         if value.startswith(prefix):
             value = value[len(prefix):].strip()
     return value
+
+
+def _is_transient_json_response_error(error: str) -> bool:
+    """Whether a text-model failure is worth pausing for before retrying.
+
+    A bad title bundle can be corrected immediately by tightening the prompt,
+    while a missing JSON object normally means an upstream model/relay briefly
+    returned an unrelated response.  Pausing only for the latter keeps an
+    unattended queue moving without delaying deterministic validation errors.
+    """
+    text = str(error or "").lower()
+    return "llm did not return a json object" in text
 
 
 def _stable_hash(value) -> str:
@@ -1334,14 +1689,30 @@ def _tts_config_hash() -> str:
 
 TTS_PRONUNCIATION_DICTIONARY = "tts_pronunciation_dictionary.txt"
 TTS_AUTO_PRONUNCIATION_DICTIONARY = "tts_auto_pronunciation_dictionary.txt"
+TTS_MANUAL_PRONUNCIATION_PROVIDERS = {"edge", "voicevox"}
 IMPORTED_AUDIO_MANIFEST = "imported_audio.json"
 IMPORTED_AUDIO_FILENAME = "imported_narration.mp3"
 
 
-def parse_pronunciation_dictionary(text: str) -> list[tuple[str, str]]:
+class PronunciationDictionaryConflictError(ValueError):
+    """Raised when one written form has multiple candidate readings."""
+
+    def __init__(self, conflicts: list[dict]):
+        self.conflicts = conflicts
+        summary = "；".join(
+            f"“{item['written']}”：{' / '.join(item['readings'])}" for item in conflicts
+        )
+        super().__init__(f"读音词典中有重复词语需要选择读音：{summary}")
+
+
+def parse_pronunciation_dictionary(
+    text: str,
+    conflict_choices: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
     """Parse `written=reading` lines and return longest terms first."""
-    readings: dict[str, str] = {}
+    candidates: dict[str, list[str]] = {}
     first_seen: dict[str, int] = {}
+    line_numbers: dict[str, list[int]] = {}
     for line_number, raw_line in enumerate(str(text or "").lstrip("\ufeff").splitlines(), start=1):
         line = raw_line.strip()
         if not line or line.startswith("#") or line.startswith("//"):
@@ -1352,31 +1723,49 @@ def parse_pronunciation_dictionary(text: str) -> list[tuple[str, str]]:
         written, reading = (part.strip() for part in line.split(separator, 1))
         if not written or not reading:
             raise ValueError(f"读音词典第 {line_number} 行的词语或读音为空")
-        previous = readings.get(written)
-        if previous is not None and previous != reading:
-            raise ValueError(
-                f"读音词典中的“{written}”有两个不同读音：{previous} / {reading}；"
-                "请只保留本任务需要的一个读音"
-            )
         if written not in first_seen:
             first_seen[written] = len(first_seen)
-        readings[written] = reading
-    if not readings:
+        values = candidates.setdefault(written, [])
+        if reading not in values:
+            values.append(reading)
+        line_numbers.setdefault(written, []).append(line_number)
+    if not candidates:
         raise ValueError("读音词典中没有可用条目；格式应为：汉字词语=假名读音")
+    conflicts = [
+        {"written": written, "readings": values, "lines": line_numbers[written]}
+        for written, values in candidates.items()
+        if len(values) > 1
+    ]
+    choices = conflict_choices or {}
+    unresolved = [
+        item for item in conflicts
+        if choices.get(item["written"]) not in item["readings"]
+    ]
+    if unresolved:
+        raise PronunciationDictionaryConflictError(unresolved)
+    readings = {
+        written: choices.get(written, values[0])
+        for written, values in candidates.items()
+    }
     return sorted(readings.items(), key=lambda item: (-len(item[0]), first_seen[item[0]]))
 
 
-def inspect_pronunciation_dictionary(source_path: str | Path) -> dict:
+def inspect_pronunciation_dictionary(
+    source_path: str | Path,
+    conflict_choices: dict[str, str] | None = None,
+) -> dict:
     path = Path(source_path).expanduser()
     if not path.exists() or not path.is_file():
         raise FileNotFoundError(f"找不到读音词典：{path}")
     source = path.read_text(encoding="utf-8-sig")
-    entries = parse_pronunciation_dictionary(source)
+    entries = parse_pronunciation_dictionary(source, conflict_choices=conflict_choices)
     normalized = source.lstrip("\ufeff")
+    if conflict_choices:
+        normalized = "".join(f"{written}={reading}\n" for written, reading in entries)
     return {
         "path": str(path),
         "entries": len(entries),
-        "text": source,
+        "text": normalized if conflict_choices else source,
         "hash": _text_hash(normalized),
     }
 
@@ -1396,11 +1785,52 @@ def _apply_pronunciation_dictionary(text: str, entries: list[tuple[str, str]]) -
     return pattern.sub(replace, str(text)), replacements
 
 
-def attach_pronunciation_dictionary(job_id: str, source_path: str | Path) -> dict:
+def _prepare_tts_pronunciation(
+    segments: list[Segment],
+    job_dir: Path,
+    provider: str,
+) -> tuple[list[str], list[int], list[tuple[str, str]], str]:
+    """Build temporary narration text without changing subtitle source segments."""
+    provider = str(provider or "").strip().lower()
+    dictionary_path = job_dir / TTS_PRONUNCIATION_DICTIONARY
+    auto_dictionary_path = job_dir / TTS_AUTO_PRONUNCIATION_DICTIONARY
+    narration_texts = [seg.text for seg in segments]
+    replacement_counts = [0 for _seg in segments]
+
+    # Uploaded dictionaries are safe text substitutions for both Edge and
+    # VOICEVOX. Auto-generated readings remain Edge-only by design.
+    manual_source = ""
+    if dictionary_path.exists() and provider in TTS_MANUAL_PRONUNCIATION_PROVIDERS:
+        manual_source = dictionary_path.read_text(encoding="utf-8-sig")
+    generated_source = ""
+    if auto_dictionary_path.exists() and provider == "edge":
+        generated_source = auto_dictionary_path.read_text(encoding="utf-8-sig")
+    if not manual_source.strip() and not generated_source.strip():
+        return narration_texts, replacement_counts, [], ""
+
+    generated_entries = parse_pronunciation_dictionary(generated_source) if generated_source.strip() else []
+    manual_entries = parse_pronunciation_dictionary(manual_source) if manual_source.strip() else []
+    merged_readings = {written: reading for written, reading in generated_entries}
+    merged_readings.update({written: reading for written, reading in manual_entries})
+    dictionary_entries = sorted(merged_readings.items(), key=lambda item: -len(item[0]))
+    dictionary_hash = _text_hash(
+        generated_source.lstrip("\ufeff") + "\n--manual--\n" + manual_source.lstrip("\ufeff")
+    )
+    applied = [_apply_pronunciation_dictionary(seg.text, dictionary_entries) for seg in segments]
+    narration_texts = [item[0] for item in applied]
+    replacement_counts = [item[1] for item in applied]
+    return narration_texts, replacement_counts, dictionary_entries, dictionary_hash
+
+
+def attach_pronunciation_dictionary(
+    job_id: str,
+    source_path: str | Path,
+    conflict_choices: dict[str, str] | None = None,
+) -> dict:
     """Copy a validated pronunciation dictionary into a job and invalidate its TTS."""
     if is_worker_running(job_id):
         raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再附加读音词典。")
-    info = inspect_pronunciation_dictionary(source_path)
+    info = inspect_pronunciation_dictionary(source_path, conflict_choices=conflict_choices)
     job_dir = _safe_job_path(job_id)
     job_dir.mkdir(parents=True, exist_ok=True)
     target = job_dir / TTS_PRONUNCIATION_DICTIONARY
@@ -2036,6 +2466,37 @@ def reset_tts_unfinished_segments(job_id: str) -> dict:
     return {"job_id": job_id, "changed": len(changed), "segments": changed}
 
 
+def redo_all_tts_reuse_images(job_id: str) -> dict:
+    """Regenerate every TTS segment, then recompose strictly with existing images.
+
+    This durable mode is used by the desktop UI's full TTS redo action.  It
+    deliberately prevents both scene-image and cover generation when the job
+    resumes, while allowing image durations to be recalculated for the new
+    narration.
+    """
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再重做 TTS。")
+    job_dir = _safe_job_path(job_id)
+    images = _valid_scene_images(job_dir)
+    if not images:
+        raise RuntimeError("没有可复用的图片，无法执行“仅重做 TTS”。")
+    segments = _load_job_segments(job_dir)
+    if not segments:
+        raise RuntimeError("没有可用的文本分段，无法重做 TTS。")
+
+    # Capture the image-only decision before plans.json is cleared by the TTS
+    # reset.  The resumed run creates a new timing plan with this same count.
+    set_image_fallback_selection(job_id, "cycle")
+    result = reset_tts_segments(job_id, indices=range(len(segments)))
+    _write_json(job_dir / TTS_REDO_REUSE_IMAGES_FILE, {
+        "mode": "reuse_existing_images_only",
+        "images": len(images),
+        "requested_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    append_log(job_dir, "full TTS redo requested: existing scene images and cover are locked; image APIs are disabled")
+    return {**result, "images_reused": len(images)}
+
+
 def _stage_tts_manifest_impl(
     segments: list[Segment],
     job_dir: Path,
@@ -2044,23 +2505,11 @@ def _stage_tts_manifest_impl(
 ) -> tuple[list[Path], list[float]]:
     dictionary_path = job_dir / TTS_PRONUNCIATION_DICTIONARY
     auto_dictionary_path = job_dir / TTS_AUTO_PRONUNCIATION_DICTIONARY
-    dictionary_entries: list[tuple[str, str]] = []
-    dictionary_hash = ""
-    narration_texts = [seg.text for seg in segments]
-    replacement_counts = [0 for _seg in segments]
-    if (dictionary_path.exists() or auto_dictionary_path.exists()) and config.tts_provider == "edge":
-        # The manually attached dictionary wins over API-generated entries.
-        generated_source = auto_dictionary_path.read_text(encoding="utf-8-sig") if auto_dictionary_path.exists() else ""
-        manual_source = dictionary_path.read_text(encoding="utf-8-sig") if dictionary_path.exists() else ""
-        generated_entries = parse_pronunciation_dictionary(generated_source) if generated_source.strip() else []
-        manual_entries = parse_pronunciation_dictionary(manual_source) if manual_source.strip() else []
-        merged_readings = {written: reading for written, reading in generated_entries}
-        merged_readings.update({written: reading for written, reading in manual_entries})
-        dictionary_entries = sorted(merged_readings.items(), key=lambda item: -len(item[0]))
-        dictionary_hash = _text_hash(generated_source.lstrip("\ufeff") + "\n--manual--\n" + manual_source.lstrip("\ufeff"))
-        applied = [_apply_pronunciation_dictionary(seg.text, dictionary_entries) for seg in segments]
-        narration_texts = [item[0] for item in applied]
-        replacement_counts = [item[1] for item in applied]
+    narration_texts, replacement_counts, dictionary_entries, dictionary_hash = _prepare_tts_pronunciation(
+        segments,
+        job_dir,
+        config.tts_provider,
+    )
 
     workers = _parallel_limit("max_parallel_tts", 2, len(segments), hard_cap=12)
     segment_timeout_seconds = _bounded_timeout(config.get("tts_segment_timeout_seconds", 180), 180.0)
@@ -2079,8 +2528,10 @@ def _stage_tts_manifest_impl(
             f"  pronunciation dictionary: {len(dictionary_entries)} entries, "
             f"{total_replacements} replacements in {changed_segments}/{len(segments)} segments"
         )
-    elif (dictionary_path.exists() or auto_dictionary_path.exists()) and config.tts_provider != "edge":
-        on_log("  pronunciation dictionary is attached but only applies when TTS provider=edge")
+    elif dictionary_path.exists() and config.tts_provider not in TTS_MANUAL_PRONUNCIATION_PROVIDERS:
+        on_log("  uploaded pronunciation dictionary only applies when TTS provider=edge or voicevox")
+    elif auto_dictionary_path.exists() and config.tts_provider != "edge":
+        on_log("  auto pronunciation dictionary only applies when TTS provider=edge")
 
     def make_tts() -> TTSBackend:
         return TTSBackend(
@@ -2199,6 +2650,43 @@ def _stage_tts_manifest_impl(
             entry = _tts_manifest_entry(manifest, i)
         d = 0.0
         waveform: dict = {}
+
+        # A segment containing only punctuation (for example "！") has
+        # nothing for TTS to pronounce.  Voice engines commonly return a
+        # near-silent file for it, which then used to trigger an unbounded
+        # retry loop.  Preserve the segment timing with a tiny silent file
+        # and mark it as intentionally skipped.
+        if not any(ch.isalnum() for ch in narration_text):
+            tmp = out.with_suffix(".tmp.mp3")
+            tmp.unlink(missing_ok=True)
+            proc = subprocess.run(
+                [
+                    ffmpeg_path(), "-y", "-f", "lavfi", "-i",
+                    "anullsrc=r=24000:cl=mono", "-t", "0.10",
+                    "-c:a", "libmp3lame", "-q:a", "9", str(tmp),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=30,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError("failed to create punctuation silence")
+            tmp.replace(out)
+            d = _audio_duration(out)
+            set_manifest({
+                **expected,
+                "index": i,
+                "status": "skipped_punctuation",
+                "path": str(out),
+                "duration": d,
+                "waveform": {"intentional_silence": True},
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            on_log(f"  TTS seg{i} contains only punctuation; inserted {d:.2f}s silence")
+            return i, out, d
         if _tts_cache_matches(entry, expected, out):
             try:
                 d, waveform = _validate_tts_audio(out)
@@ -2506,6 +2994,50 @@ def stage_character_analysis(
     return payload
 
 
+def share_series_character_analysis(job_dir: Path, payload: dict | None, on_log: LogFn = _noop) -> dict | None:
+    """Merge stable character locks across every episode in an enabled series."""
+    if not series_animation_enabled_for_job(job_dir) or not isinstance(payload, dict):
+        return payload
+    status = _read_json(job_dir / "status.json", {})
+    group_key = str(status.get("series_group_key") or status.get("series_title") or "").strip()
+    try:
+        episode = int(status.get("series_episode") or 0)
+    except (TypeError, ValueError):
+        episode = 0
+    if not group_key or episode < 1:
+        return payload
+    registry_path = JOBS_DIR / ".series_character_profiles.json"
+    registry = _read_json(registry_path, {})
+    if not isinstance(registry, dict):
+        registry = {}
+    shared = registry.get(group_key) if isinstance(registry.get(group_key), dict) else {}
+    merged = dict(shared or payload)
+    existing_characters = [
+        item for item in merged.get("characters") or [] if isinstance(item, dict)
+    ]
+    known = {
+        str(item.get("name") or item.get("trigger") or "").strip()
+        for item in existing_characters
+    }
+    for item in payload.get("characters") or []:
+        if not isinstance(item, dict):
+            continue
+        identity = str(item.get("name") or item.get("trigger") or "").strip()
+        if identity and identity not in known:
+            existing_characters.append(item)
+            known.add(identity)
+    merged["characters"] = existing_characters
+    merged["enabled"] = bool(shared.get("enabled", payload.get("enabled", False)))
+    for key in ("visual_theme", "plot_summary", "story_conflict", "protagonists", "supporting_characters"):
+        if not merged.get(key) and payload.get(key):
+            merged[key] = payload[key]
+    registry[group_key] = merged
+    _write_json(registry_path, registry)
+    _write_json(job_dir / "character_profiles.json", merged)
+    on_log(f"  series shared character profiles: {len(existing_characters)}")
+    return merged
+
+
 def stage_story_context(
     novel: Novel,
     segments: list[Segment],
@@ -2535,8 +3067,13 @@ def stage_story_context(
         on_log("  reuse story visual context for highlight selection")
         return normalize_story_context(cached.get("context"))
 
+    fallback_summary = str(novel.description or "").strip()
+    if fallback_summary.lower() == "local text input":
+        fallback_summary = ""
+    fallback_summary = fallback_summary[:600]
     fallback = normalize_story_context({
-        "story_summary": str(novel.description or "").strip()[:600],
+        "story_summary": fallback_summary,
+        "title_brief": fallback_summary,
         "era_and_world": "Follow the local narration exactly.",
     })
     if not _can_call_text_llm():
@@ -2565,6 +3102,14 @@ def stage_story_context(
 def _image_route_settings(role: str) -> dict:
     role = str(role or "scene")
 
+    def request_size() -> tuple[int, int]:
+        if not _unified_ai_enabled() or role == "character_reference":
+            return 0, 0
+        return (
+            int(config.get("ai_api_image_width", 1792) or 1792),
+            int(config.get("ai_api_image_height", 1008) or 1008),
+        )
+
     def workflow_for(provider: str, value: str) -> str:
         return str(value or "") if str(provider or "").strip().lower() == "comfyui" else ""
 
@@ -2576,12 +3121,15 @@ def _image_route_settings(role: str) -> dict:
             str(config.image_api_key or ""),
             str(config.image_model or ""),
         )
+        request_width, request_height = request_size()
         return {
             "provider": provider,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
             "workflow_path": workflow_for(provider, str(config.image_workflow or "")),
+            "request_width": request_width,
+            "request_height": request_height,
         }
 
     if role == "cover":
@@ -2594,30 +3142,41 @@ def _image_route_settings(role: str) -> dict:
             str(config.get("cover_api_key", "") or config.image_api_key or ""),
             str(config.get("cover_model", "") or config.image_model or ""),
         )
+        request_width, request_height = request_size()
         return {
             "provider": provider,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
             "workflow_path": workflow_for(provider, str(config.image_workflow or "")),
+            "request_width": request_width,
+            "request_height": request_height,
         }
 
     if role == "character_reference":
         provider = str(config.get("character_reference_provider", "same_as_image") or "").strip()
         if provider in {"", "same_as_image", "同配图", "同图片"}:
-            return _image_route_settings("scene")
+            route = _image_route_settings("scene")
+            # Character sheets retain their configured portrait/square target;
+            # the unified landscape request size is only for scenes and covers.
+            route["request_width"] = 0
+            route["request_height"] = 0
+            return route
         provider, base_url, api_key, model = _apply_unified_image_api(
             provider,
             str(config.get("character_reference_base_url", "") or config.image_base_url or ""),
             str(config.get("character_reference_api_key", "") or config.image_api_key or ""),
             str(config.get("character_reference_model", "") or config.image_model or ""),
         )
+        request_width, request_height = request_size()
         return {
             "provider": provider,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
             "workflow_path": workflow_for(provider, str(config.get("character_reference_workflow", "") or config.image_workflow or "")),
+            "request_width": request_width,
+            "request_height": request_height,
         }
 
     if role == "scene_reference":
@@ -2630,12 +3189,15 @@ def _image_route_settings(role: str) -> dict:
             str(config.get("scene_reference_api_key", "") or config.image_api_key or ""),
             str(config.get("scene_reference_model", "") or config.image_model or ""),
         )
+        request_width, request_height = request_size()
         return {
             "provider": provider,
             "base_url": base_url,
             "api_key": api_key,
             "model": model,
             "workflow_path": workflow_for(provider, str(config.get("scene_reference_workflow", "") or config.image_workflow or "")),
+            "request_width": request_width,
+            "request_height": request_height,
         }
 
     return _image_route_settings("scene")
@@ -2651,6 +3213,8 @@ def _make_image_backend(route: dict, *, provider: str | None = None) -> ImageBac
         cfg=config.image_cfg,
         workflow_path=route.get("workflow_path", ""),
         timeout_seconds=config.get("image_api_timeout_seconds", 300),
+        request_width=route.get("request_width", 0),
+        request_height=route.get("request_height", 0),
     )
 
 
@@ -2781,24 +3345,10 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_tit
         value = re.sub(pattern, replacement, value, flags=re.I)
     value = re.sub(r"(?i)\b(blood|gore|corpse|nude|naked|sexual|erotic|severed)\b", "", value)
     value = re.sub(r"\s{2,}", " ", value).strip(" ,.;")
-    if not allow_title_text:
-        # Remove camera directions that directly fight the mandatory safe
-        # framing below.  This matters for profiles that say both "complete
-        # heads" and "strong foreground protagonist" in the same prompt.
-        value = re.sub(
-            r"(?i)\b(?:extreme|dramatic|tight)\s+close[- ]?up(?:\s+portrait)?\b|\bclose[- ]?up\s+portrait\b",
-            "pulled-back medium-wide shot",
-            value,
-        )
-        value = re.sub(
-            r"(?i)\bstrong\s+foreground\s+protagonist\b|\boversized\s+foreground\s+(?:character|face)\b",
-            "clearly staged protagonist with comfortable surrounding space",
-            value,
-        )
     if allow_title_text:
         guard = (
             "Family-friendly cinematic cover illustration, adult-looking characters, symbolic emotional drama, "
-            "fully clothed characters, clean composition, soft lighting, readable faces, only the requested title text, "
+            "fully clothed characters, clean composition, subject-appropriate high-contrast lighting, readable faces, only the requested Japanese poster text, "
             "no extra captions, logos, UI, or watermarks"
         )
     else:
@@ -2806,25 +3356,53 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_tit
             "Family-friendly cinematic anime illustration, adult-looking characters, symbolic emotional drama, "
             "fully clothed characters, clean composition, soft lighting, readable faces, text-free artwork"
         )
-    if not allow_title_text:
-        # Always put the hard camera constraint first.  A profile may contain a
-        # weaker phrase such as "complete faces" while also asking for a strong
-        # foreground close-up; the weaker phrase must not suppress this guard.
-        framing_guard = (
-            "Mandatory final-video crop-safe framing: the output will be enlarged and center-cropped to a full-screen "
-            "16:9 landscape frame regardless of the provider canvas ratio; compose every person, face, hand, and essential "
-            "story action entirely inside the central horizontal 16:9 safe band (for a square source, this is the middle "
-            "56 percent of its height); keep the upper and lower outside strips background-only, such as sky, wall, ceiling, "
-            "floor, or scenery; use a pulled-back medium-wide shot, never a close-up; the primary character occupies no more "
-            "than 50 percent of source-canvas height; show every visible person's entire hair crown, head, face, chin, "
-            "shoulders, and upper body inside the central safe band; keep all people and essential action at least 10 percent "
-            "away from every side edge; no person, hair, head, face, chin, hand, or key object may touch or cross the central "
-            "16:9 safe-band boundary"
-        )
-        if "central horizontal 16:9 safe band" not in value.lower():
-            value = f"{framing_guard}. {value}"
     if "family-friendly" not in value.lower():
         value = f"{value}. {guard}"
+    if not allow_title_text:
+        # Keep this at the end of every non-cover request so a profile's
+        # no-readable-text instruction survives prompt length limiting.
+        text_free_guard = (
+            " Strict final requirement: generate text-free artwork only. Do not render any readable or pseudo-readable "
+            "writing, letters, words, Japanese or Chinese characters, numbers, signage, document pages, speech bubbles, "
+            "captions, typography, UI, logos, watermarks, symbols resembling glyphs, or text-like magical effects; use "
+            "blank surfaces and abstract light instead."
+        )
+        # Make prompt hardening idempotent.  In particular, strip an existing
+        # protected suffix before calculating the head/tail budget, otherwise
+        # a second pass mistakes the suffix for the scene-specific tail.
+        text_free_guard_core = text_free_guard.strip().rstrip(".")
+        value = re.sub(
+            rf"(?:{re.escape(text_free_guard_core)}[.\s]*)+",
+            "",
+            value,
+            flags=re.I,
+        ).strip(" ,.;")
+        max_prompt_chars = 1400
+        # Preserve both the global visual lock at the beginning and the selected
+        # scene/action at the end.
+        budget = max_prompt_chars - len(text_free_guard)
+        if len(value) > budget:
+            # Keep enough of the beginning to retain the profile's historical
+            # setting (for example, Chinese late-Han costumes) before keeping
+            # the final scene-specific instruction below.
+            # Reserve a real scene budget.  The previous calculation usually
+            # left only ~120 characters at 1400 total, so a later pass could
+            # shave the beginning off even a short concrete action anchor.
+            desired_tail = min(400, max(280, budget // 3))
+            head = max(500, budget - desired_tail - 24)
+            tail = max(240, budget - head - 24)
+            value = f"{value[:head].rstrip(' ,.;')}. Scene details: {value[-tail:].lstrip(' ,.;')}"
+        value = value.rstrip(" ,.;") + text_free_guard
+    # Scene prompts stay compact for SD-style backends.  Covers need room for
+    # the event, two reacting characters, palette, composition and four text
+    # hierarchy instructions; clipping them to 1400 characters previously
+    # produced visibly truncated prompts such as "(masterpiece:1.".
+    if allow_title_text:
+        if len(value) <= 6000:
+            return value
+        # Preserve the final typography checks instead of slicing them off
+        # when a detailed poster method produces a long prompt.
+        return f"{value[:5200].rstrip(' ,.;')}. Final constraints: {value[-760:].lstrip(' ,.;')}"[:6000]
     return value[:1400]
 
 
@@ -2870,12 +3448,14 @@ def _image_cache_key(
     """
     return _stable_hash(
         {
-            # v4 restores full-screen cover cropping for every provider ratio.
-            # Old blurred-extension images must never be reused.
-            "schema": 4,
+            # Request dimensions are part of the fingerprint below, so a real
+            # API-size change invalidates only the affected generated images.
+            "schema": 5,
             "provider": str(route.get("provider") or "").strip().lower(),
             "base_url": str(route.get("base_url") or "").strip().rstrip("/"),
             "model": str(route.get("model") or "").strip(),
+            "request_width": int(route.get("request_width") or 0),
+            "request_height": int(route.get("request_height") or 0),
             "prompt_hash": _text_hash(prompt),
             "negative_prompt_hash": _text_hash(negative_prompt),
             "width": int(width),
@@ -3055,14 +3635,7 @@ def stage_storyboard_and_image(
     prompts_log: list[dict | None] = [None] * len(plans)
     paths: list[Path | None] = [None] * len(plans)
     write_lock = threading.Lock()
-    scene_negative_prompt = ", ".join(
-        part for part in (
-            str(config.llm_negative_prompt or "").strip(" ,"),
-            "cropped head, cut-off head, cropped face, face outside frame, forehead outside frame, "
-            "top of head outside frame, character touching image edge, extreme close-up, oversized foreground face, "
-            "portrait crop, partial person at image boundary",
-        ) if part
-    )
+    scene_negative_prompt = str(config.llm_negative_prompt or "").strip(" ,")
 
     def process_image(i: int, plan: ImagePlan) -> tuple[int, Path, str]:
         out = img_dir / f"img_{i:05d}.png"
@@ -3146,7 +3719,12 @@ def stage_storyboard_and_image(
             out.unlink(missing_ok=True)
             cache_path.unlink(missing_ok=True)
             last_exc: Exception | None = None
-            for attempt in range(1, 3):
+            try:
+                image_attempts = int(config.get("image_retry_attempts", config.get("pipeline_failure_retry_limit", 5)) or 5)
+            except (TypeError, ValueError):
+                image_attempts = 5
+            image_attempts = max(1, min(10, image_attempts))
+            for attempt in range(1, image_attempts + 1):
                 try:
                     # A backend may create a partial output before raising.  It
                     # must not survive into the next attempt or a resumed job.
@@ -3215,7 +3793,7 @@ def stage_storyboard_and_image(
                 except Exception as exc:
                     last_exc = exc
                     out.unlink(missing_ok=True)
-                    on_log(f"  WARN 图{i} 生成失败 {attempt}/2: {exc}")
+                    on_log(f"  WARN 图{i} 生成失败 {attempt}/{image_attempts}: {exc}")
                     time.sleep(attempt)
             if not out.exists() or out.stat().st_size < 100:
                 error_text = redact_secret_text(last_exc or "unknown image generation failure", limit=800)
@@ -3267,6 +3845,10 @@ def stage_storyboard_and_image(
         pool.shutdown(wait=False, cancel_futures=True)
         if job_dir.name == "_prefetch_images":
             raise RuntimeError(f"图{failure.index + 1} 生成失败：{failure.error}") from failure
+        if bool(config.get("pipeline_skip_after_failures", True)):
+            raise RuntimeError(
+                f"图{failure.index + 1} 连续生成失败达到上限；已跳过当前任务并继续队列：{failure.error}"
+            ) from failure
         return _wait_for_image_failure_choice(job_dir, plans, failure, on_log)
     except Exception:
         for future in future_labels:
@@ -3283,7 +3865,15 @@ def stage_storyboard_and_image(
     return final_paths
 
 
-def _metadata_intro(novel: Novel, limit: int = 700) -> str:
+def _metadata_intro(novel: Novel, story_context: dict | None = None, limit: int = 700) -> str:
+    """Return a compact, grounded title brief without re-sending the full novel."""
+    if isinstance(story_context, dict):
+        brief = re.sub(r"\s+", " ", str(story_context.get("title_brief") or "")).strip()
+        if brief:
+            return brief[:limit]
+        summary = re.sub(r"\s+", " ", str(story_context.get("story_summary") or "")).strip()
+        if summary:
+            return summary[:limit]
     desc = re.sub(r"\s+", " ", str(novel.description or "")).strip()
     if desc and desc.lower() != "local text input":
         return desc[:limit]
@@ -3344,42 +3934,605 @@ def _fallback_short_title(novel: Novel, intro: str, min_chars: int, max_chars: i
     return _clean_short_title(value, min_chars, max_chars) or (title[:max_chars] if title else "精彩小说推文剧情解说")
 
 
-def stage_metadata(novel: Novel, job_dir: Path, on_log: LogFn = _noop) -> dict:
-    intro = _metadata_intro(novel)
+def _candidate_title(value: str) -> str:
+    """Clean model wrappers without deleting useful Japanese ad punctuation."""
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"^\s*(?:[①②③]|[1-3][.、:：)])\s*", "", text)
+    text = re.sub(r"(?i)^\s*(?:動画タイトル|タイトル|title)\s*[:：]\s*", "", text)
+    return re.sub(r"\s+", " ", text).strip().strip('"')
+
+
+def _strip_series_part_prefix(value: str) -> str:
+    """Remove an older series marker before the current one is applied."""
+    text = _candidate_title(value)
+    patterns = (
+        r"^[^｜]{1,32}｜(?:上篇|中篇|下篇|第\d+話|前編|後編|第\d+編)｜",
+        r"^.{1,32}【(?:上篇|中篇|下篇|第\d+話|前編|後編|第\d+編)】",
+    )
+    changed = True
+    while changed:
+        changed = False
+        for pattern in patterns:
+            if re.match(pattern, text):
+                text = re.sub(pattern, "", text, count=1).strip()
+                changed = True
+    return text
+
+
+_MARKETING_SOURCE_WRAPPERS = ("标题：", "タイトル：", "简介：", "概要：", "local text input", "[开头]", "[中段]", "[结尾]")
+
+
+def _contains_marketing_source_wrapper(value: str) -> bool:
+    text = str(value or "").lower()
+    return any(marker.lower() in text for marker in _MARKETING_SOURCE_WRAPPERS)
+
+
+def _candidate_synopsis(value: str) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"^\s*(?:[①②]|[1-2][.、:：)])\s*", "", text)
+    text = re.sub(r"(?i)^\s*(?:あらすじ|概要|synopsis)\s*[:：]\s*", "", text)
+    return re.sub(r"\s+", " ", text).strip().strip('"')
+
+
+def _candidate_tags(value) -> list[str]:
+    rows = value if isinstance(value, list) else re.findall(r"#[^#\s【】]+", str(value or ""))
+    tags: list[str] = []
+    for raw in rows:
+        tag = re.sub(r"\s+", "", str(raw or "").strip())
+        tag_name = tag.lstrip("#＃").strip("【】[]")
+        if not tag or re.sub(r"[・·]", "", tag_name) == "朗読小説":
+            continue
+        if not tag.startswith("#"):
+            tag = "#" + tag.lstrip("＃")
+        if tag.lstrip("#＃") == "赤陽の勧めるノベル":
+            continue
+        if tag not in tags:
+            tags.append(tag)
+    return tags[:15]
+
+
+def _parse_marketing_candidates(raw) -> dict:
+    data = raw if isinstance(raw, dict) else parse_json_object(str(raw or ""))
+    titles_raw = data.get("titles") or data.get("video_titles") or data.get("動画タイトル") or []
+    synopses_raw = data.get("synopses") or data.get("summaries") or data.get("あらすじ") or []
+    titles = [_candidate_title(x) for x in titles_raw] if isinstance(titles_raw, list) else []
+    synopses = [_candidate_synopsis(x) for x in synopses_raw] if isinstance(synopses_raw, list) else []
+    # Internal source labels are never titles.  Dropping them here forces a
+    # corrective LLM retry instead of letting task metadata reach upload.
+    titles = [x for x in titles if x and not _contains_marketing_source_wrapper(x)]
+    synopses = [x for x in synopses if x]
+    tags = _candidate_tags(data.get("tags") or data.get("hashtags") or data.get("タグ") or [])
+    series_short_title = re.sub(r"\s+", " ", str(
+        data.get("series_short_title") or data.get("series_title") or data.get("系列短名") or ""
+    )).strip().strip("【】[]『』「」")
+    series_short_title = re.sub(r"[｜|].*$", "", series_short_title).strip()
+    return {
+        "titles": titles[:3],
+        "synopses": synopses[:2],
+        "tags": tags,
+        "tag_line": "".join(tags),
+        "series_short_title": series_short_title[:18],
+    }
+
+
+def _marketing_validation_error(bundle: dict, min_chars: int, max_chars: int) -> str:
+    titles = bundle.get("titles") if isinstance(bundle.get("titles"), list) else []
+    synopses = bundle.get("synopses") if isinstance(bundle.get("synopses"), list) else []
+    problems = []
+    if len(titles) != 3:
+        problems.append(f"titles={len(titles)} (required 3)")
+    if len(set(titles)) != len(titles):
+        problems.append("titles must be distinct")
+    bad_title_lengths = [len(x) for x in titles if len(x) < min_chars or len(x) > max_chars]
+    if bad_title_lengths:
+        problems.append(f"title lengths outside {min_chars}-{max_chars}: {bad_title_lengths}")
+    if any(_contains_marketing_source_wrapper(title) for title in titles):
+        problems.append("titles contain source-wrapper text")
+    if len(synopses) != 2:
+        problems.append(f"synopses={len(synopses)} (required 2)")
+    bad_synopsis_lengths = [len(x) for x in synopses if len(x) < 80 or len(x) > 160]
+    if bad_synopsis_lengths:
+        problems.append(f"synopsis lengths outside 80-160: {bad_synopsis_lengths}")
+    tags = bundle.get("tags") if isinstance(bundle.get("tags"), list) else []
+    if not 10 <= len(tags) <= 15:
+        problems.append(f"tags={len(tags)} (required 10-15)")
+    return "; ".join(problems)
+
+
+def _fallback_marketing_candidates(novel: Novel, story_material: str, max_chars: int) -> dict:
+    """Produce upload-safe local metadata when a text gateway cannot return JSON.
+
+    This is deliberately source-derived rather than inventive: it keeps a job
+    moving without silently turning an API formatting outage into a pipeline
+    failure.  The generated candidates remain editable in the GUI afterwards.
+    """
     clean_title = _clean_display_title(novel.title)
-    min_chars = max(6, int(config.get("short_title_min_chars", 20) or 20))
-    max_chars = max(min_chars, int(config.get("short_title_max_chars", 30) or 30))
-    short_title = ""
-    if bool(config.get("short_title_enabled", True)):
-        if _can_call_text_llm():
+    compact = re.sub(r"\s+", " ", str(novel.full_text or story_material or "")).strip()
+    compact = re.sub(r"(?:标题|简介)\s*[:：]\s*", "", compact)
+    if compact.startswith(clean_title):
+        compact = compact[len(clean_title):].strip()
+    sentences = [x.strip() for x in re.split(r"(?<=[。！？!?])", compact) if x.strip()]
+    seeds = sentences[:3] or [clean_title]
+    titles = []
+    for index in range(3):
+        seed = seeds[index % len(seeds)]
+        value = _candidate_title(seed) or clean_title
+        value = re.sub(r"[\r\n]+", " ", value).strip()
+        # Marketing titles have a configured minimum length.  Extend with
+        # neighbouring source sentences, then a neutral source-safe suffix.
+        next_seed = seeds[(index + 1) % len(seeds)]
+        while len(value) < 40 and next_seed:
+            value = f"{value}――{_candidate_title(next_seed)}"
+            next_seed = ""
+        if len(value) < 40:
+            value = f"{value}――明かされる物語の真相"
+        value = value[:max_chars].rstrip("、。！？!?｜ ")
+        while len(value) < 40:
+            value = (value + "――逆転の結末へ")[:max_chars].rstrip("、。！？!?｜ ")
+        if value in titles:
+            value = (value[: max(1, max_chars - 8)].rstrip("、。！？!?｜ ") + f"――転機{index + 1}")[:max_chars]
+        titles.append(value)
+
+    def synopsis_from(rows: list[str]) -> str:
+        value = _candidate_synopsis("".join(rows)) or compact or clean_title
+        if len(value) < 80:
+            value = (value + "。" + compact)[:160]
+        return value[:160].rstrip()
+
+    synopsis = synopsis_from(sentences[:4])
+    synopsis2 = synopsis_from(sentences[-4:])
+    tags = [
+        "#小説", "#異世界", "#恋愛", "#ざまぁ", "#逆転劇", "#貴族令嬢",
+        "#復讐", "#ファンタジー", "#朗読", "#物語", "#漫画風", "#ドラマ",
+    ]
+    return {"titles": titles, "synopses": [synopsis, synopsis2], "tags": tags, "tag_line": "".join(tags)}
+
+
+def _write_marketing_candidates_text(path: Path, bundle: dict) -> None:
+    titles = list(bundle.get("titles") or [])[:3]
+    synopses = list(bundle.get("synopses") or [])[:2]
+    rows = ["【動画タイトル】", ""]
+    rows.extend(f"{label}{value}" for label, value in zip(("①", "②", "③"), titles))
+    rows.extend(["", "【あらすじ】", ""])
+    rows.extend(f"{label}{value}" for label, value in zip(("①", "②"), synopses))
+    tags = _candidate_tags(bundle.get("tags") or bundle.get("tag_line") or [])
+    if tags:
+        rows.extend(["", "【タグ候補】", "", "".join(tags)])
+    rows.append("")
+    path.write_text("\n".join(rows), encoding="utf-8")
+
+
+def _metadata_has_marketing_candidates(metadata: dict | None) -> bool:
+    data = metadata if isinstance(metadata, dict) else {}
+    bundle = {
+        "titles": [_candidate_title(x) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else [],
+        "synopses": [_candidate_synopsis(x) for x in data.get("synopses", [])] if isinstance(data.get("synopses"), list) else [],
+        "tags": _candidate_tags(data.get("generated_tags") or data.get("generated_tag_line") or data.get("tags") or ""),
+    }
+    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
+    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
+    return not _marketing_validation_error(bundle, min_chars, max_chars)
+
+
+def _metadata_has_valid_marketing_titles(metadata: dict | None) -> bool:
+    """Check title safety before a manual upload can reach YouTube."""
+    data = metadata if isinstance(metadata, dict) else {}
+    titles = [_candidate_title(x) for x in data.get("titles", [])] if isinstance(data.get("titles"), list) else []
+    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
+    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
+    return (
+        len(titles) == 3
+        and len(set(titles)) == 3
+        and all(min_chars <= len(title) <= max_chars and not _contains_marketing_source_wrapper(title) for title in titles)
+    )
+
+
+def _series_marketing_label(job_dir: Path, short_name: str = "") -> str:
+    """Return a compact, stable prefix for a split novel series.
+
+    The source title can be far too long for YouTube.  Keep a recognizable
+    opening of it, but make the part marker deterministic so every candidate
+    title and its cover visibly belong to the same series.
+    """
+    status = _read_json(job_dir / "status.json", {})
+    if not isinstance(status, dict):
+        return ""
+    try:
+        episode = int(status.get("series_episode") or 0)
+    except (TypeError, ValueError):
+        episode = 0
+    series_title = str(status.get("series_title") or "").strip()
+    if not series_title or episode < 1:
+        return ""
+    siblings = []
+    for candidate in JOBS_DIR.iterdir():
+        if not candidate.is_dir():
+            continue
+        sibling = _read_json(candidate / "status.json", {})
+        if not isinstance(sibling, dict):
+            continue
+        if str(sibling.get("series_title") or "").strip() != series_title:
+            continue
+        try:
+            value = int(sibling.get("series_episode") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            siblings.append(value)
+    total = max(siblings, default=episode)
+    part = "上篇" if total == 2 and episode == 1 else "下篇" if total == 2 and episode == 2 else f"第{episode}話"
+    source_path = Path(str(status.get("source_path") or status.get("input") or "")).expanduser()
+    bible = _read_json(source_path.parent / SERIES_BIBLE_FILENAME, {}) if source_path.is_file() else {}
+    saved_short = str(bible.get("marketing_short_title") or "").strip() if isinstance(bible, dict) else ""
+    compact = str(short_name or saved_short).strip()
+    return f"{compact}｜{part}" if compact else ""
+
+
+def _persist_series_marketing_short_title(job_dir: Path, short_name: str) -> str:
+    """Persist one AI-renamed short title for every part in the source folder."""
+    clean = re.sub(r"\s+", " ", str(short_name or "")).strip().strip("【】[]『』「」")[:18]
+    status = _read_json(job_dir / "status.json", {})
+    source_path = Path(str(status.get("source_path") or status.get("input") or "")).expanduser() if isinstance(status, dict) else Path()
+    if not source_path.is_file():
+        return clean
+    bible_path = source_path.parent / SERIES_BIBLE_FILENAME
+    bible = _read_json(bible_path, {})
+    if not isinstance(bible, dict):
+        bible = {}
+    existing = str(bible.get("marketing_short_title") or "").strip()
+    if existing:
+        return existing
+    if not clean:
+        return ""
+    bible["marketing_short_title"] = clean
+    bible["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_json(bible_path, bible)
+    return clean
+
+
+def _apply_series_marketing_label(bundle: dict, label: str, max_chars: int) -> dict:
+    if not label:
+        return bundle
+    titles = []
+    for raw in list(bundle.get("titles") or [])[:3]:
+        title = _candidate_title(raw)
+        title = re.sub(r"^(?:【[^】]+】|[^｜]{1,24}｜(?:上篇|下篇|第\d+話)｜)\s*", "", title)
+        available = max(1, max_chars - len(label))
+        title = title[:available].rstrip("、。！？!?｜ ")
+        titles.append(f"{label}｜{title}")
+    bundle = dict(bundle)
+    bundle["titles"] = titles
+    return bundle
+
+
+def _fit_marketing_title_lengths(bundle: dict, max_chars: int) -> dict:
+    """Keep a valid model title instead of failing solely for a few extra chars."""
+    bundle = dict(bundle)
+    bundle["titles"] = [
+        _candidate_title(value)[:max_chars].rstrip("、。！？!?｜ ")
+        for value in list(bundle.get("titles") or [])[:3]
+    ]
+    return bundle
+
+
+SERIES_MARKETING_TITLES_FILE = ".series_marketing_titles.json"
+
+
+def _series_presentation_info(job_dir: Path) -> tuple[str, int, int, Path | None]:
+    status = _read_json(job_dir / "status.json", {})
+    if not isinstance(status, dict):
+        return "", 0, 0, None
+    series_title = str(status.get("series_title") or "").strip()
+    try:
+        episode = int(status.get("series_episode") or 0)
+    except (TypeError, ValueError):
+        episode = 0
+    if not series_title or episode < 1:
+        return "", 0, 0, None
+    episodes = []
+    for candidate in JOBS_DIR.iterdir():
+        if not candidate.is_dir():
+            continue
+        sibling = _read_json(candidate / "status.json", {})
+        if str(sibling.get("series_title") or "").strip() != series_title:
+            continue
+        try:
+            value = int(sibling.get("series_episode") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            episodes.append(value)
+    return series_title, episode, max(episodes, default=episode), JOBS_DIR / SERIES_MARKETING_TITLES_FILE
+
+
+def _series_part_label(episode: int, total: int) -> str:
+    if total == 2:
+        return "上篇" if episode == 1 else "下篇"
+    if total == 3:
+        return ("上篇", "中篇", "下篇")[max(0, min(2, episode - 1))]
+    return f"第{episode}話"
+
+
+def _series_short_name_from_existing_titles(
+    job_dir: Path,
+    titles: list[str],
+    on_log: LogFn,
+    *,
+    _lock_held: bool = False,
+) -> str:
+    """Let the first-started episode initialize one durable shared novel name."""
+    series_title, _episode, _total, bible_path = _series_presentation_info(job_dir)
+    if not series_title or bible_path is None:
+        return ""
+    registry = _read_json(bible_path, {})
+    if not isinstance(registry, dict):
+        registry = {}
+    saved = str(registry.get(series_title) or "").strip()
+    if saved:
+        return saved
+    if not _lock_held:
+        lock_path = JOBS_DIR / f".series_name_{_text_hash(series_title)[:16]}.lock"
+        lock_fd = None
+        deadline = time.monotonic() + 300
+        while lock_fd is None:
             try:
-                route = _llm_route_settings()
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.write(lock_fd, str(os.getpid()).encode("ascii"))
+            except FileExistsError:
+                try:
+                    if time.time() - lock_path.stat().st_mtime > 1800:
+                        lock_path.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("等待同系列小说名初始化超时")
+                time.sleep(0.5)
+        try:
+            return _series_short_name_from_existing_titles(
+                job_dir, titles, on_log, _lock_held=True
+            )
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
+    llm = None
+    if _can_call_text_llm():
+        route = _llm_route_settings()
+        llm = LLMBackend(
+            provider=route["provider"], base_url=route["base_url"], api_key=route["api_key"], model=route["model"],
+            system_prompt="Return JSON only.", temperature=0.25, max_tokens=180, timeout=90.0,
+        )
+    series_titles = list(dict.fromkeys(str(value).strip() for value in titles if str(value).strip()))[:3]
+    request = (
+        "以下は同じ小説シリーズで最初に制作開始された1本の動画タイトルです。この1本の内容を根拠に、"
+        "今後のシリーズ全話で共有できる、CTRを意識した"
+        "短い日本語の小説名を3案作り、その中から最も内容が伝わりクリックされやすい1案を選んでください。"
+        "ライトノベルまたは漫画広告の作品名らしく、主人公属性、関係性、溺愛、逆転、能力、危機など、その作品に"
+        "根拠がある強い要素を1〜2個だけ入れてください。元ファイル名や元シリーズ名の単純な短縮・言い換えは禁止です。"
+        "各案は6〜18文字程度、上篇・中篇・下篇・前編・後編・話数・タグ・括弧・各動画固有の出来事を含めないでください。"
+        "3案は切り口を変え、selectedにはcandidates内の文字列を完全一致で入れてください。"
+        "JSONのみ: {\"candidates\":[\"候補1\",\"候補2\",\"候補3\"],\"selected\":\"最良候補\"}\n\n"
+        f"元シリーズ名（重複回避の確認用、出力しない）：{series_title}\n"
+        f"最初に制作された動画タイトル：{json.dumps(series_titles, ensure_ascii=False)}"
+    )
+    try:
+        if llm is None:
+            raise RuntimeError("文字模型不可用")
+        with external_api_slot(action="series short title"):
+            data = parse_json_object(llm.complete(llm.system_prompt, request, temperature=0.25))
+        candidates = [
+            re.sub(r"\s+", " ", str(value or "")).strip().strip("【】[]『』「」")
+            for value in data.get("candidates") or []
+        ]
+        candidates = [
+            value for value in candidates
+            if 6 <= len(value) <= 18
+            and not re.search(r"(?:上篇|中篇|下篇|前編|後編|第\d+話|[#｜|])", value)
+            and unicodedata.normalize("NFKC", value) != unicodedata.normalize("NFKC", series_title)
+        ]
+        selected = re.sub(r"\s+", " ", str(data.get("selected") or "")).strip().strip("【】[]『』「」")
+        short_name = selected if selected in candidates else (candidates[0] if candidates else "")
+        if not short_name:
+            raise ValueError("invalid short name")
+    except Exception as exc:
+        # Legacy repairs must remain usable even when a compatibility gateway
+        # emits prose rather than the requested JSON.  Preserve series
+        # readability with a stable source-derived fallback instead of failing
+        # every cover repair.
+        short_name = unicodedata.normalize("NFKC", series_title)
+        short_name = re.sub(r"[～~].*$", "", short_name).strip(" ｜・、。-–—")
+        short_name = re.sub(r"[【\[].*$", "", short_name).strip()
+        short_name = short_name[:18].rstrip(" ｜・、。-–—") or "物語シリーズ"
+        on_log(f"  WARN series short-title AI failed; use stable fallback: {redact_secret_text(exc)}")
+    registry[series_title] = short_name
+    _write_json(bible_path, registry)
+    on_log(f"  series short title: {short_name}")
+    return short_name
+
+
+def apply_series_presentation(metadata: dict, job_dir: Path, on_log: LogFn = _noop) -> dict:
+    """Add a stable series badge after ordinary title generation, without altering it."""
+    data = dict(metadata or {})
+    if not series_animation_enabled_for_job(job_dir):
+        for key in (
+            "series_short_title", "series_part_label", "series_upload_prefix",
+            "series_cover_label", "series_display_title",
+        ):
+            data.pop(key, None)
+        return data
+    titles = [_strip_series_part_prefix(str(value)) for value in data.get("titles") or [] if str(value).strip()]
+    if not titles:
+        titles = [str(data.get("short_title") or data.get("clean_title") or data.get("title") or "").strip()]
+    titles = [value for value in titles if value]
+    series_title, episode, total, _bible_path = _series_presentation_info(job_dir)
+    if not series_title or not titles:
+        return data
+    short_name = _series_short_name_from_existing_titles(job_dir, titles, on_log)
+    part = _series_part_label(episode, total)
+    data["series_short_title"] = short_name
+    data["series_part_label"] = part
+    data["series_upload_prefix"] = f"{short_name}【{part}】"
+    data["series_cover_label"] = f"{short_name}【{part}】"
+    base_title = _strip_series_part_prefix(str(data.get("short_title") or titles[0]))
+    data["series_display_title"] = f"{data['series_upload_prefix']}{base_title}"
+    return data
+
+
+def stage_metadata(
+    novel: Novel,
+    job_dir: Path,
+    story_context: dict | None = None,
+    segments: list[Segment] | None = None,
+    on_log: LogFn = _noop,
+) -> dict:
+    intro = _metadata_intro(novel, story_context)
+    clean_title = _clean_display_title(novel.title)
+    min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
+    max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
+    story_material = sampled_story_input(
+        novel,
+        list(segments or []),
+        int(config.get("storyboard_highlight_context_max_chars", 18000) or 18000),
+    )
+    route = _llm_route_settings()
+    prompt = str(config.get("marketing_candidates_prompt", "") or "").strip()
+    input_hash = _stable_hash({
+        "schema": "marketing_candidates_v4_no_fallback_source_text",
+        "source": story_material,
+        "story_context": story_context or {},
+        "provider": route["provider"],
+        "model": route["model"],
+        "prompt": prompt,
+        "min_chars": min_chars,
+        "max_chars": max_chars,
+    })
+    candidates_path = job_dir / "marketing_candidates.json"
+    cached = _read_json(candidates_path, {})
+    bundle = {}
+    if isinstance(cached, dict) and cached.get("input_hash") == input_hash:
+        try:
+            candidate = _parse_marketing_candidates(cached)
+            candidate = _fit_marketing_title_lengths(candidate, max_chars)
+            if not _marketing_validation_error(candidate, min_chars, max_chars):
+                bundle = candidate
+                on_log("  reuse 3 title / 2 synopsis marketing candidates")
+        except Exception:
+            bundle = {}
+    raw_output = ""
+    validation_error = ""
+    generation_attempts = 0
+    last_candidate: dict = {}
+    try:
+        max_generation_attempts = int(config.get("marketing_candidates_retry_attempts", 5) or 5)
+    except (TypeError, ValueError):
+        max_generation_attempts = 5
+    max_generation_attempts = max(1, min(10, max_generation_attempts))
+    retry_delay_seconds = _optional_timeout(
+        config.get("marketing_candidates_retry_delay_seconds", 60), 60.0, minimum=5.0, maximum=900.0,
+    )
+    if bool(config.get("short_title_enabled", True)):
+        if not bundle and _can_call_text_llm():
+            try:
                 llm = LLMBackend(
                     provider=route["provider"],
                     base_url=route["base_url"],
                     api_key=route["api_key"],
                     model=route["model"],
-                    system_prompt=str(config.get("short_title_prompt", "") or ""),
+                    system_prompt=prompt,
                     style_suffix="",
+                    temperature=0.7,
+                    max_tokens=int(config.get("marketing_candidates_max_tokens", 1600) or 1600),
+                    timeout=180.0,
                 )
-                request = f"书名：{clean_title}\n简介：{intro[:900]}\n只输出短说明标题。"
-                with external_api_slot(action="short title"):
-                    short_title = _clean_short_title(llm.storyboard(request), min_chars, max_chars)
+                request = (
+                    "以下は作品のタイトルと、冒頭・中盤・終盤から抽出した事実資料です。"
+                    "この資料全体を根拠に、指定JSONだけを返してください。\n\n"
+                    f"作品タイトル（事実確認用。出力しない）：{clean_title}\n"
+                    f"既存の全体簡報：{json.dumps(story_context or {}, ensure_ascii=False)}\n\n"
+                    + f"冒頭・中盤・終盤の資料：\n{story_material}"
+                )
+                for attempt in range(max_generation_attempts):
+                    generation_attempts = attempt + 1
+                    retry_note = ""
+                    if attempt:
+                        if _is_transient_json_response_error(validation_error) and retry_delay_seconds > 0:
+                            on_log(
+                                "  WARN 标题接口未返回 JSON，"
+                                f"等待 {retry_delay_seconds:.0f}s 后自动重试 "
+                                f"({attempt + 1}/{max_generation_attempts})..."
+                            )
+                            time.sleep(retry_delay_seconds)
+                        retry_note = (
+                            f"\n\n前回の出力は形式検査に失敗しました：{validation_error}。"
+                            "内容を作り直し、3タイトル・2あらすじ・10〜15個の内容一致タグを含む正しいJSONだけを一行で返してください。"
+                            "入力内の「标题」「简介」「local text input」「[开头]」等の内部ラベルをタイトルへ絶対に写さないでください。"
+                            "【朗読・小説】と#赤陽の勧めるノベルは使用しないでください。"
+                        )
+                    try:
+                        with external_api_slot(action="marketing candidates"):
+                            raw_output = llm.complete(
+                                prompt,
+                                request + retry_note,
+                                max_tokens=int(config.get("marketing_candidates_max_tokens", 1600) or 1600),
+                                temperature=0.7,
+                            ).strip()
+                        candidate = _parse_marketing_candidates(raw_output)
+                        candidate = _fit_marketing_title_lengths(candidate, max_chars)
+                        last_candidate = candidate
+                        validation_error = _marketing_validation_error(candidate, min_chars, max_chars)
+                    except Exception as exc:
+                        candidate = {}
+                        validation_error = str(exc)
+                    if not validation_error:
+                        bundle = candidate
+                        break
             except Exception as exc:
-                on_log(f"  WARN short title LLM failed: {exc}; use intro fallback")
-        if not short_title:
-            short_title = _fallback_short_title(novel, intro, min_chars, max_chars)
+                on_log(f"  WARN marketing candidate LLM failed: {redact_secret_text(exc)}; use grounded fallback")
+    if not bundle:
+        message = validation_error or "text LLM unavailable or did not return a valid bundle"
+        bundle = _fallback_marketing_candidates(novel, story_material, max_chars)
+        fallback_error = _marketing_validation_error(bundle, min_chars, max_chars)
+        if fallback_error:
+            raise RuntimeError(f"本地标题兜底生成失败：{fallback_error}")
+        on_log(
+            "  WARN 标题接口格式异常；已使用本地保底标题继续任务："
+            + redact_secret_text(message)
+        )
+
+    bundle_record = {
+        "schema_version": 2,
+        "input_hash": input_hash,
+        "titles": bundle["titles"],
+        "synopses": bundle["synopses"],
+        "tags": bundle["tags"],
+        "tag_line": bundle["tag_line"],
+        "generation_attempts": generation_attempts,
+        "validation_warning": validation_error,
+        "raw_model_output": raw_output,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _write_json(candidates_path, bundle_record)
+    _write_marketing_candidates_text(job_dir / "タイトル・あらすじ候補.txt", bundle_record)
+    short_title = str(bundle["titles"][0] or "")
+    intro = str(bundle["synopses"][0] or intro)
     metadata = {
         "title": novel.title,
         "clean_title": clean_title,
         "short_title": short_title,
         "intro": intro,
+        "titles": bundle["titles"],
+        "synopses": bundle["synopses"],
+        "generated_tags": bundle["tags"],
+        "generated_tag_line": bundle["tag_line"],
+        "story_brief": _metadata_intro(novel, story_context),
         "author": novel.author,
         "tags": str(config.youtube_tags or ""),
     }
     _write_json(job_dir / "metadata.json", metadata)
-    if short_title:
-        on_log(f"  short_title: {short_title}")
+    on_log(f"  marketing candidates: {len(bundle['titles'])} titles / {len(bundle['synopses'])} synopses")
+    for index, value in enumerate(bundle["titles"], start=1):
+        on_log(f"  title {index}: {value}")
     return metadata
 
 
@@ -3408,6 +4561,70 @@ def _limit_upload_title(text: str, max_chars: int = 100) -> str:
             body = title[: limit - len(suffix)].rstrip(" ，。！？、,.!?;；:")
             return (body + suffix).strip()
     return title[:limit].rstrip(" ，。！？、,.!?;；:")
+
+
+def _remove_disallowed_upload_tag(text: str) -> str:
+    """Remove the retired channel tag from new and legacy upload text."""
+    value = re.sub(r"[#＃]?赤陽の勧めるノベル", "", str(text or ""))
+    return re.sub(r"[ \t]{2,}", " ", value).strip()
+
+
+def _append_generated_tags_to_upload_title(text: str, generated_tags, max_chars: int) -> str:
+    """Fill unused title space with relevant generated tags not already in the template."""
+    limit = max(1, int(max_chars or 100))
+    title = _limit_upload_title(_remove_disallowed_upload_tag(text), limit)
+    existing_tags = set(_candidate_tags(title))
+    for tag in _candidate_tags(generated_tags):
+        if tag in existing_tags:
+            continue
+        candidate = f"{title} {tag}".strip()
+        if len(candidate) > limit:
+            continue
+        title = candidate
+        existing_tags.add(tag)
+    return title
+
+
+def _persistent_upload_candidate(
+    job_dir: Path,
+    profile: dict,
+    metadata: dict,
+) -> dict | None:
+    titles_raw = metadata.get("titles") if isinstance(metadata.get("titles"), list) else []
+    titles = [_strip_series_part_prefix(x) for x in titles_raw if _strip_series_part_prefix(x)][:3]
+    if not titles:
+        return None
+    candidate_hash = _stable_hash({
+        "schema": "upload_candidate_v2_template_driven",
+        "titles": titles,
+    })
+    path = job_dir / "upload_title_selection.json"
+    record = _read_json(path, {})
+    if not isinstance(record, dict) or record.get("candidate_hash") != candidate_hash:
+        record = {"schema_version": 2, "candidate_hash": candidate_hash, "selections": {}}
+    selections = record.get("selections") if isinstance(record.get("selections"), dict) else {}
+    profile_key = "|".join(
+        (
+            str(profile.get("name") or "default").strip(),
+            str(profile.get("chrome_profile") or "Default").strip(),
+        )
+    )
+    selected = selections.get(profile_key) if isinstance(selections.get(profile_key), dict) else {}
+    chosen = str(selected.get("candidate_title") or "")
+    if chosen not in titles:
+        chosen = secrets.choice(titles)
+        selected = {
+            "profile_name": str(profile.get("name") or "default"),
+            "chrome_profile": str(profile.get("chrome_profile") or "Default"),
+            "candidate_index": titles.index(chosen) + 1,
+            "candidate_title": chosen,
+            "selected_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        selections[profile_key] = selected
+        record["selections"] = selections
+        record["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(path, record)
+    return selected
 
 
 def _upload_lock_path() -> Path:
@@ -3499,84 +4716,251 @@ def _cover_excerpt(novel: Novel, segments: list[Segment], limit: int = 900) -> s
     return text[: max(80, int(limit))]
 
 
-def _cover_crop_safe_prompt(prompt: str) -> str:
-    """Keep the actual cover content safe for the provider-to-16:9 center crop."""
-    value = " ".join(str(prompt or "").split()).strip()
-    value = re.sub(
-        r"(?i)\b(?:extreme|dramatic|tight)\s+close[- ]?up(?:\s+portrait)?\b|\bclose[- ]?up\s+portrait\b",
-        "medium-wide character composition",
-        value,
-    )
-    value = re.sub(
-        r"(?i)\bdramatic\s+character\s+close[- ]?up\b",
-        "medium-wide character composition",
-        value,
-    )
-    guard = (
-        "Mandatory final-cover crop-safe framing: the provider image may be enlarged and center-cropped to a full-screen "
-        "16:9 landscape cover. Keep every face, entire head, hair crown, chin, hands, important object, and the exact "
-        "title typography completely inside the central horizontal 16:9 safe band; for a square source, use only its middle "
-        "56 percent of height for meaningful content. The top and bottom outside strips must contain background-only scenery. "
-        "Use a medium-wide composition with generous edge margins; no cropped head, face, hand, person, title, or key object."
-    )
-    return f"{guard}. {value}"
+def _cover_marketing_context(
+    novel: Novel,
+    segments: list[Segment],
+    metadata: dict | None,
+) -> tuple[str, str]:
+    """Return the generated marketing title and synopsis for a cover.
+
+    Covers must use the metadata stage's audience-facing title, never the job
+    directory or source-work title.  Metadata is created before the cover
+    stage and reuses the story-context sampling, so this adds no API call.
+    """
+    data = metadata if isinstance(metadata, dict) else {}
+    title = _clean_short_title(str(data.get("short_title") or ""), 1, 80)
+    source_title = _clean_short_title(_clean_display_title(novel.title), 1, 80)
+    if title and title == source_title:
+        # A provider occasionally echoes the source title.  It is a useful
+        # fact for title generation, but must never become the cover hook.
+        title = ""
+    synopsis = re.sub(r"\s+", " ", str(data.get("intro") or "")).strip()
+    if not synopsis:
+        synopsis = _cover_excerpt(novel, segments)
+    if not title:
+        # Degraded/offline fallback: derive display text from story material,
+        # deliberately never from novel.title (which is also the task name).
+        title = _clean_short_title(synopsis, 1, 30) or "物語の真相"
+    return title, synopsis[:900]
 
 
-def _build_cover_prompt(novel: Novel, segments: list[Segment], on_log: LogFn = _noop) -> str:
-    title = _clean_display_title(novel.title)
-    excerpt = _cover_excerpt(novel, segments)
+def _cover_marketing_bundle(
+    novel: Novel,
+    segments: list[Segment],
+    metadata: dict | None,
+) -> dict:
+    data = metadata if isinstance(metadata, dict) else {}
+    titles_raw = data.get("titles") if isinstance(data.get("titles"), list) else []
+    synopses_raw = data.get("synopses") if isinstance(data.get("synopses"), list) else []
+    titles = [_candidate_title(x) for x in titles_raw if _candidate_title(x)][:3]
+    synopses = [_candidate_synopsis(x) for x in synopses_raw if _candidate_synopsis(x)][:2]
+    if not titles or not synopses:
+        legacy_title, legacy_synopsis = _cover_marketing_context(novel, segments, metadata)
+        if not titles:
+            titles = [legacy_title]
+        if not synopses:
+            synopses = [legacy_synopsis]
+    return {"titles": titles, "synopses": synopses, "tags": [], "tag_line": ""}
+
+
+def _cover_prompt_aspect_only(value: str) -> str:
+    """Remove legacy fixed pixel dimensions from cover prompt text."""
+    text = str(value or "")
+    text = re.sub(r"(?i)\b1280\s*[x×✖]\s*720\b", "16:9", text)
+    return text
+
+
+def _normalize_cover_prompt(prompt: str) -> str:
+    """Normalize whitespace and remove legacy fixed pixel dimensions."""
+    return " ".join(_cover_prompt_aspect_only(prompt).split()).strip()
+
+
+def _full_cover_poster_method_prompt() -> str:
+    """Use only the complete poster method currently editable in the GUI."""
+    configured = str(config.get("cover_poster_method_prompt", "") or "").strip()
+    return _cover_prompt_aspect_only(configured)
+
+
+def _cover_planner_quality_error(prompt: str) -> str:
+    """Reject incomplete art-direction output without spending a second call."""
+    value = re.sub(r"\s+", " ", str(prompt or "")).strip()
+    problems: list[str] = []
+    if len(value) < 180:
+        problems.append("too short")
+    if not re.search(r"[\u3040-\u30ff\u3400-\u9fff]", value):
+        problems.append("no exact Japanese poster copy")
+    lowered = value.lower()
+    if not any(term in lowered for term in ("headline", "main title", "typography")):
+        problems.append("no headline layout")
+    if not any(term in lowered for term in ("hook", "emphasis", "subtitle", "supporting line")):
+        problems.append("no text hierarchy")
+    if not any(term in lowered for term in ("action", "confront", "reveal", "react", "turns", "raises", "hands", "stops", "standing", "holding", "facing")):
+        problems.append("no concrete action/reaction")
+    return "; ".join(problems)
+
+
+def _build_cover_prompt(
+    novel: Novel,
+    segments: list[Segment],
+    on_log: LogFn = _noop,
+    metadata: dict | None = None,
+) -> str:
+    bundle = _cover_marketing_bundle(novel, segments, metadata)
+    title = str(bundle["titles"][0])
+    excerpt = str(bundle["synopses"][0])
+    series_badge = (
+        str((metadata or {}).get("series_cover_label") or "").strip()
+        if bool(config.get("series_animation_enabled", True))
+        else ""
+    )
     style = str(config.llm_image_style_suffix or "").strip()
     custom = str(config.get("cover_custom_prompt", "") or "").strip()
-    template = str(config.get("cover_prompt_template", "") or "")
-    context = {"title": title, "excerpt": excerpt, "style": style, "custom": custom}
+    template = _cover_prompt_aspect_only(str(config.get("cover_prompt_template", "") or ""))
+    title_list = "\n".join(f"{index}. {value}" for index, value in enumerate(bundle["titles"], start=1))
+    synopsis_list = "\n".join(f"{index}. {value}" for index, value in enumerate(bundle["synopses"], start=1))
+    context = {
+        "title": title,
+        "excerpt": excerpt,
+        "titles": title_list,
+        "synopses": synopsis_list,
+        "tags": bundle["tag_line"],
+        "style": style,
+        "custom": custom,
+        "series_badge": series_badge,
+    }
     fallback = _format_template(
         template,
         context,
         fallback=(
             f'Create a cinematic YouTube cover illustration for a novel video. '
             f'Render the exact title text "{title}" as the main large readable cover title inside the image. '
-            f'Story excerpt: {excerpt}. {custom} {style}'
+            + (f'Render the exact recurring series identifier "{series_badge}" as a prominent primary text element near the upper edge, clearly separate from the episode hook. ' if series_badge else "")
+            + f'Story excerpt: {excerpt}. {custom} {style}'
         ),
     )
 
     if _can_call_text_llm():
         try:
             route = _llm_route_settings()
+            analysis_prompt = _cover_prompt_aspect_only(str(config.get("cover_ai_analysis_prompt", "") or "")).strip()
+            poster_method = _full_cover_poster_method_prompt()
+            system_prompt = "\n\n".join(x for x in (analysis_prompt, poster_method) if x)
             llm = LLMBackend(
                 provider=route["provider"],
                 base_url=route["base_url"],
                 api_key=route["api_key"],
                 model=route["model"],
-                system_prompt=str(config.get("cover_ai_analysis_prompt", "") or ""),
+                system_prompt=system_prompt,
                 style_suffix="",
+                temperature=0.65,
+                max_tokens=int(config.get("cover_prompt_max_tokens", 1400) or 1400),
             )
             request = (
-                f"{fallback}\n\n"
-                "Return one prompt only. The prompt must explicitly instruct the image model to render the "
-                f'exact title text "{title}" inside the cover image as polished large readable typography. Do not request '
-                "any post-production/editor overlay."
+                "Choose one supported climax. Return one compact prompt only; never use the source title as poster copy.\n"
+                + (f'Prominent primary series identifier, exact text: "{series_badge}". Keep it clearly separate from the episode headline.\n' if series_badge else "")
+                + f"Candidates:{json.dumps(bundle, ensure_ascii=False, separators=(',', ':'))}\n"
+                f"Base:{custom} {style}\n"
+                "No logo, UI, watermark, or post-production overlay."
             )
             with external_api_slot(action="cover prompt"):
-                prompt = llm.storyboard(request).strip()
-            if title not in prompt:
-                prompt = f'Title context: "{title}". {prompt}'
+                prompt = llm.complete(
+                    system_prompt,
+                    request,
+                    max_tokens=int(config.get("cover_prompt_max_tokens", 1400) or 1400),
+                    temperature=0.65,
+                ).strip()
+            quality_error = _cover_planner_quality_error(prompt)
+            if quality_error:
+                raise RuntimeError(f"incomplete cover planner output: {quality_error}")
             return _policy_safe_image_prompt(
-                _cover_crop_safe_prompt(
-                    f'{prompt}. Render the exact title text "{title}" as the main readable cover title in the image. '
-                    f'Do not add other text, logos, captions, UI, or watermarks.'
+                _normalize_cover_prompt(
+                    f"{prompt}. Only the specified Japanese title, hook and subtitle; no other text or watermark."
                 ),
                 fallback_text=excerpt,
                 allow_title_text=True,
             )
         except Exception as exc:
             on_log(f"  WARN cover prompt LLM failed: {exc}; use template prompt")
-    if title not in fallback:
-        fallback = f'Render the exact title text "{title}" as the main readable cover title. {fallback}'
     return _policy_safe_image_prompt(
-        _cover_crop_safe_prompt(fallback),
+        _normalize_cover_prompt(fallback),
         fallback_text=excerpt,
         allow_title_text=True,
     )
+
+
+def _cover_error_kind(exc: Exception | str) -> str:
+    text = str(redact_secret_text(exc)).lower()
+    policy_markers = (
+        "content policy", "safety system", "safety filter", "moderation", "responsible ai",
+        "content_filter", "content blocked", "prompt blocked", "unsafe prompt", "sensitive content",
+        "policy violation", "violates", "违规", "内容审核", "安全策略", "敏感内容", "审核拒绝",
+    )
+    if any(marker in text for marker in policy_markers):
+        return "policy"
+    transient_markers = (
+        "timeout", "timed out", "rate limit", "too many requests", "temporarily unavailable",
+        "service unavailable", "connection reset", "connection refused", "connection aborted",
+        "remote protocol", "server disconnected", "bad gateway", "gateway timeout",
+        "http 429", "http 500", "http 502", "http 503", "http 504", "超时", "限流", "暂时不可用",
+    )
+    if any(marker in text for marker in transient_markers):
+        return "transient"
+    return "other"
+
+
+def _rewrite_cover_prompt_for_policy(
+    novel: Novel,
+    segments: list[Segment],
+    metadata: dict | None,
+    previous_prompt: str,
+    error_text: str,
+    on_log: LogFn = _noop,
+) -> str:
+    if not _can_call_text_llm():
+        return ""
+    bundle = _cover_marketing_bundle(novel, segments, metadata)
+    route = _llm_route_settings()
+    analysis_prompt = _cover_prompt_aspect_only(str(config.get("cover_ai_analysis_prompt", "") or "")).strip()
+    poster_method = _full_cover_poster_method_prompt()
+    system_prompt = "\n\n".join(x for x in (analysis_prompt, poster_method) if x)
+    llm = LLMBackend(
+        provider=route["provider"],
+        base_url=route["base_url"],
+        api_key=route["api_key"],
+        model=route["model"],
+        system_prompt=system_prompt,
+        style_suffix="",
+        temperature=0.45,
+        max_tokens=int(config.get("cover_prompt_max_tokens", 1400) or 1400),
+    )
+    request = (
+        "The image provider rejected the previous prompt for content-policy reasons. Rewrite it as exactly ONE complete English "
+        "image-generation prompt. Keep the same factual story event, premium manga-ad style, subject-specific palette, Japanese "
+        "headline hierarchy and horizontal 16:9 composition, but replace any risky physical action, injury, threat, sexualized detail, "
+        "minor depiction or graphic wording with a fully clothed adult-looking, non-contact, symbolic emotional confrontation. "
+        "Do not return analysis or alternatives.\n\n"
+        f"Marketing candidates:\n{json.dumps(bundle, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        f"Provider rejection summary:\n{redact_secret_text(error_text)[:700]}\n\n"
+        f"Previous prompt:\n{previous_prompt[:5000]}"
+    )
+    try:
+        with external_api_slot(action="cover policy rewrite"):
+            rewritten = llm.complete(
+                system_prompt,
+                request,
+                max_tokens=int(config.get("cover_prompt_max_tokens", 1400) or 1400),
+                temperature=0.45,
+            ).strip()
+        return _policy_safe_image_prompt(
+            _normalize_cover_prompt(
+                f"{rewritten}. Only the specified Japanese title, hook and subtitle; no other text or watermark."
+            ),
+            fallback_text=" ".join(bundle["synopses"]),
+            allow_title_text=True,
+        )
+    except Exception as exc:
+        on_log(f"  WARN cover policy rewrite failed: {redact_secret_text(exc)}")
+        return ""
 
 
 def _cover_negative_prompt() -> str:
@@ -3590,11 +4974,6 @@ def _cover_negative_prompt() -> str:
         if "title text" in lower or "readable text" in lower:
             continue
         filtered.append(item)
-    filtered.extend([
-        "cropped head", "cut-off head", "cropped face", "face outside frame",
-        "forehead outside frame", "title outside frame", "cropped typography",
-        "person touching image edge", "extreme close-up", "portrait crop",
-    ])
     return ", ".join(item for item in filtered if item)
 
 
@@ -3740,11 +5119,44 @@ def _render_cover_title(raw_path: Path, out_path: Path, title: str) -> Path:
     return out_path
 
 
+def render_series_cover_badge(cover_path: Path, label: str) -> Path:
+    """Add a durable, readable series/part marker without regenerating art."""
+    label = str(label or "").strip()
+    if not label or not cover_path.exists():
+        return cover_path
+    img = Image.open(cover_path).convert("RGBA")
+    width, height = img.size
+    size = max(22, min(56, int(width / 30)))
+    font = _load_title_font(str(config.get("cover_title_font", "Microsoft YaHei") or "Microsoft YaHei"), size)
+    draw = ImageDraw.Draw(img)
+    pad_x, pad_y = max(16, width // 55), max(10, height // 70)
+    text_w = _text_width(draw, label, font)
+    text_h = _line_height(draw, label, font)
+    box_w = min(width - pad_x * 2, text_w + pad_x * 2)
+    box_h = text_h + pad_y * 2
+    x, y = pad_x, pad_y
+    draw.rounded_rectangle((x, y, x + box_w, y + box_h), radius=max(8, size // 4), fill=(20, 15, 30, 220), outline=(244, 210, 110, 255), width=max(1, size // 18))
+    draw.text((x + pad_x, y + pad_y - 2), label, font=font, fill=(255, 244, 205, 255), stroke_width=max(1, size // 24), stroke_fill=(0, 0, 0, 220))
+    img.convert("RGB").save(cover_path, "JPEG", quality=93, optimize=True)
+    return cover_path
+
+
 def _finalize_cover_image(raw_path: Path, out_path: Path, width: int, height: int) -> Path:
     img = Image.open(raw_path).convert("RGB")
     img = ImageOps.fit(img, (max(320, int(width)), max(180, int(height))), method=Image.LANCZOS, centering=(0.5, 0.5))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path, "JPEG", quality=93, optimize=True)
+    return out_path
+
+
+def _fit_provider_cover_to_16_9(source_path: Path, out_path: Path, width: int, height: int) -> Path:
+    """Normalize a provider response to the configured exact 16:9 output size."""
+    target = (max(320, int(width)), max(180, int(height)))
+    with Image.open(source_path) as opened:
+        source = ImageOps.exif_transpose(opened).convert("RGB")
+    result = ImageOps.fit(source, target, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result.save(out_path, "PNG")
     return out_path
 
 
@@ -3799,46 +5211,62 @@ def stage_cover(
     segments: list[Segment],
     job_dir: Path,
     on_log: LogFn = _noop,
+    metadata: dict | None = None,
+    force: bool = False,
 ) -> Path | None:
-    if not bool(config.get("cover_enabled", True)):
+    if not force and not bool(config.get("cover_enabled", True)):
         return None
+    if not series_animation_enabled_for_job(job_dir) and isinstance(metadata, dict):
+        metadata = dict(metadata)
+        for key in (
+            "series_short_title", "series_part_label", "series_upload_prefix",
+            "series_cover_label", "series_display_title",
+        ):
+            metadata.pop(key, None)
 
-    title = _clean_display_title(novel.title)
+    marketing_bundle = _cover_marketing_bundle(novel, segments, metadata)
+    title = str(marketing_bundle["titles"][0])
+    excerpt = str(marketing_bundle["synopses"][0])
     cover_dir = job_dir / "cover"
     cover_dir.mkdir(parents=True, exist_ok=True)
+    provider_raw_path = cover_dir / "cover_provider_raw.png"
     raw_path = cover_dir / "cover_raw.png"
     out_path = cover_dir / "cover.jpg"
     manifest_path = cover_dir / "cover_manifest.json"
-    if _image_fallback_mode(job_dir):
+    attempts_path = cover_dir / "cover_prompt_attempts.json"
+    if not force and _image_fallback_mode(job_dir):
         if out_path.exists() and out_path.stat().st_size > 1000:
             on_log(f"  reuse cover without image API: {out_path}")
             return out_path
         on_log("  skip cover generation: image-reuse retry does not call image API")
         return None
-    excerpt = _cover_excerpt(novel, segments)
     cover_backend = _cover_backend_settings()
     provider = cover_backend["provider"]
     expected_hash = _stable_hash(
         {
-            "schema": "cover_v3_crop_safe_fullscreen",
-            "title": title,
-            "excerpt_hash": _text_hash(excerpt),
+            "schema": "cover_v13_configurable_api_request_size",
+            "marketing_bundle": marketing_bundle,
+            "series_cover_label": str((metadata or {}).get("series_cover_label") or ""),
             "provider": provider,
             "base_url": cover_backend["base_url"],
             "model": cover_backend["model"],
+            "request_width": int(cover_backend.get("request_width") or 0),
+            "request_height": int(cover_backend.get("request_height") or 0),
             "style": config.llm_image_style_suffix,
             "prompt_template": config.get("cover_prompt_template", ""),
             "custom_prompt": config.get("cover_custom_prompt", ""),
             "analysis_prompt": config.get("cover_ai_analysis_prompt", ""),
+            "poster_method_prompt": _full_cover_poster_method_prompt(),
             "width": int(config.get("cover_width", 1280) or 1280),
             "height": int(config.get("cover_height", 720) or 720),
-            "title_mode": "prompt_generated",
+            "title_mode": "three_candidates_single_cover_prompt",
             "api_key_hash": _text_hash(cover_backend["api_key"])[:16],
         }
     )
     manifest = _read_json(manifest_path, {})
     if (
         isinstance(manifest, dict)
+        and manifest.get("status") == "ready"
         and manifest.get("input_hash") == expected_hash
         and out_path.exists()
         and out_path.stat().st_size > 1000
@@ -3846,8 +5274,8 @@ def stage_cover(
         on_log(f"  reuse cover: {out_path}")
         return out_path
 
-    on_log(f"[cover] Generate cover from title/text: {title}")
-    prompt = _build_cover_prompt(novel, segments, on_log=on_log)
+    on_log(f"[cover] Generate from generated title and story synopsis: {title}")
+    prompt = _build_cover_prompt(novel, segments, metadata=metadata, on_log=on_log)
     (cover_dir / "cover_prompt.txt").write_text(prompt, encoding="utf-8")
     width = int(config.get("cover_width", 1280) or 1280)
     height = int(config.get("cover_height", 720) or 720)
@@ -3860,19 +5288,110 @@ def stage_cover(
         cfg=config.image_cfg,
         workflow_path=cover_backend.get("workflow_path", ""),
         timeout_seconds=config.get("image_api_timeout_seconds", 300),
+        preserve_source=True,
+        request_width=cover_backend.get("request_width", 0),
+        request_height=cover_backend.get("request_height", 0),
     )
-    raw_tmp = raw_path.with_suffix(".tmp.png")
-    raw_tmp.unlink(missing_ok=True)
-    try:
-        if provider == "placeholder":
-            _create_cover_placeholder(prompt, title, raw_tmp, width, height)
-        else:
-            with external_api_slot(action="cover image"):
-                backend.generate(prompt, _cover_negative_prompt(), raw_tmp, width=width, height=height)
-        raw_tmp.replace(raw_path)
-    except Exception as exc:
-        raw_tmp.unlink(missing_ok=True)
-        on_log(f"  WARN cover image generation failed: {exc}; use generated video image fallback")
+    provider_tmp = cover_dir / "cover_provider_raw.tmp.png"
+    provider_tmp.unlink(missing_ok=True)
+    provider_raw_path.unlink(missing_ok=True)
+    prompt_versions = max(1, min(3, int(config.get("cover_policy_prompt_versions", 3) or 3)))
+    transient_retries = max(1, min(5, int(config.get("cover_transient_retries", 3) or 3)))
+    attempt_log = {
+        "schema_version": 1,
+        "input_hash": expected_hash,
+        "marketing_bundle": marketing_bundle,
+        "prompt_versions": [],
+        "status": "running",
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    generated = False
+    final_error = ""
+    current_prompt = prompt
+    for version_index in range(prompt_versions):
+        version_record = {
+            "version": version_index + 1,
+            "prompt": current_prompt,
+            "image_attempts": [],
+        }
+        attempt_log["prompt_versions"].append(version_record)
+        (cover_dir / "cover_prompt.txt").write_text(current_prompt, encoding="utf-8")
+        policy_rejected = False
+        for image_attempt in range(transient_retries):
+            provider_tmp.unlink(missing_ok=True)
+            try:
+                if provider == "placeholder":
+                    _create_cover_placeholder(current_prompt, title, provider_tmp, width, height)
+                else:
+                    with external_api_slot(action="cover image"):
+                        backend.generate(
+                            current_prompt,
+                            _cover_negative_prompt(),
+                            provider_tmp,
+                            width=width,
+                            height=height,
+                        )
+                provider_tmp.replace(provider_raw_path)
+                _fit_provider_cover_to_16_9(provider_raw_path, raw_path, width, height)
+                with Image.open(provider_raw_path) as provider_image:
+                    provider_size = list(provider_image.size)
+                version_record["image_attempts"].append({
+                    "attempt": image_attempt + 1,
+                    "status": "success",
+                    "provider_size": provider_size,
+                    "adapted_size": [width, height],
+                    "adaptation": "exact_16_9_output_fit",
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                generated = True
+                prompt = current_prompt
+                break
+            except Exception as exc:
+                provider_tmp.unlink(missing_ok=True)
+                final_error = str(redact_secret_text(exc))
+                kind = _cover_error_kind(exc)
+                version_record["image_attempts"].append({
+                    "attempt": image_attempt + 1,
+                    "status": "failed",
+                    "error_kind": kind,
+                    "error": final_error[:1000],
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                attempt_log["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                _write_json(attempts_path, attempt_log)
+                if kind == "policy":
+                    policy_rejected = True
+                    on_log(f"  WARN cover prompt rejected by policy (version {version_index + 1}); rewrite only this prompt")
+                    break
+                if kind == "transient" and image_attempt + 1 < transient_retries:
+                    on_log(f"  WARN temporary cover image error; retry same prompt ({image_attempt + 2}/{transient_retries})")
+                    time.sleep(min(4, 2 * (image_attempt + 1)))
+                    continue
+                break
+        if generated:
+            break
+        if policy_rejected and version_index + 1 < prompt_versions:
+            rewritten = _rewrite_cover_prompt_for_policy(
+                novel,
+                segments,
+                metadata,
+                current_prompt,
+                final_error,
+                on_log=on_log,
+            )
+            if rewritten:
+                current_prompt = rewritten
+                continue
+        break
+
+    attempt_log["status"] = "success" if generated else "fallback"
+    attempt_log["final_prompt_version"] = len(attempt_log["prompt_versions"])
+    attempt_log["final_error"] = "" if generated else final_error[:1000]
+    attempt_log["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    _write_json(attempts_path, attempt_log)
+    if not generated:
+        prompt = current_prompt
+        on_log(f"  WARN cover image generation failed: {final_error}; use generated video image fallback")
         if not _create_cover_from_video_image(job_dir, raw_path, width, height):
             on_log("  WARN no generated image available for cover fallback; use placeholder")
             _create_cover_placeholder(prompt, title, raw_path, width, height)
@@ -3882,11 +5401,18 @@ def stage_cover(
         manifest_path,
         {
             "schema_version": 1,
-            "status": "ready",
+            "status": "ready" if generated else "fallback",
             "input_hash": expected_hash,
             "title": title,
+            "title_candidates": marketing_bundle["titles"],
+            "series_cover_label": str((metadata or {}).get("series_cover_label") or ""),
+            "synopsis_candidates": marketing_bundle["synopses"],
+            "title_source": "metadata.titles[0]",
+            "synopsis_source": "metadata.synopses[0]",
             "provider": provider,
             "prompt": prompt,
+            "prompt_attempts_path": str(attempts_path),
+            "provider_raw_path": str(provider_raw_path) if provider_raw_path.exists() else "",
             "raw_path": str(raw_path),
             "path": str(out_path),
             "file": _file_signature(out_path),
@@ -3895,6 +5421,211 @@ def stage_cover(
     )
     on_log(f"  OK cover: {out_path}")
     return out_path
+
+
+def _series_group_job_dirs(job_dir: Path) -> tuple[list[Path], int]:
+    status = _read_json(job_dir / "status.json", {})
+    group_key = str(status.get("series_group_key") or "").strip()
+    series_title = str(status.get("series_title") or "").strip()
+    try:
+        expected = int(status.get("series_total") or 0)
+    except (TypeError, ValueError):
+        expected = 0
+    entries: list[tuple[int, Path]] = []
+    for candidate in JOBS_DIR.iterdir():
+        if not candidate.is_dir():
+            continue
+        sibling = _read_json(candidate / "status.json", {})
+        same_group = (
+            bool(group_key)
+            and str(sibling.get("series_group_key") or "").strip() == group_key
+        ) or (
+            not group_key
+            and bool(series_title)
+            and str(sibling.get("series_title") or "").strip() == series_title
+        )
+        if not same_group:
+            continue
+        try:
+            episode = int(sibling.get("series_episode") or 0)
+        except (TypeError, ValueError):
+            episode = 0
+        if episode > 0:
+            entries.append((episode, candidate))
+            expected = max(expected, episode)
+    entries.sort(key=lambda item: (item[0], item[1].name))
+    return [path for _episode, path in entries], expected
+
+
+def regenerate_job_cover(
+    job_id: str, on_log: LogFn = _noop, *, allow_running: bool = False, ensure_marketing: bool = True
+) -> Path:
+    """Regenerate only one job's cover from its saved text artifacts.
+
+    The current GUI configuration is used intentionally. Existing narration,
+    scene images, subtitles and video are left untouched. The previous cover
+    is restored if an unexpected error interrupts regeneration.
+    """
+    if is_worker_running(job_id) and not allow_running:
+        raise RuntimeError(f"{job_id} 正在运行，请先停止任务后再重新生成封面。")
+    job_dir = _safe_job_path(job_id)
+    if not job_dir.exists():
+        raise FileNotFoundError(f"任务不存在：{job_id}")
+
+    novel = _read_saved_novel(job_dir / "novel.json")
+    segments = _read_saved_segments(job_dir / "segments.json")
+    if novel is None or segments is None:
+        raise RuntimeError("任务还没有完成文本整理，暂时不能单独重新生成封面。")
+    metadata = _read_json(job_dir / "metadata.json", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    if ensure_marketing and not _metadata_has_marketing_candidates(metadata):
+        saved_context = _read_json(job_dir / "story_visual_context.json", {})
+        story_context = saved_context.get("context") if isinstance(saved_context, dict) else {}
+        if not isinstance(story_context, dict):
+            story_context = {}
+        on_log("manual cover regeneration: old/missing marketing metadata; generate 3 titles, 2 synopses and tags first")
+        metadata = stage_metadata(
+            novel,
+            job_dir,
+            story_context,
+            segments=segments,
+            on_log=on_log,
+        )
+
+    previous_status = load_status(job_id, include_worker=False)
+    previous_stage = str(previous_status.get("stage") or "queued")
+    previous_progress = previous_status.get("progress", 0.0)
+    previous_error = str(previous_status.get("error") or "")
+    cover_dir = job_dir / "cover"
+    backup_dir = job_dir / f".cover_before_regenerate_{secrets.token_hex(6)}"
+    if cover_dir.exists():
+        cover_dir.replace(backup_dir)
+
+    write_status(job_dir, stage="cover", progress=0.89, error="", manual_cover_error="")
+    on_log("manual cover regeneration started: keep audio, scene images and video")
+    try:
+        cover = stage_cover(
+            novel,
+            segments,
+            job_dir,
+            metadata=metadata,
+            on_log=on_log,
+            force=True,
+        )
+        if cover is None or not cover.exists():
+            raise RuntimeError("封面生成没有产生可用文件。")
+    except Exception as exc:
+        if cover_dir.exists():
+            shutil.rmtree(cover_dir)
+        if backup_dir.exists():
+            backup_dir.replace(cover_dir)
+        safe_error = str(redact_secret_text(exc))
+        write_status(
+            job_dir,
+            stage=previous_stage,
+            progress=previous_progress,
+            error=previous_error,
+            manual_cover_error=safe_error,
+        )
+        on_log(f"manual cover regeneration failed: {safe_error}")
+        raise
+
+    if backup_dir.exists():
+        shutil.rmtree(backup_dir)
+
+    result_path = job_dir / "result.json"
+    result = _read_json(result_path, {})
+    if result_path.exists() and isinstance(result, dict):
+        result["cover"] = str(cover)
+        _write_json(result_path, result)
+
+    # Keep an already-exported delivery package in sync without re-exporting
+    # or touching its finished video.
+    try:
+        source_path = str(previous_status.get("source_path") or previous_status.get("input") or "")
+        source = Path(source_path).expanduser()
+        exported_directory = str(result.get("exported_directory") or "") if isinstance(result, dict) else ""
+        exported = Path(exported_directory).expanduser() if exported_directory else None
+        source_export = bool(
+            source.is_file()
+            and exported is not None
+            and exported.is_dir()
+            and exported.resolve() == source.parent.resolve()
+        )
+        if source.is_file() and (bool(config.get("output_to_input_directory", False)) or source_export):
+            base = safe_job_name(source.stem, fallback="article")
+            shutil.copy2(cover, source.parent.resolve() / f"{base}_cover{cover.suffix.lower() or '.jpg'}")
+        if exported is not None and exported.is_dir() and not source_export:
+            shutil.copy2(cover, exported / cover.name)
+    except Exception as exc:
+        on_log(f"  WARN regenerated cover could not be synced to the delivery folder: {redact_secret_text(exc)}")
+
+    write_status(
+        job_dir,
+        stage=previous_stage,
+        progress=previous_progress,
+        cover=str(cover),
+        error=previous_error,
+        manual_cover_error="",
+    )
+    on_log(f"manual cover regeneration completed: {cover}")
+    return cover
+
+
+def regenerate_job_marketing_and_cover(
+    job_id: str, on_log: LogFn = _noop, *, allow_running: bool = False
+) -> Path:
+    """Rebuild only publishing metadata and cover, never video-related media."""
+    if is_worker_running(job_id) and not allow_running:
+        raise RuntimeError(f"{job_id} 正在运行，请先停止任务后再重新生成。")
+    job_dir = _safe_job_path(job_id)
+    novel = _read_saved_novel(job_dir / "novel.json")
+    segments = _read_saved_segments(job_dir / "segments.json")
+    if novel is None or segments is None:
+        raise RuntimeError("任务缺少已保存的正文或分段，无法只重做标题和封面。")
+    saved_context = _read_json(job_dir / "story_visual_context.json", {})
+    story_context = saved_context.get("context") if isinstance(saved_context, dict) else {}
+    if not isinstance(story_context, dict):
+        story_context = {}
+    on_log("legacy marketing rebuild: regenerate titles/synopses, then cover; keep video/audio/images/subtitles")
+    metadata = stage_metadata(novel, job_dir, story_context, segments=segments, on_log=on_log)
+    metadata = apply_series_presentation(metadata, job_dir, on_log=on_log)
+    _write_json(job_dir / "metadata.json", metadata)
+    return regenerate_job_cover(job_id, on_log=on_log, allow_running=True)
+
+
+def queue_marketing_cover_rebuild(job_ids: Iterable[str], on_log: LogFn = _noop) -> tuple[list[str], list[tuple[str, int]]]:
+    """Durably queue metadata-and-cover-only repairs using current settings."""
+    queued: list[str] = []
+    for raw_job_id in job_ids:
+        job_id = str(raw_job_id)
+        if is_worker_running(job_id):
+            continue
+        job_dir = _safe_job_path(job_id)
+        if not job_dir.exists():
+            continue
+        status = load_status(job_id, include_worker=False)
+        input_text = str(status.get("input") or status.get("source_path") or "")
+        if not input_text:
+            continue
+        _write_settings_snapshot(job_dir, config.as_dict())
+        clear_worker_pid(job_id)
+        write_status(
+            job_dir, job_id=job_id, input=input_text, stage="queued", progress=0.80,
+            worker_pid=None, error="", queued_compose_only=False,
+            queued_marketing_cover_only=True, queued_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        append_log(job_dir, "queued: legacy marketing title/synopsis + cover rebuild (video preserved)")
+        queued.append(job_id)
+    started: list[tuple[str, int]] = []
+    max_jobs = max(1, int(config.get("max_concurrent_jobs", 2)))
+    while count_running_workers() < max_jobs:
+        next_job = start_next_queued_job(on_log=on_log)
+        if next_job is None:
+            break
+        started.append(next_job)
+    return queued, started
 
 
 def _create_cover_from_video_image(job_dir: Path, out_path: Path, width: int, height: int) -> bool:
@@ -4026,7 +5757,7 @@ def _stage_compose_manifest_impl(
             "kind": "final_video_v2",
             # Bump when composition semantics change so an old cached render
             # (for example, one rendered with motion suppressed) is not reused.
-            "composer_revision": 3,
+            "composer_revision": 4,
             "audio": {"path": str(audio_full), **_file_signature(audio_full)},
             "images": [{"path": str(p), **_file_signature(p)} for p in images],
             "image_durations": [round(float(v), 3) for v in image_durations],
@@ -4038,7 +5769,6 @@ def _stage_compose_manifest_impl(
                 "encoder": config.get("video_encoder", "libx264"),
                 "encoder_preset": config.get("video_encoder_preset", "veryfast"),
                 "encoder_quality": config.get("video_encoder_quality", 20),
-                "safe_framing": bool(config.get("video_safe_framing", True)),
                 "ken_burns": bool(config.ken_burns),
                 "long_mode": bool(config.video_long_mode),
                 "motion": str(config.video_motion or "none"),
@@ -4100,7 +5830,6 @@ def _stage_compose_manifest_impl(
             video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
             video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
             video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
-            safe_framing=bool(config.get("video_safe_framing", True)),
         )
         video_duration = _audio_duration(tmp)
         audio_duration = _audio_duration(audio_full)
@@ -4118,27 +5847,82 @@ def _stage_compose_manifest_impl(
     return out
 
 
-def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, metadata: dict | None = None, on_log: LogFn = _noop) -> str:
-    if not bool(config.upload_enabled):
+def stage_upload(
+    video: Path,
+    title: str,
+    cover: Path | None,
+    job_dir: Path,
+    metadata: dict | None = None,
+    on_log: LogFn = _noop,
+    *,
+    force: bool = False,
+    profile_name_override: str = "",
+    schedule_enabled_override: bool | None = None,
+    scheduled_at_override: str = "",
+    schedule_timezone_override: str = "",
+) -> str:
+    if not force and not bool(config.upload_enabled):
+        return ""
+    profiles = _selected_upload_profiles(profile_name_override)
+    if not profiles:
+        return ""
+    active_mode = str(profiles[0].get("publish_mode") or config.get("youtube_publish_mode", "immediate") or "immediate")
+    if active_mode not in {"immediate", "youtube", "script"}:
+        active_mode = "immediate"
+    schedule_requested = active_mode == "youtube"
+    if active_mode in {"youtube", "script"} and not force:
+        if active_mode == "script":
+            on_log("  脚本内定时已开启：成片保留在本地，等待 GUI 发布队列到点自动上传。")
+        else:
+            on_log("  油管内定时目前处于单视频测试阶段：已跳过生成后的自动上传，请在 GUI 选中成片后测试。")
         return ""
     if str(config.youtube_upload_method or "browser").lower() != "browser":
         on_log("  WARN only browser upload is wired in this build")
         return ""
     metadata = metadata or {}
+    if metadata.get("titles") and not _metadata_has_valid_marketing_titles(metadata):
+        raise RuntimeError(
+            "标题候选无效，已阻止上传：请先重新生成标题/概梗，不能把“标题：”“简介：”或“local text input”等内部任务文字发布到 YouTube。"
+        )
     clean_title = str(metadata.get("clean_title") or _clean_display_title(title))
     context = {
         "title": title,
         "clean_title": clean_title,
         "short_title": metadata.get("short_title", ""),
+        "candidate_title": metadata.get("short_title", "") or clean_title,
         "intro": metadata.get("intro", ""),
         "author": metadata.get("author", ""),
-        "tags": str(config.youtube_tags or metadata.get("tags", "")),
+        "tags": _remove_disallowed_upload_tag(str(config.youtube_tags or "")),
         "job_id": job_dir.name,
+        "series_title": "",
+        "series_episode": "",
+        "series_total": "",
+        "series_label": "",
     }
-    profiles = _selected_upload_profiles()
-    if not profiles:
-        return ""
-    multi_upload = len(profiles) > 1
+    schedule_enabled = bool(force and schedule_requested)
+    if schedule_enabled_override is not None:
+        schedule_enabled = bool(schedule_enabled_override)
+    scheduled_at = ""
+    schedule_timezone = str(
+        schedule_timezone_override or config.get("youtube_schedule_timezone", "Asia/Tokyo") or "Asia/Tokyo"
+    ).strip()
+    if schedule_enabled:
+        if scheduled_at_override:
+            try:
+                scheduled_local = datetime.strptime(str(scheduled_at_override), "%Y-%m-%dT%H:%M")
+            except ValueError as exc:
+                raise ValueError("指定的油管定时时间格式不正确") from exc
+        else:
+            schedule_date = str(config.get("youtube_schedule_date", "") or "").strip()
+            schedule_time = str(config.get("youtube_schedule_time", "") or "").strip()
+            try:
+                scheduled_local = datetime.strptime(f"{schedule_date} {schedule_time}", "%Y-%m-%d %H:%M")
+            except ValueError as exc:
+                raise ValueError("定时发布日期或时间格式不正确，应为 YYYY-MM-DD 和 HH:MM") from exc
+        if scheduled_local <= datetime.now() + timedelta(minutes=5):
+            raise ValueError("定时发布时间必须至少晚于当前时间 5 分钟")
+        scheduled_at = scheduled_local.strftime("%Y-%m-%dT%H:%M")
+        on_log(f"  scheduled publish test: {scheduled_at} timezone={schedule_timezone}")
     on_log(f"[7/7] YouTube browser upload: {len(profiles)} profile(s)")
     lock_path = _acquire_upload_lock(job_dir, on_log)
     results: list[dict] = []
@@ -4147,7 +5931,7 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
         from app.upload import upload_to_youtube
 
         for index, profile in enumerate(profiles, start=1):
-            title_template = str(profile.get("title_template") or config.youtube_title_template or "{clean_title}")
+            title_template = str(profile.get("title_template") or config.youtube_title_template or "{candidate_title}")
             description_template = str(profile.get("description") or config.youtube_description or "")
             flow = _normalize_upload_flow(profile.get("flow") or config.browser_flow or "simple")
             visibility = str(profile.get("visibility") or config.youtube_visibility or "PRIVATE").strip().upper()
@@ -4158,14 +5942,69 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
             ad_suitability_template = str(
                 profile.get("ad_suitability_template") or config.get("browser_ad_suitability_template", "") or ""
             )
-
+            title_limit = int(config.get("youtube_title_max_chars", 100) or 100)
+            selected_candidate = _persistent_upload_candidate(job_dir, profile, metadata)
+            profile_context = dict(context)
+            if selected_candidate:
+                chosen_title = str(selected_candidate.get("candidate_title") or "").strip()
+                profile_context["candidate_title"] = chosen_title
+                profile_context["short_title"] = chosen_title
+            series_title = str(profile.get("series_title") or "").strip()
+            series_episode = str(profile.get("series_episode") or "").strip()
+            series_total = str(profile.get("series_total") or "").strip()
+            series_format = str(profile.get("series_format") or "第{episode}话").strip()
+            if series_title and series_episode:
+                try:
+                    episode_label = series_format.format(episode=series_episode, total=series_total)
+                except (KeyError, ValueError):
+                    episode_label = series_format
+                series_prefix = f"{series_title}｜{episode_label}" if episode_label else series_title
+                profile_context["series_title"] = series_title
+                profile_context["series_episode"] = series_episode
+                profile_context["series_total"] = series_total
+                profile_context["series_label"] = episode_label
+                selected = _strip_series_part_prefix(str(profile_context.get("candidate_title") or clean_title))
+                profile_context["candidate_title"] = f"{series_prefix}｜{selected}"
+                profile_context["short_title"] = profile_context["candidate_title"]
+            elif series_animation_enabled_for_job(job_dir) and str(metadata.get("series_upload_prefix") or "").strip():
+                # Automatic series presentation is derived from the completed
+                # normal titles.  Keep the series/part prefix even when the
+                # channel has no manually configured series profile.
+                auto_prefix = str(metadata.get("series_upload_prefix") or "").strip()
+                profile_context["series_title"] = str(metadata.get("series_short_title") or "")
+                profile_context["series_label"] = str(metadata.get("series_part_label") or "")
+                selected = _strip_series_part_prefix(str(profile_context.get("candidate_title") or clean_title))
+                profile_context["candidate_title"] = selected if selected.startswith(auto_prefix) else f"{auto_prefix}{selected}"
+                profile_context["short_title"] = profile_context["candidate_title"]
+            fallback_title = str(profile_context.get("candidate_title") or clean_title)
             upload_title = _limit_upload_title(
-                _format_template(title_template, context, fallback=clean_title),
-                int(config.get("youtube_title_max_chars", 100) or 100),
-            ) or clean_title
-            upload_description = _format_template(description_template, context, fallback="")
+                _format_template(title_template, profile_context, fallback=fallback_title),
+                title_limit,
+            ) or fallback_title
+            if series_title and series_episode:
+                # 无论频道模板使用哪个标题变量，系列前缀都必须稳定保留。
+                prefix = f"{series_title}｜{episode_label}｜" if episode_label else f"{series_title}｜"
+                if not upload_title.startswith(prefix):
+                    upload_title = _limit_upload_title(prefix + upload_title, title_limit) or prefix.rstrip("｜")
+            elif series_animation_enabled_for_job(job_dir) and str(metadata.get("series_upload_prefix") or "").strip():
+                prefix = str(metadata.get("series_upload_prefix") or "").strip()
+                if not upload_title.startswith(prefix):
+                    upload_title = _limit_upload_title(prefix + upload_title, title_limit) or prefix.rstrip("｜")
+            upload_title = _append_generated_tags_to_upload_title(
+                upload_title,
+                metadata.get("generated_tags") or metadata.get("generated_tag_line") or [],
+                title_limit,
+            )
+            upload_description = _remove_disallowed_upload_tag(
+                _format_template(description_template, profile_context, fallback="")
+            )
             profile_name = str(profile.get("name") or f"上传方案{index}").strip() or f"上传方案{index}"
             on_log(f"  [{index}/{len(profiles)}] profile={profile_name} chrome_profile={chrome_profile} flow={'精简' if flow == 'simple' else '完整'}")
+            if selected_candidate:
+                on_log(
+                    f"    random title candidate {selected_candidate.get('candidate_index')}: "
+                    f"{selected_candidate.get('candidate_title')}"
+                )
 
             def _profile_progress(progress, *, current=index, total=len(profiles)):
                 try:
@@ -4191,16 +6030,39 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
                 browser_profiles=str(config.get("browser_profiles", "[]") or "[]"),
                 browser_active_profile=profile_name,
                 upload_all_profiles=False,
-                force_profile_launch=multi_upload,
+                # Port 9222 may still belong to another channel's Chrome
+                # profile. Always restart with the selected profile before
+                # uploading, including single-channel uploads.
+                force_profile_launch=True,
                 auto_restart=bool(config.browser_auto_restart),
                 stall_timeout_min=int(config.browser_stall_timeout_min or 10),
                 op_speed=str(config.browser_op_speed or "normal"),
+                schedule_enabled=schedule_enabled,
+                scheduled_at=scheduled_at,
+                schedule_timezone=schedule_timezone,
                 on_log=on_log,
                 on_progress=_profile_progress,
             )
             if not video_id:
                 raise RuntimeError(f"YouTube upload failed: {profile_name}")
-            url = f"https://www.youtube.com/watch?v={video_id}"
+            if video_id == "SCHEDULE_UNCONFIRMED":
+                review_result = {
+                    "profile": profile_name,
+                    "chrome_profile": chrome_profile,
+                    "video_id": "",
+                    "url": "",
+                    "title": upload_title,
+                    "description": upload_description,
+                    "visibility": "SCHEDULED",
+                    "flow": flow,
+                    "publish_mode": "scheduled",
+                    "scheduled_at": scheduled_at,
+                    "schedule_timezone": schedule_timezone,
+                    "schedule_status": "needs_review",
+                }
+                _write_json(job_dir / "upload_result.json", {"uploads": results + [review_result], **review_result})
+                raise RuntimeError("已经点击 YouTube 预定按钮，但未确认到成功弹窗；为避免重复上传，已停止重试，请到 Studio 检查。")
+            url = f"https://www.youtube.com/watch?v={video_id}" if re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id)) else ""
             results.append(
                 {
                     "profile": profile_name,
@@ -4209,12 +6071,19 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
                     "url": url,
                     "title": upload_title,
                     "description": upload_description,
-                    "visibility": visibility,
+                    "visibility": "SCHEDULED" if schedule_enabled else visibility,
                     "flow": flow,
+                    "publish_mode": "scheduled" if schedule_enabled else "immediate",
+                    "scheduled_at": scheduled_at if schedule_enabled else "",
+                    "schedule_timezone": schedule_timezone if schedule_enabled else "",
+                    "schedule_status": "scheduled" if schedule_enabled else "published",
                 }
             )
             _write_json(job_dir / "upload_result.json", {"uploads": results, **results[0]})
-            on_log(f"  OK uploaded [{profile_name}]: {url}")
+            if schedule_enabled:
+                on_log(f"  OK scheduled [{profile_name}] {scheduled_at}: {url or video_id}")
+            else:
+                on_log(f"  OK uploaded [{profile_name}]: {url}")
     finally:
         _release_upload_lock(lock_path, job_dir.name)
     if not results:
@@ -4223,6 +6092,56 @@ def stage_upload(video: Path, title: str, cover: Path | None, job_dir: Path, met
     if len(results) > 1:
         on_log(f"  OK uploaded {len(results)} copies")
     return str(results[0].get("url") or "")
+
+
+def upload_completed_job(
+    job_id: str,
+    on_log: LogFn = _noop,
+    *,
+    profile_name_override: str = "",
+    schedule_enabled_override: bool | None = None,
+    scheduled_at_override: str = "",
+    schedule_timezone_override: str = "",
+) -> str:
+    """Upload an existing finished video without restarting its production stages."""
+    job_dir = job_dir_for(job_id)
+    status = load_status(job_id)
+    if status.get("worker_alive"):
+        raise RuntimeError("任务仍在制作中，请完成后再单独上传。")
+    video = Path(str(status.get("video") or video_output_path(job_dir)))
+    if not video.exists() or video.stat().st_size < 100:
+        raise FileNotFoundError("没有找到已完成的视频，无法上传。")
+    metadata = _read_json(job_dir / "metadata.json", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    cover_value = str(status.get("cover") or "")
+    cover = Path(cover_value) if cover_value else None
+    if cover is not None and not cover.exists():
+        cover = None
+    title = str(metadata.get("title") or status.get("title") or job_id)
+    write_status(job_dir, stage="upload", progress=1.0, upload_progress=0.0, error="")
+    append_log(job_dir, "manual upload started for completed video")
+    try:
+        url = stage_upload(
+            video,
+            title,
+            cover,
+            job_dir,
+            metadata=metadata,
+            on_log=on_log,
+            force=True,
+            profile_name_override=profile_name_override,
+            schedule_enabled_override=schedule_enabled_override,
+            scheduled_at_override=scheduled_at_override,
+            schedule_timezone_override=schedule_timezone_override,
+        )
+    except Exception as exc:
+        write_status(job_dir, stage="completed", progress=1.0, upload_error=str(exc))
+        append_log(job_dir, f"manual upload failed: {exc}")
+        raise
+    write_status(job_dir, stage="completed", progress=1.0, youtube_url=url, upload_error="")
+    append_log(job_dir, f"manual upload completed: {url}")
+    return url
 
 
 def _upload_profiles() -> list[dict]:
@@ -4310,8 +6229,13 @@ def _active_upload_profile() -> dict:
     return dict(profiles[0]) if profiles else {}
 
 
-def _selected_upload_profiles() -> list[dict]:
+def _selected_upload_profiles(profile_name_override: str = "") -> list[dict]:
     profiles = [_normalize_upload_profile(profile, idx) for idx, profile in enumerate(_upload_profiles())]
+    if profile_name_override:
+        selected = [dict(profile) for profile in profiles if str(profile.get("name") or "") == profile_name_override]
+        if not selected:
+            raise ValueError(f"找不到脚本定时队列指定的频道方案：{profile_name_override}")
+        return selected
     if bool(config.get("browser_upload_all_profiles", False)):
         enabled = [dict(profile) for profile in profiles if profile.get("enabled", True)]
         return enabled or [_active_upload_profile()]
@@ -4446,7 +6370,6 @@ def resume_compose_only(job_id: str, on_log: LogFn = _noop) -> Path:
         video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
         video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
         video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
-        safe_framing=bool(config.get("video_safe_framing", True)),
     )
     on_log(f"  OK 视频完成: {out}")
     return out
@@ -4508,35 +6431,47 @@ def run_full(
     progress("starting", 0.0, input=url_or_id, site=config.scraper_site, worker_pid=os.getpid(), started_at=time.strftime("%Y-%m-%d %H:%M:%S"))
     try:
         imported_audio_mode = (job_dir / IMPORTED_AUDIO_MANIFEST).exists()
-        progress("scrape", 0.03)
-        novel = timed(
-            "1_scrape",
-            stage_scrape,
-            url_or_id,
-            site=config.scraper_site,
-            max_chars=0 if imported_audio_mode else config.scraper_max_chars,
-            on_log=log,
-        )
-        _write_novel(job_dir / "novel.json", novel)
-        metadata = timed("2_metadata", stage_metadata, novel, job_dir, on_log=log)
-        progress("clean", 0.10, title=novel.title, short_title=metadata.get("short_title", ""))
+        novel = _read_saved_novel(job_dir / "novel.json") if resume else None
+        segments = _read_saved_segments(job_dir / "segments.json") if resume else None
+        if novel is not None and segments is not None:
+            log(f"resume: reuse saved source and {len(segments)} cleaned segments")
+            progress("tts", 0.15, title=novel.title)
+        else:
+            progress("scrape", 0.03)
+            novel = timed(
+                "1_scrape",
+                stage_scrape,
+                url_or_id,
+                site=config.scraper_site,
+                max_chars=0 if imported_audio_mode else config.scraper_max_chars,
+                on_log=log,
+            )
+            _write_novel(job_dir / "novel.json", novel)
+            progress("clean", 0.10, title=novel.title)
 
-        segments = timed(
-            "3_clean",
-            stage_clean,
-            novel,
-            on_log=log,
-            job_dir=job_dir,
-            preserve_source_text=imported_audio_mode,
-        )
-        _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
-        story_context = timed("4_story_context", stage_story_context, novel, segments, job_dir, on_log=log)
-        character_analysis = timed("4_character_analysis", stage_character_analysis, novel, segments, job_dir, on_log=log)
-        character_analysis = timed("4b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
+            segments = timed(
+                "2_clean",
+                stage_clean,
+                novel,
+                on_log=log,
+                job_dir=job_dir,
+                preserve_source_text=imported_audio_mode,
+            )
+            _apply_series_title_to_novel(novel, job_dir, log)
+            _write_json(job_dir / "segments.json", [{"i": s.index, "text": s.text} for s in segments])
+        story_context = timed("3_story_context", stage_story_context, novel, segments, job_dir, on_log=log)
+        metadata = timed("4_metadata", stage_metadata, novel, job_dir, story_context, segments=segments, on_log=log)
+        if series_animation_enabled_for_job(job_dir):
+            metadata = apply_series_presentation(metadata, job_dir, on_log=log)
+            _write_json(job_dir / "metadata.json", metadata)
+        character_analysis = timed("5_character_analysis", stage_character_analysis, novel, segments, job_dir, on_log=log)
+        character_analysis = share_series_character_analysis(job_dir, character_analysis, on_log=log)
+        character_analysis = timed("5b_character_references", stage_character_references, character_analysis, job_dir, on_log=log)
         progress("tts", 0.15, title=novel.title)
 
         # A user-selected fallback means this resumed job must spend effort on
         # missing TTS only; it must never start another image API request.
+        tts_redo_reuse_images = (job_dir / TTS_REDO_REUSE_IMAGES_FILE).exists()
         image_fallback_mode = _image_fallback_mode(job_dir)
         even_image_count = len(_valid_scene_images(job_dir)) if image_fallback_mode else None
         overlap_images = bool(config.get("pipeline_overlap_tts_images", True)) and not image_fallback_mode
@@ -4645,7 +6580,12 @@ def run_full(
         _finalize_highlight_timeline(plans, segments, durs, job_dir, on_log=log)
         _write_json(job_dir / "plans.json", [_image_plan_to_dict(p) for p in plans])
         progress("cover", 0.89, title=novel.title)
-        cover = timed("7_cover", stage_cover, novel, segments, job_dir, on_log=log)
+        if tts_redo_reuse_images:
+            saved_cover = job_dir / "cover" / "cover.jpg"
+            cover = saved_cover if saved_cover.exists() else None
+            log("  full TTS redo: reuse existing scene images and cover; skip all image API calls")
+        else:
+            cover = timed("7_cover", stage_cover, novel, segments, job_dir, metadata=metadata, on_log=log)
         progress("compose", 0.90, title=novel.title, cover=str(cover or ""))
 
         video = timed("8_compose", stage_compose, audios, durs, segments, plans, images, job_dir, on_log=log)
@@ -4654,8 +6594,11 @@ def run_full(
             cover,
             novel.title,
             str(metadata.get("short_title", "") or ""),
+            source_path=str(_read_json(job_dir / "status.json", {}).get("source_path") or _read_json(job_dir / "status.json", {}).get("input") or ""),
             on_log=log,
         )
+        if tts_redo_reuse_images:
+            (job_dir / TTS_REDO_REUSE_IMAGES_FILE).unlink(missing_ok=True)
         youtube_url = ""
         if bool(config.upload_enabled):
             progress("upload", 0.96, title=novel.title, short_title=metadata.get("short_title", ""), video=str(video), cover=str(cover or ""))
@@ -4671,6 +6614,9 @@ def run_full(
             "cover": str(cover or ""),
             "title": novel.title,
             "short_title": metadata.get("short_title", ""),
+            "title_candidates": metadata.get("titles", []),
+            "synopsis_candidates": metadata.get("synopses", []),
+            "generated_tag_line": metadata.get("generated_tag_line", ""),
             "youtube_url": youtube_url,
             "performance": performance,
         }
@@ -4772,7 +6718,12 @@ def _fallback_storyboard_prompt(text: str) -> str:
     prefix = str(config.get("llm_image_prompt_prefix", "") or "").strip()
     prompt = (
         f"{prefix} "
-        f"Story mood reference: {excerpt}. {config.llm_image_style_suffix}"
+        "Depict mainland Chinese late Han dynasty people and places only: Chinese facial features, Han robes and armor, "
+        "Chinese palace, village, battlefield, banners, and weapons; never Japanese people, kimono, samurai, shrine, or Japan setting. "
+        f"{config.llm_image_style_suffix}. "
+        # Keep the concrete narration at the end: the safe prompt length cap
+        # intentionally preserves the tail as well as the global style lock.
+        f"Scene-specific Three Kingdoms event to depict: {excerpt}."
     )
     return _policy_safe_image_prompt(prompt, fallback_text="")
 
@@ -4896,6 +6847,54 @@ def _write_novel(path: Path, novel: Novel):
             "chapters": [{"index": c.index, "title": c.title, "text": c.text} for c in novel.chapters],
         },
     )
+
+
+def _read_saved_novel(path: Path) -> Novel | None:
+    """Read a completed scrape artifact for a genuine resume without re-scraping."""
+    payload = _read_json(path, {})
+    if not isinstance(payload, dict):
+        return None
+    chapters = payload.get("chapters")
+    if not isinstance(chapters, list):
+        return None
+    restored = []
+    for index, chapter in enumerate(chapters, start=1):
+        if not isinstance(chapter, dict):
+            return None
+        text = str(chapter.get("text") or "").strip()
+        if not text:
+            return None
+        restored.append(NovelChapter(
+            index=int(chapter.get("index") or index),
+            title=str(chapter.get("title") or ""),
+            text=text,
+        ))
+    if not restored:
+        return None
+    return Novel(
+        site=str(payload.get("site") or "text"),
+        novel_id=str(payload.get("id") or ""),
+        title=str(payload.get("title") or "untitled"),
+        author=str(payload.get("author") or ""),
+        description=str(payload.get("description") or ""),
+        chapters=restored,
+    )
+
+
+def _read_saved_segments(path: Path) -> list[Segment] | None:
+    """Read saved clean/split output, returning None when it is incomplete."""
+    rows = _read_json(path, [])
+    if not isinstance(rows, list) or not rows:
+        return None
+    segments = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            return None
+        text = str(row.get("text") or "").strip()
+        if not text:
+            return None
+        segments.append(Segment(index=int(row.get("i", row.get("index", index)) or index), text=text))
+    return segments
 
 
 def _image_plan_to_dict(plan: ImagePlan) -> dict:
