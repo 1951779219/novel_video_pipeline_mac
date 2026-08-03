@@ -42,4 +42,4 @@ print(redact_secret_text("Bearer sk-example1234567890"))
 PY
 ```
 
-When packaging for another Mac, scrub API keys in `data/settings.json` and `data/profiles/*.json`. Do not package `data/jobs`, `data/chrome_debug_profile`, runtime caches, or local browser login data.
+When packaging for another Mac, scrub API keys in `data/settings.json` and `data/profiles/*.json`. Do not package `data/jobs`, `data/projects`, `data/chrome_debug_profile`, runtime caches, or local browser login data.

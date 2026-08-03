@@ -26,6 +26,7 @@ PROTECTED_DATA_ITEMS = (
     "settings.json",
     "profiles",
     "jobs",
+    "projects",
     "runtime",
     "chrome_debug_profile",
     "chrome_debug_profiles",

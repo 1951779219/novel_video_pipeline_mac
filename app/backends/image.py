@@ -1,6 +1,6 @@
 """Image backend：统一接口 generate(prompt, negative, out_path, w, h)
 支持：
-  - openai     (DALL·E 3 / gpt-image-1)
+  - openai     (GPT Image 2)
   - sdwebui    (AUTOMATIC1111 /sdapi/v1/txt2img)
   - comfyui    (本地 ComfyUI，需要预设 workflow.json)
   - replicate  (Replicate API)
@@ -76,8 +76,8 @@ def _http_error_detail(exc: httpx.HTTPStatusError) -> str:
 
 def _image_model_hint(model: str) -> str:
     text = str(model or "").strip().lower()
-    if text.startswith("gpt-image") and text != "gpt-image-1":
-        return " Hint: this image model may not be supported by the /images/generations endpoint; try gpt-image-1 or use API probe to pick an available image model."
+    if text and text != "gpt-image-2":
+        return " Hint: this build is configured for gpt-image-2; use API probe to confirm a custom relay supports another image model."
     return ""
 
 
@@ -271,7 +271,7 @@ class ImageBackend:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        model = self.model or "gpt-image-1"
+        model = self.model or "gpt-image-2"
         # The OpenAI image API has no separate negative-prompt field.  Putting
         # an SD/ComfyUI negative list into the natural-language prompt made
         # policy-sensitive words (for example gore or nudity) part of every
@@ -298,7 +298,7 @@ class ImageBackend:
         headers = {}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
-        model = self.model or "gpt-image-1"
+        model = self.model or "gpt-image-2"
         # See _gen_openai: an OpenAI-compatible edit request does not support
         # a negative prompt, so do not turn restricted-word exclusions into
         # positive prompt text.
@@ -379,9 +379,9 @@ class ImageBackend:
         url = f"{base}/images/generations"
         headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         payload = {
-            "model": self.model or "dall-e-3",
+            "model": self.model or "gpt-image-2",
             "prompt": prompt,
-            "size": f"{w}x{h}" if (w, h) in [(1024, 1024), (1024, 1792), (1792, 1024)] else "1024x1792",
+            "size": _openai_image_size(self.model or "gpt-image-2", w, h, self.request_width, self.request_height),
             "n": 1,
             "response_format": "b64_json",
         }

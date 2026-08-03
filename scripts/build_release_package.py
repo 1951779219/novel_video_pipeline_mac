@@ -123,7 +123,7 @@ def copy_sanitized_data(staging: Path) -> None:
     (profiles_dst / "配置1.json").write_text(default_profile, encoding="utf-8")
     (defaults_dir / "profile.template.json").write_text(default_profile, encoding="utf-8")
 
-    for rel in ("data/jobs", "data/runtime", "data/chrome_debug_profiles", "data/updates"):
+    for rel in ("data/jobs", "data/projects", "data/runtime", "data/chrome_debug_profiles", "data/updates"):
         (staging / rel).mkdir(parents=True, exist_ok=True)
 
 

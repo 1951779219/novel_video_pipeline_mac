@@ -15,6 +15,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--compose-only", action="store_true", help="only rebuild the final video from cached artifacts")
     parser.add_argument("--marketing-cover-only", action="store_true", help="only rebuild titles, synopses and cover")
+    parser.add_argument("--preprocess-only", action="store_true", help="accelerator: prepare API-backed stages, then pause")
     args = parser.parse_args(argv)
 
     job_dir = pr.job_dir_for(args.job_id)
@@ -22,7 +23,12 @@ def main(argv: list[str] | None = None) -> int:
     pr.write_status(job_dir, job_id=args.job_id, worker_pid=os.getpid(), stage="worker_starting")
     pr.append_log(job_dir, f"== worker pid={os.getpid()} starting ==")
     try:
-        if args.marketing_cover_only:
+        if args.preprocess_only:
+            pr.run_acceleration_preprocess(
+                args.input,
+                job_id=args.job_id,
+            )
+        elif args.marketing_cover_only:
             cover = pr.regenerate_job_marketing_and_cover(
                 args.job_id, on_log=lambda message: pr.append_log(job_dir, message), allow_running=True
             )
@@ -48,13 +54,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception as exc:
         pr.append_log(job_dir, f"== worker failed: {exc} ==")
-        if args.compose_only or args.marketing_cover_only:
+        if args.compose_only or args.marketing_cover_only or args.preprocess_only:
             pr.write_status(
                 job_dir,
                 job_id=args.job_id,
                 worker_pid=None,
                 stage="failed",
-                progress=0.90,
+                progress=0.12 if args.preprocess_only else 0.90,
                 error=str(exc),
             )
         return 1
@@ -64,7 +70,7 @@ def main(argv: list[str] | None = None) -> int:
         # check still counts this just-finished process and a one-at-a-time
         # batch can never advance to its next queued job.
         pr.start_next_queued_job(
-            exclude_job_id=args.job_id,
+            exclude_job_id=None if args.preprocess_only else args.job_id,
             on_log=lambda message: pr.append_log(job_dir, message),
         )
         pr.append_log(job_dir, f"== worker pid={os.getpid()} stopped ==")

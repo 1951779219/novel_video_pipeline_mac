@@ -66,6 +66,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
                        schedule_enabled: bool = False,
                        scheduled_at: str = "",
                        schedule_timezone: str = "Asia/Tokyo",
+                       job: Optional[_Job] = None,
                        on_log: Callable = print,
                        on_progress: Callable = lambda x: None) -> Optional[str]:
     """visibility: PUBLIC / UNLISTED / PRIVATE"""
@@ -105,7 +106,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
     }
     try:
         return mod.upload_via_browser(
-            _Job(), fake_config, video_path, title, cover_path,
+            job or _Job(), fake_config, video_path, title, cover_path,
             on_log=on_log, on_progress=on_progress, profile=profile,
             force_profile_launch=bool(force_profile_launch),
         )
@@ -114,7 +115,7 @@ def upload_to_youtube(video_path: Path, title: str, description: str = "",
         mod._get_active_profile = lambda c: profile
         try:
             return mod.upload_via_browser(
-                _Job(), fake_config, video_path, title, cover_path,
+                job or _Job(), fake_config, video_path, title, cover_path,
                 on_log=on_log, on_progress=on_progress,
             )
         finally:

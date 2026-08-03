@@ -78,7 +78,7 @@ macOS 兼容点不要丢：
 - GUI 检查/下载/应用：`app/update_tab.py` 调用 `app/updater.py`。
 - 发布新版本：`scripts/build_release_package.py` 生成脱敏 zip 和 `latest.json`，`scripts/publish_github_release.sh` 用 GitHub CLI 上传 release 资产。
 
-macOS 应用更新不再依赖 Windows `update.bat`，而是由 `scripts/apply_update.py` 执行。它只覆盖程序文件，保护 `data/settings.json`、`data/profiles/`、`data/jobs/`、Chrome 登录态和 `.venv`。更新前会备份设置到 `data/backups/pre_update_*`。
+macOS 应用更新不再依赖 Windows `update.bat`，而是由 `scripts/apply_update.py` 执行。它只覆盖程序文件，保护 `data/settings.json`、`data/profiles/`、`data/jobs/`、`data/projects/`、Chrome 登录态和 `.venv`。更新前会备份设置到 `data/backups/pre_update_*`。
 
 完整发布说明见 `docs/online_update_github.md`。
 
@@ -152,6 +152,7 @@ HTTP 401: Invalid token
 发布包不应该包含：
 
 - `data/jobs/`
+- `data/projects/`
 - `data/runtime/`
 - `data/chrome_debug_profile/`
 - `data/chrome_debug_profiles/`

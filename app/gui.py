@@ -31,6 +31,7 @@ except Exception as exc:
     }
 
 from app import pipeline_runner as pr
+from app import upload as browser_upload
 from app import script_publish_scheduler as publish_scheduler
 from app.api_probe import probe_image, probe_llm, probe_tts
 from app.autotune import run_startup_autotune
@@ -47,6 +48,19 @@ MONO_FONT = "Menlo" if sys.platform == "darwin" else "Consolas"
 UI_FONT_SIZE = 12
 UI_SMALL_FONT_SIZE = 11
 UI_HEADING_FONT_SIZE = 13
+
+# The fields remain editable so OpenAI-compatible relays can use a private
+# model name.  These choices are the maintained, production-oriented presets.
+TEXT_MODEL_OPTIONS = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.6-flash",
+    "gpt-5-mini",
+    "gpt-5-nano",
+    "deepseek-chat",
+    "qwen-plus",
+]
+IMAGE_MODEL_OPTIONS = ["gpt-image-2"]
 
 _DICTIONARY_SUFFIX_RE = re.compile(
     r"(?:[\s_.\-—－]*"
@@ -324,6 +338,13 @@ def _normalize_profile_flow(value: str) -> str:
 
 def _normalize_upload_profile(profile: dict | None, index: int = 0) -> dict:
     profile = profile if isinstance(profile, dict) else {}
+    profile_name = str(profile.get("name") or f"上传频道{index + 1}").strip() or f"上传频道{index + 1}"
+    chrome_profile = str(profile.get("chrome_profile") or config.get("browser_chrome_profile", "Default") or "Default").strip() or "Default"
+    try:
+        from app.youtube_channel_bindings import get_binding
+        saved_binding = get_binding(chrome_profile, profile_name)
+    except Exception:
+        saved_binding = {}
     visibility = str(profile.get("visibility") or config.get("youtube_visibility", "PRIVATE") or "PRIVATE").strip().upper()
     if visibility not in {"PRIVATE", "UNLISTED", "PUBLIC"}:
         visibility = "PRIVATE"
@@ -331,9 +352,11 @@ def _normalize_upload_profile(profile: dict | None, index: int = 0) -> dict:
     if publish_mode not in {"immediate", "youtube", "script"}:
         publish_mode = "youtube" if _profile_bool(profile.get("youtube_schedule_enabled"), False) else "immediate"
     return {
-        "name": str(profile.get("name") or f"上传频道{index + 1}").strip() or f"上传频道{index + 1}",
+        "name": profile_name,
         "enabled": _profile_bool(profile.get("enabled"), True),
-        "chrome_profile": str(profile.get("chrome_profile") or config.get("browser_chrome_profile", "Default") or "Default").strip() or "Default",
+        "chrome_profile": chrome_profile,
+        "youtube_channel_id": str(profile.get("youtube_channel_id") or saved_binding.get("channel_id") or "").strip(),
+        "youtube_channel_name": str(profile.get("youtube_channel_name") or saved_binding.get("channel_name") or profile_name).strip(),
         "flow": _normalize_profile_flow(str(profile.get("flow") or config.get("browser_flow", "simple"))),
         "visibility": visibility,
         "upload_policy": str(profile.get("upload_policy") or config.get("browser_upload_policy", "BTRA") or "BTRA").strip() or "BTRA",
@@ -443,11 +466,15 @@ class PipelineGUI:
         self.root.geometry("1320x820")
         self.root.minsize(1050, 680)
         self._selected_job = ""
+        self._rendered_log_job = ""
+        self._rendered_log_text = None
         self._search_refs: dict[str, str] = {}
         self._search_seq = 0
         self._search_result_queue: queue.Queue = queue.Queue()
         self._dependency_check_running = False
         self._script_upload_running = False
+        self._script_publish_paused = False
+        self._active_browser_upload_jobs: dict[str, browser_upload._Job] = {}
         self._image_failure_prompted: set[str] = set()
         self._pronunciation_resolution_cache: dict[str, dict[str, str]] = {}
         self._build_style()
@@ -507,15 +534,20 @@ class PipelineGUI:
 
         library_tab = ttk.Frame(notebook, padding=8)
         file_tab = ttk.Frame(notebook, padding=8)
+        project_tab = ttk.Frame(notebook, padding=8)
         category_tab = ttk.Frame(notebook, padding=8)
         notebook.add(library_tab, text="书库导入")
         notebook.add(file_tab, text="文件导入")
+        notebook.add(project_tab, text="小说项目")
         notebook.add(category_tab, text="任务分类")
         self._source_library_tab = library_tab
         self._source_file_tab = file_tab
+        self._source_project_tab = project_tab
         self._source_category_tab = category_tab
         self._task_category_active = False
+        self._project_tab_active = False
         self._task_category_paths: dict[str, str] = {}
+        self._project_tree_ids: dict[str, str] = {}
 
         search_row = ttk.Frame(library_tab)
         search_row.pack(fill=tk.X, pady=(0, 6))
@@ -619,6 +651,163 @@ class PipelineGUI:
         self.manual_text = scrolledtext.ScrolledText(file_tab, height=4, wrap=tk.WORD, font=(UI_FONT, UI_FONT_SIZE))
         self.manual_text.pack(fill=tk.X, pady=(2, 0))
 
+        ttk.Label(
+            project_tab,
+            text="系列视频设置",
+            font=(UI_FONT, UI_HEADING_FONT_SIZE + 2, "bold"),
+        ).pack(anchor=tk.W, pady=(0, 6))
+
+        project_actions = ttk.Frame(project_tab)
+        project_actions.pack(fill=tk.X)
+        ttk.Button(
+            project_actions,
+            text="新建系列项目",
+            style="Primary.TButton",
+            command=self._create_series_project_before_import,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            project_actions,
+            text="刷新项目",
+            command=self._rebuild_project_tree,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            project_actions,
+            text="将选中任务加入项目…",
+            command=self._assign_selected_jobs_to_project_dialog,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            project_actions,
+            text="将选中任务移出项目",
+            command=self._remove_selected_jobs_from_project,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            project_actions,
+            text="打开项目文件夹",
+            command=self._open_selected_project_dir,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        project_manage_actions = ttk.Frame(project_tab)
+        project_manage_actions.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(
+            project_manage_actions,
+            text="项目详情/改名",
+            command=self._show_project_details,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            project_manage_actions,
+            text="人物档案",
+            command=self._show_project_characters,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            project_manage_actions,
+            text="删除项目",
+            command=self._archive_selected_project,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(
+            project_manage_actions,
+            text="迁移旧系列",
+            command=self._migrate_legacy_projects,
+        ).pack(side=tk.RIGHT)
+
+        series_settings = ttk.LabelFrame(
+            project_tab,
+            text="当前项目的统一名称与分集规则",
+            padding=8,
+        )
+        series_settings.pack(fill=tk.X, pady=(8, 0))
+        series_settings.columnconfigure(1, weight=1)
+        self.project_shared_novel_title_var = tk.StringVar()
+        self.project_shared_title_locked_var = tk.BooleanVar(value=True)
+        self.project_ai_episode_title_var = tk.BooleanVar(value=True)
+        self.project_ai_cover_copy_var = tk.BooleanVar(value=True)
+        self.project_episode_start_var = tk.StringVar(value="1")
+        self.project_episode_label_style_var = tk.StringVar(value="第{episode}集")
+        self.project_upload_title_template_var = tk.StringVar(
+            value="{series_title}｜{episode_label}｜{ai_title}"
+        )
+        self.project_cover_label_template_var = tk.StringVar(
+            value="{series_title}【{episode_label}】"
+        )
+        ttk.Label(series_settings, text="统一小说名").grid(row=0, column=0, sticky="w")
+        ttk.Entry(
+            series_settings,
+            textvariable=self.project_shared_novel_title_var,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 8))
+        ttk.Checkbutton(
+            series_settings,
+            text="锁定，禁止 AI 改名",
+            variable=self.project_shared_title_locked_var,
+        ).grid(row=0, column=2, sticky="w")
+        toggle_row = ttk.Frame(series_settings)
+        toggle_row.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        ttk.Checkbutton(
+            toggle_row,
+            text="允许 AI 生成每集标题",
+            variable=self.project_ai_episode_title_var,
+        ).pack(side=tk.LEFT)
+        ttk.Checkbutton(
+            toggle_row,
+            text="允许 AI 生成封面文案",
+            variable=self.project_ai_cover_copy_var,
+        ).pack(side=tk.LEFT, padx=(12, 0))
+        ttk.Label(toggle_row, text="集数起点").pack(side=tk.LEFT, padx=(16, 4))
+        ttk.Entry(
+            toggle_row,
+            textvariable=self.project_episode_start_var,
+            width=5,
+        ).pack(side=tk.LEFT)
+        ttk.Label(toggle_row, text="集数格式").pack(side=tk.LEFT, padx=(10, 4))
+        ttk.Combobox(
+            toggle_row,
+            textvariable=self.project_episode_label_style_var,
+            values=["第{episode}集", "第{episode}話", "{episode:02d}", "第{episode}部"],
+            width=14,
+        ).pack(side=tk.LEFT)
+        ttk.Label(series_settings, text="上传标题格式").grid(row=2, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(
+            series_settings,
+            textvariable=self.project_upload_title_template_var,
+        ).grid(row=2, column=1, columnspan=2, sticky="ew", padx=(6, 0), pady=(5, 0))
+        ttk.Label(series_settings, text="封面系列标记").grid(row=3, column=0, sticky="w", pady=(5, 0))
+        ttk.Entry(
+            series_settings,
+            textvariable=self.project_cover_label_template_var,
+        ).grid(row=3, column=1, sticky="ew", padx=(6, 8), pady=(5, 0))
+        series_setting_actions = ttk.Frame(series_settings)
+        series_setting_actions.grid(row=3, column=2, sticky="e", pady=(5, 0))
+        ttk.Button(
+            series_setting_actions,
+            text="保存系列设置",
+            command=self._save_current_project_series_settings,
+        ).pack(side=tk.LEFT)
+        ttk.Button(
+            series_setting_actions,
+            text="导入正文到此项目…",
+            style="Primary.TButton",
+            command=self._import_into_current_project,
+        ).pack(side=tk.LEFT, padx=(6, 0))
+
+        project_tree_box = ttk.Frame(project_tab)
+        project_tree_box.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+        project_tree_box.columnconfigure(0, weight=1)
+        project_tree_box.rowconfigure(0, weight=1)
+        project_scroll = ttk.Scrollbar(project_tree_box, orient=tk.VERTICAL)
+        self.project_tree = ttk.Treeview(
+            project_tree_box,
+            columns=("count",),
+            show="tree headings",
+            height=6,
+            selectmode="browse",
+            yscrollcommand=project_scroll.set,
+        )
+        project_scroll.configure(command=self.project_tree.yview)
+        self.project_tree.heading("#0", text="小说项目")
+        self.project_tree.heading("count", text="任务数")
+        self.project_tree.column("#0", width=360, minwidth=160, stretch=True)
+        self.project_tree.column("count", width=70, minwidth=55, stretch=False, anchor=tk.CENTER)
+        self.project_tree.grid(row=0, column=0, sticky="nsew")
+        project_scroll.grid(row=0, column=1, sticky="ns")
+        self.project_tree.bind("<<TreeviewSelect>>", self._on_project_selected)
+
         category_source_row = ttk.Frame(category_tab)
         category_source_row.pack(fill=tk.X)
         ttk.Label(category_source_row, text="文本来源目录").pack(side=tk.LEFT)
@@ -713,6 +902,7 @@ class PipelineGUI:
             if previous_sash is not None:
                 self.root.after_idle(lambda: left_pane.sashpos(0, previous_sash))
             category_active = page is category_tab
+            project_active = page is project_tab
             if category_active != self._task_category_active:
                 self._task_category_active = category_active
                 if hasattr(self, "job_tree"):
@@ -720,6 +910,14 @@ class PipelineGUI:
                     self._selected_job = ""
                     if category_active:
                         self._rebuild_task_category_tree()
+                    self._refresh_jobs()
+            if project_active != self._project_tab_active:
+                self._project_tab_active = project_active
+                if hasattr(self, "job_tree"):
+                    self.job_tree.selection_remove(self.job_tree.selection())
+                    self._selected_job = ""
+                    if project_active:
+                        self._rebuild_project_tree()
                     self._refresh_jobs()
 
         notebook.bind("<<NotebookTabChanged>>", resize_source_notebook)
@@ -788,11 +986,20 @@ class PipelineGUI:
             "video": 60,
             "youtube": 60,
         }
+        saved_widths = config.get("job_table_column_widths", {})
+        if not isinstance(saved_widths, dict):
+            saved_widths = {}
         for col in cols:
+            # Ignore invalid old values, and keep Tk's minimum width contract.
+            try:
+                saved_width = int(saved_widths.get(col, widths[col]))
+            except (TypeError, ValueError):
+                saved_width = widths[col]
+            width = max(min_widths[col], saved_width)
             self.job_tree.heading(col, text=headings[col])
             self.job_tree.column(
                 col,
-                width=widths[col],
+                width=width,
                 minwidth=min_widths[col],
                 stretch=False,
                 anchor=tk.W,
@@ -804,16 +1011,18 @@ class PipelineGUI:
         self.job_tree.bind("<Button-3>", self._show_job_context_menu)
         self.job_tree.bind("<Button-2>", self._show_job_context_menu)
         self.job_tree.bind("<Control-Button-1>", self._show_job_context_menu)
+        self._job_tree_column_resize_started = False
+        self.job_tree.bind("<ButtonPress-1>", self._remember_job_column_resize_start, add="+")
         self.job_tree.bind(
             "<ButtonRelease-1>",
-            lambda _event: self.root.after_idle(self._refresh_job_table_display),
+            self._finish_job_column_resize,
             add="+",
         )
         self.job_context_menu = tk.Menu(self.root, tearoff=False)
         for label, command in (
             ("套用当前方案到选中任务", self._apply_profile_to_selected_jobs),
             ("启动选中", self._start_selected),
-            ("继续选中任务", self._continue_selected),
+            ("从失败处继续（选中）", self._continue_selected),
             ("加入排队序列", self._enqueue_selected_jobs),
             ("停止选中", self._stop_selected_jobs),
             ("清除图片缓存", self._clear_selected_media_cache),
@@ -840,6 +1049,14 @@ class PipelineGUI:
             label="附加读音词典…",
             command=self._choose_pronunciation_dictionary,
         )
+        self.job_context_menu.add_command(
+            label="加入小说项目…",
+            command=self._assign_selected_jobs_to_project_dialog,
+        )
+        self.job_context_menu.add_command(
+            label="移出小说项目",
+            command=self._remove_selected_jobs_from_project,
+        )
         self.job_context_menu.add_command(label="打开任务文件夹", command=self._open_selected_output_dir)
         self.job_context_menu.add_command(label="删除选中任务", command=self._delete_selected_jobs)
         self.job_context_menu.add_separator()
@@ -865,6 +1082,9 @@ class PipelineGUI:
             self.update_tab = None
             self._append_probe_log(f"[软件更新] 更新页加载失败：{exc}")
 
+        log_actions = ttk.Frame(log_tab)
+        log_actions.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(log_actions, text="复制全部日志", command=self._copy_all_log).pack(side=tk.RIGHT)
         self.log_text = scrolledtext.ScrolledText(log_tab, wrap=tk.WORD, font=(MONO_FONT, UI_SMALL_FONT_SIZE))
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
@@ -1191,6 +1411,18 @@ class PipelineGUI:
                 line, textvariable=var, values=["开启", "关闭"], state="readonly", width=12
             ).pack(side=tk.LEFT)
 
+        def synced_combo(label: str, key: str, values: list[str]):
+            """Render a second selector backed by the exact same setting variable."""
+            line = ttk.Frame(section_parent)
+            line.pack(fill=tk.X, pady=3)
+            ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
+            var = self.vars.get(key)
+            if var is None:
+                raise KeyError(f"Shared selector must be created before its mirror: {key}")
+            widget = ttk.Combobox(line, textvariable=var, values=values, state="readonly")
+            widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            return widget
+
         def buttons(*items: tuple[str, callable]):
             line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=(5, 3))
@@ -1258,15 +1490,15 @@ class PipelineGUI:
             "统一文本模型",
             "ai_api_text_model",
             "图片与提示词",
-            "gpt-4o-mini",
-            ["gpt-4o-mini", "gpt-4o", "deepseek-chat"],
+            "gemini-3.5-flash",
+            TEXT_MODEL_OPTIONS,
         )
         api_model_combo(
             "统一图片模型",
             "ai_api_image_model",
             "图片与提示词",
             "gpt-image-2",
-            ["gpt-image-1", "gpt-image-2", "dall-e-3"],
+            IMAGE_MODEL_OPTIONS,
         )
         row("统一图片 API 请求宽", "ai_api_image_width", "1792")
         row("统一图片 API 请求高", "ai_api_image_height", "1008")
@@ -1283,8 +1515,8 @@ class PipelineGUI:
             "词典文本模型",
             "pronunciation_dictionary_model",
             "生词词典",
-            "gpt-4o-mini",
-            ["gpt-4o-mini", "gpt-4o", "deepseek-chat"],
+            "gemini-3.5-flash",
+            TEXT_MODEL_OPTIONS,
         )
         buttons(("检测生词词典 API", lambda: self._probe_api("pronunciation_dictionary")))
 
@@ -1309,13 +1541,13 @@ class PipelineGUI:
             "分镜模型",
             "llm_model",
             "图片与提示词",
-            "gpt-4o-mini",
-            ["gpt-4o-mini", "gpt-4o", "deepseek-chat"],
+            "gemini-3.5-flash",
+            TEXT_MODEL_OPTIONS,
         )
         combo("图片 Provider", "image_provider", ["placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "placeholder")
         row("图片 Base URL/中转(可空=统一)", "image_base_url", "")
         secret_row("图片 API Key(可空=统一)", "image_api_key", "")
-        api_model_combo("图片模型名", "image_model", "图片与提示词", "", ["gpt-image-1", "gpt-image-2", "dall-e-3"])
+        api_model_combo("图片模型名", "image_model", "图片与提示词", "", IMAGE_MODEL_OPTIONS)
         row("图片 API 超时秒", "image_api_timeout_seconds", "300")
         combo("人设图 Provider", "character_reference_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
         row("人设图 Base URL/中转(可空=统一)", "character_reference_base_url", "")
@@ -1325,7 +1557,7 @@ class PipelineGUI:
             "character_reference_model",
             "图片与提示词",
             "",
-            ["gpt-image-1", "dall-e-3", "flux", "sdxl"],
+            IMAGE_MODEL_OPTIONS,
         )
         combo("剧情参考 Provider", "scene_reference_provider", ["same_as_image", "comfyui", "sdwebui", "openai", "custom"], "same_as_image")
         row("剧情参考 Base URL/中转(可空=统一)", "scene_reference_base_url", "")
@@ -1335,7 +1567,7 @@ class PipelineGUI:
             "scene_reference_model",
             "图片与提示词",
             "",
-            ["gpt-image-1", "dall-e-3", "flux", "sdxl"],
+            IMAGE_MODEL_OPTIONS,
         )
         buttons(
             ("检测分镜 LLM", lambda: self._probe_api("llm")),
@@ -1348,15 +1580,23 @@ class PipelineGUI:
         combo("封面 Provider", "cover_provider", ["same_as_image", "placeholder", "comfyui", "sdwebui", "openai", "replicate", "aliyun", "custom"], "same_as_image")
         row("封面 Base URL/中转(可空=统一)", "cover_base_url", "")
         secret_row("封面 API Key(可空=统一)", "cover_api_key", "")
-        api_model_combo("封面模型名", "cover_model", "封面", "", ["gpt-image-1", "dall-e-3"])
+        api_model_combo("封面模型名", "cover_model", "封面", "", IMAGE_MODEL_OPTIONS)
         buttons(("检测封面 API", lambda: self._probe_api("cover")))
 
         subheading("批量与上传")
         row("外部 API 并发", "max_concurrent_external_api", "2")
 
         section("TTS")
+        tts_provider_in_section = synced_combo(
+            "TTS Provider（同步）",
+            "tts_provider",
+            ["edge", "voicevox", "openai", "azure", "elevenlabs", "custom"],
+        )
         combo("常用音色", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
         self.combo_widgets["tts_provider"].bind(
+            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options()
+        )
+        tts_provider_in_section.bind(
             "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options()
         )
         self._refresh_tts_voice_options()
@@ -1419,8 +1659,7 @@ class PipelineGUI:
 
         section("洗稿")
         check("AI 洗稿改写", "ai_rewrite_enabled")
-        check("保留章节标题并朗读（第X话）", "narrate_chapter_headings")
-        check("洗稿后朗读净化（清除装饰符号）", "tts_clean_rewritten_text")
+        check("TTS 朗读净化（独立于洗稿开关）", "tts_clean_rewritten_text")
         row("洗稿批大小", "ai_rewrite_batch_chars", "3500")
         textrow("洗稿提示词", "ai_rewrite_prompt", str(config.get("ai_rewrite_prompt", "")), height=5)
 
@@ -1436,8 +1675,8 @@ class PipelineGUI:
         section_model_combo(
             "使用的文本模型",
             "pronunciation_dictionary_model",
-            "gpt-4o-mini",
-            ["gpt-4o-mini", "gpt-4o", "deepseek-chat"],
+            "gemini-3.5-flash",
+            TEXT_MODEL_OPTIONS,
         )
         row("最多候选生词", "tts_auto_pronunciation_max_terms", "40")
         textrow(
@@ -1449,14 +1688,14 @@ class PipelineGUI:
 
         section("图片与提示词")
         subheading("模型输入", "这些模型也可以在“API 设置与 Key”中填写；保存时会检查两处是否一致。")
-        section_model_combo("统一文本模型", "ai_api_text_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
-        section_model_combo("统一图片模型", "ai_api_image_model", "gpt-image-2", ["gpt-image-1", "gpt-image-2", "dall-e-3"])
-        section_model_combo("分镜模型", "llm_model", "gpt-4o-mini", ["gpt-4o-mini", "gpt-4o", "deepseek-chat"])
-        section_model_combo("图片模型名", "image_model", "", ["gpt-image-1", "gpt-image-2", "dall-e-3"])
+        section_model_combo("统一文本模型", "ai_api_text_model", "gemini-3.5-flash", TEXT_MODEL_OPTIONS)
+        section_model_combo("统一图片模型", "ai_api_image_model", "gpt-image-2", IMAGE_MODEL_OPTIONS)
+        section_model_combo("分镜模型", "llm_model", "gemini-3.5-flash", TEXT_MODEL_OPTIONS)
+        section_model_combo("图片模型名", "image_model", "", IMAGE_MODEL_OPTIONS)
         row("分镜图宽", "image_width", "1792")
         row("分镜图高", "image_height", "1008")
-        section_model_combo("人设图模型名", "character_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
-        section_model_combo("剧情参考模型名", "scene_reference_model", "", ["gpt-image-1", "dall-e-3", "flux", "sdxl"])
+        section_model_combo("人设图模型名", "character_reference_model", "", IMAGE_MODEL_OPTIONS)
+        section_model_combo("剧情参考模型名", "scene_reference_model", "", IMAGE_MODEL_OPTIONS)
         check("AI 人设分析", "character_analysis_enabled")
         row("人设分析最大字数", "character_analysis_max_chars", "12000")
         row("人设分析输出 tokens", "character_analysis_max_tokens", "1800")
@@ -1486,7 +1725,7 @@ class PipelineGUI:
         section("封面")
         check("自动生成封面", "cover_enabled")
         synced_check("检测系列动画", "series_animation_enabled")
-        section_model_combo("封面模型名", "cover_model", "", ["gpt-image-1", "gpt-image-2", "dall-e-3"])
+        section_model_combo("封面模型名", "cover_model", "", IMAGE_MODEL_OPTIONS)
         row("封面宽", "cover_width", "1792")
         row("封面高", "cover_height", "1008")
         textrow("封面固定模板", "cover_prompt_template", str(config.get("cover_prompt_template", "")), height=5)
@@ -1607,7 +1846,7 @@ class PipelineGUI:
         ).pack(anchor=tk.W, pady=(4, 14))
         ttk.Button(
             section_parent,
-            text="执行选中任务",
+            text="立即上传选中成片",
             command=self._upload_selected_completed_jobs,
             style="Primary.TButton",
         ).pack(anchor=tk.E, pady=(0, 14))
@@ -1719,7 +1958,6 @@ class PipelineGUI:
             "video_long_mode", "ken_burns", "video_subtitle", "video_external_subtitle",
             "upload_enabled", "cover_enabled", "video_subtitle_bold", "video_subtitle_italic",
             "short_title_enabled", "pipeline_overlap_tts_images", "ai_rewrite_enabled",
-            "narrate_chapter_headings",
             "character_analysis_enabled", "character_analysis_always_include_protagonists",
             "character_reference_enabled", "scene_inject_visual_theme", "scene_inject_character_triggers",
             "storyboard_highlight_enabled", "storyboard_highlight_align_timeline",
@@ -1890,6 +2128,7 @@ class PipelineGUI:
             section_var = mirror.get("section_var")
             if section_var is not None:
                 section_var.set(str(config.get(key, "")))
+        self._refresh_tts_voice_options()
 
     def _refresh_pacing_mode_controls(self):
         """Grey out image-count fields that do not apply to the selected mode."""
@@ -2339,6 +2578,38 @@ class PipelineGUI:
         current = {"idx": -1}
         busy = {"selecting": False}
 
+        def known_chrome_profiles() -> list[str]:
+            """Return login-profile names already known to this installation.
+
+            The field remains editable: a user may still enter a new name before
+            its Chrome data folder exists.  Supplying the known names in a
+            combobox prevents having to remember Account-2 / Account-3 exactly.
+            """
+            names = {"Default"}
+            for item in profiles:
+                value = str(item.get("chrome_profile") or "").strip()
+                if value:
+                    names.add(value)
+            try:
+                for configuration_name in config.list_profiles():
+                    try:
+                        _cleaned, settings = config.profile_settings(configuration_name)
+                    except (FileNotFoundError, ValueError):
+                        continue
+                    for item in _parse_upload_profiles(str(settings.get("browser_profiles", "[]") or "[]")):
+                        value = str(item.get("chrome_profile") or "").strip()
+                        if value:
+                            names.add(value)
+            except Exception:
+                pass
+            try:
+                debug_profiles = Path("data/chrome_debug_profiles")
+                if debug_profiles.is_dir():
+                    names.update(path.name for path in debug_profiles.iterdir() if path.is_dir())
+            except OSError:
+                pass
+            return sorted(names, key=lambda value: (value != "Default", value.lower()))
+
         win = tk.Toplevel(self.root)
         win.title("频道上传方案")
         win.geometry("980x620")
@@ -2348,8 +2619,40 @@ class PipelineGUI:
         except Exception:
             pass
 
-        root = ttk.Frame(win, padding=10)
-        root.pack(fill=tk.BOTH, expand=True)
+        # This dialog contains more fields than fit on smaller Mac displays.
+        # Put its normal layout in a canvas so the bottom save button remains
+        # reachable instead of being clipped below the screen.
+        scroll_host = ttk.Frame(win)
+        scroll_host.pack(fill=tk.BOTH, expand=True)
+        dialog_canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+        dialog_scrollbar = ttk.Scrollbar(scroll_host, orient=tk.VERTICAL, command=dialog_canvas.yview)
+        dialog_canvas.configure(yscrollcommand=dialog_scrollbar.set)
+        dialog_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        dialog_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        root = ttk.Frame(dialog_canvas, padding=10)
+        root_window = dialog_canvas.create_window((0, 0), window=root, anchor=tk.NW)
+
+        def refresh_dialog_scrollregion(_event=None):
+            dialog_canvas.configure(scrollregion=dialog_canvas.bbox("all"))
+
+        def resize_dialog_content(event):
+            # Keep the familiar full-height layout on large screens, while
+            # allowing a smaller viewport to scroll through the same layout.
+            dialog_canvas.itemconfigure(root_window, width=event.width, height=max(600, root.winfo_reqheight()))
+            refresh_dialog_scrollregion()
+
+        def scroll_dialog_with_wheel(event):
+            delta = getattr(event, "delta", 0)
+            if delta:
+                dialog_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+                return "break"
+
+        root.bind("<Configure>", refresh_dialog_scrollregion)
+        dialog_canvas.bind("<Configure>", resize_dialog_content)
+        # Binding on the dialog's toplevel also receives wheel events from its
+        # child controls, without affecting other application windows.
+        win.bind("<MouseWheel>", scroll_dialog_with_wheel)
 
         top = ttk.Frame(root)
         top.pack(fill=tk.X, pady=(0, 8))
@@ -2422,8 +2725,22 @@ class PipelineGUI:
 
         chrome_var = tk.StringVar()
         line = row("Chrome 资料")
-        ttk.Entry(line, textvariable=chrome_var, width=28).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
-        ttk.Label(line, text="每个频道用独立资料名保存登录态", foreground="#777").pack(side=tk.LEFT)
+        chrome_picker = ttk.Combobox(
+            line, textvariable=chrome_var, values=known_chrome_profiles(), width=28
+        )
+        chrome_picker.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 6))
+
+        def refresh_chrome_profiles():
+            chrome_picker.configure(values=known_chrome_profiles())
+
+        ttk.Button(line, text="刷新", command=refresh_chrome_profiles).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Label(line, text="选择已登录账号；也可输入新资料名", foreground="#777").pack(side=tk.LEFT)
+
+        youtube_channel_id_var = tk.StringVar()
+        youtube_channel_name_var = tk.StringVar()
+        line = row("已绑定频道")
+        ttk.Label(line, textvariable=youtube_channel_name_var, width=24, anchor=tk.W).pack(side=tk.LEFT, padx=(6, 6))
+        ttk.Label(line, textvariable=youtube_channel_id_var, foreground="#777", anchor=tk.W).pack(side=tk.LEFT)
 
         flow_var = tk.StringVar(value="simple")
         line = row("上传流程")
@@ -2495,166 +2812,23 @@ class PipelineGUI:
         )
         hint.pack(anchor=tk.W, pady=(5, 0), padx=(120, 0))
 
-        ttk.Label(schedule_form, text="油管内定时（测试）", font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold")).pack(anchor=tk.W)
+        ttk.Label(schedule_form, text="油管内定时", font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold")).pack(anchor=tk.W)
         ttk.Label(
             schedule_form,
-            text="测试阶段仅支持一个已完成视频。开启后会在 YouTube Studio 中填写日期、时间并点击“预定”。",
-            foreground="#666",
-            wraplength=620,
+            text="与任务列表右键的“油管内定时”使用完全相同的设置窗口：选择配置、频道方案、登录账号，并逐个设置视频的年月日时分。",
+            foreground="#666", wraplength=620,
         ).pack(anchor=tk.W, pady=(4, 12))
-
-        schedule_enabled_var = tk.StringVar(value="关闭")
-        default_schedule_date = str(config.get("youtube_schedule_date", "") or "").strip()
-        if not default_schedule_date:
-            default_schedule_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        schedule_year, schedule_month, schedule_day = _future_numeric_date_parts(default_schedule_date)
-        schedule_hour, schedule_minute = _split_numeric_time(str(config.get("youtube_schedule_time", "18:00") or "18:00"))
-        schedule_year_var = tk.StringVar(value=schedule_year)
-        schedule_month_var = tk.StringVar(value=schedule_month)
-        schedule_day_var = tk.StringVar(value=schedule_day)
-        schedule_hour_var = tk.StringVar(value=schedule_hour)
-        schedule_minute_var = tk.StringVar(value=schedule_minute)
-        schedule_timezone_var = tk.StringVar(value=str(config.get("youtube_schedule_timezone", "Asia/Tokyo") or "Asia/Tokyo"))
-
-        schedule_rows = []
-
-        def numeric_part_entry(parent, variable: tk.StringVar, width: int, max_digits: int):
-            validate = (win.register(lambda value, limit=max_digits: (not value) or (value.isdigit() and len(value) <= limit)), "%P")
-            widget = ttk.Entry(parent, textvariable=variable, width=width, validate="key", validatecommand=validate)
-            widget.pack(side=tk.LEFT, padx=(8, 2))
-            return widget
-
-        def schedule_row(label: str):
-            line = ttk.Frame(schedule_form)
-            line.pack(fill=tk.X, pady=4)
-            ttk.Label(line, text=label, width=12, anchor=tk.E).pack(side=tk.LEFT)
-            schedule_rows.append(line)
-            return line
-
-        line = schedule_row("启用定时")
-        schedule_enabled_widget = ttk.Combobox(
-            line, textvariable=schedule_enabled_var, values=["关闭", "开启"], state="readonly", width=8
-        )
-        schedule_enabled_widget.pack(side=tk.LEFT, padx=(8, 0))
-
-        line = schedule_row("发布日期")
-        schedule_year_widget = numeric_part_entry(line, schedule_year_var, 6, 4)
-        ttk.Label(line, text="年").pack(side=tk.LEFT)
-        schedule_month_widget = numeric_part_entry(line, schedule_month_var, 4, 2)
-        ttk.Label(line, text="月").pack(side=tk.LEFT)
-        schedule_day_widget = numeric_part_entry(line, schedule_day_var, 4, 2)
-        ttk.Label(line, text="日").pack(side=tk.LEFT)
-
-        line = schedule_row("发布时间")
-        schedule_hour_widget = numeric_part_entry(line, schedule_hour_var, 4, 2)
-        ttk.Label(line, text="时").pack(side=tk.LEFT)
-        schedule_minute_widget = numeric_part_entry(line, schedule_minute_var, 4, 2)
-        ttk.Label(line, text="分").pack(side=tk.LEFT)
-
-        line = schedule_row("时区")
-        schedule_timezone_widget = ttk.Entry(line, textvariable=schedule_timezone_var, width=20)
-        schedule_timezone_widget.pack(side=tk.LEFT, padx=(8, 0))
-
-        schedule_test_btn = ttk.Button(schedule_form, text="测试定时上传选中视频")
-        schedule_test_btn.pack(anchor=tk.W, pady=(14, 0))
-        ttk.Label(
-            schedule_form,
-            text="定时测试会忽略上传方案中的公开范围，改用“安排时间”。请先在任务列表只选一个已完成视频。",
-            foreground="#9a5b00",
-            wraplength=620,
-        ).pack(anchor=tk.W, pady=(6, 0))
+        schedule_batch_btn = ttk.Button(schedule_form, text="设置选中任务的油管内定时")
+        schedule_batch_btn.pack(anchor=tk.W)
 
         ttk.Label(script_schedule_form, text="脚本内定时", font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold")).pack(anchor=tk.W)
         ttk.Label(
             script_schedule_form,
-            text="视频制作完成后进入本地待发布队列，到点才由脚本打开对应频道并上传。软件必须保持运行，Mac 不能深度睡眠。",
-            foreground="#666",
-            wraplength=620,
-        ).pack(anchor=tk.W, pady=(4, 10))
-
-        script_enabled_var = tk.StringVar(value="关闭")
-        default_script_date = str(config.get("script_schedule_first_date", "") or "").strip()
-        if not default_script_date:
-            default_script_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-        script_year, script_month, script_day = _split_numeric_date(default_script_date)
-        script_hour, script_minute = _split_numeric_time(str(config.get("script_schedule_time", "18:00") or "18:00"))
-        script_year_var = tk.StringVar(value=script_year)
-        script_month_var = tk.StringVar(value=script_month)
-        script_day_var = tk.StringVar(value=script_day)
-        script_hour_var = tk.StringVar(value=script_hour)
-        script_minute_var = tk.StringVar(value=script_minute)
-        script_interval_var = tk.StringVar(value=str(config.get("script_schedule_interval_hours", 24) or 24))
-        script_timezone_var = tk.StringVar(value=str(config.get("script_schedule_timezone", "Asia/Tokyo") or "Asia/Tokyo"))
-        script_missed_var = tk.StringVar(value="顺延到下一个时间")
-        script_unfinished_var = tk.StringVar(value="顺延到下一个时间")
-
-        def script_row(label: str):
-            line = ttk.Frame(script_schedule_form)
-            line.pack(fill=tk.X, pady=3)
-            ttk.Label(line, text=label, width=14, anchor=tk.E).pack(side=tk.LEFT)
-            return line
-
-        line = script_row("启用定时")
-        script_enabled_widget = ttk.Combobox(
-            line, textvariable=script_enabled_var, values=["关闭", "开启"], state="readonly", width=8
-        )
-        script_enabled_widget.pack(side=tk.LEFT, padx=(8, 0))
-        line = script_row("首次发布日期")
-        script_year_widget = numeric_part_entry(line, script_year_var, 6, 4)
-        ttk.Label(line, text="年").pack(side=tk.LEFT)
-        script_month_widget = numeric_part_entry(line, script_month_var, 4, 2)
-        ttk.Label(line, text="月").pack(side=tk.LEFT)
-        script_day_widget = numeric_part_entry(line, script_day_var, 4, 2)
-        ttk.Label(line, text="日").pack(side=tk.LEFT)
-        line = script_row("每天发布时间")
-        script_hour_widget = numeric_part_entry(line, script_hour_var, 4, 2)
-        ttk.Label(line, text="时").pack(side=tk.LEFT)
-        script_minute_widget = numeric_part_entry(line, script_minute_var, 4, 2)
-        ttk.Label(line, text="分").pack(side=tk.LEFT)
-        line = script_row("发布间隔")
-        script_interval_widget = ttk.Entry(line, textvariable=script_interval_var, width=8)
-        script_interval_widget.pack(side=tk.LEFT, padx=(8, 6))
-        ttk.Label(line, text="小时（推荐 24）", foreground="#777").pack(side=tk.LEFT)
-        line = script_row("时区")
-        script_timezone_widget = ttk.Entry(line, textvariable=script_timezone_var, width=20)
-        script_timezone_widget.pack(side=tk.LEFT, padx=(8, 0))
-        line = script_row("错过发布时间")
-        script_missed_widget = ttk.Combobox(
-            line, textvariable=script_missed_var, values=["顺延到下一个时间", "立即补发"], state="readonly", width=18
-        )
-        script_missed_widget.pack(side=tk.LEFT, padx=(8, 0))
-        line = script_row("视频尚未完成")
-        script_unfinished_widget = ttk.Combobox(
-            line, textvariable=script_unfinished_var, values=["顺延到下一个时间", "完成后立即补发"], state="readonly", width=18
-        )
-        script_unfinished_widget.pack(side=tk.LEFT, padx=(8, 0))
-
-        queue_box = ttk.LabelFrame(script_schedule_form, text="待发布队列（同系列连续、集数升序）", padding=5)
-        queue_box.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
-        queue_tree = ttk.Treeview(
-            queue_box,
-            columns=("order", "title", "series", "episode", "time", "state"),
-            show="headings",
-            height=7,
-        )
-        for column, label, width in (
-            ("order", "顺序", 45), ("title", "视频", 150), ("series", "系列", 110),
-            ("episode", "集数", 50), ("time", "计划时间", 130), ("state", "状态", 80),
-        ):
-            queue_tree.heading(column, text=label)
-            queue_tree.column(column, width=width, minwidth=width, stretch=column in {"title", "series"})
-        queue_tree.pack(fill=tk.BOTH, expand=True)
-        queue_btns = ttk.Frame(script_schedule_form)
-        queue_btns.pack(fill=tk.X, pady=(5, 0))
-        rebuild_queue_btn = ttk.Button(queue_btns, text="重新识别并计算队列")
-        rebuild_queue_btn.pack(side=tk.LEFT)
-        queue_up_btn = ttk.Button(queue_btns, text="上移")
-        queue_up_btn.pack(side=tk.LEFT, padx=(5, 0))
-        queue_down_btn = ttk.Button(queue_btns, text="下移")
-        queue_down_btn.pack(side=tk.LEFT, padx=(5, 0))
-        queue_edit_btn = ttk.Button(queue_btns, text="修改系列/集数")
-        queue_edit_btn.pack(side=tk.LEFT, padx=(5, 0))
-        ttk.Label(queue_btns, text="没有“第1话/第2期”等标记的文件按独立故事处理", foreground="#777").pack(side=tk.LEFT, padx=(8, 0))
+            text="与任务列表右键的“脚本内定时”使用完全相同的设置窗口：选择配置、频道方案、登录账号，并逐个设置视频的年月日时分。",
+            foreground="#666", wraplength=620,
+        ).pack(anchor=tk.W, pady=(4, 12))
+        script_schedule_batch_btn = ttk.Button(script_schedule_form, text="设置选中任务的脚本内定时")
+        script_schedule_batch_btn.pack(anchor=tk.W)
 
         form_btns = ttk.Frame(right)
         form_btns.pack(fill=tk.X, pady=(8, 0))
@@ -2683,30 +2857,14 @@ class PipelineGUI:
         mode_switch = {"busy": False}
 
         def refresh_schedule_ui(*_args):
-            youtube_enabled = mode_var.get() == "youtube"
-            script_enabled = mode_var.get() == "script"
-            mode_switch["busy"] = True
+            # Both scheduling tabs now reuse the task-list context-menu dialog.
+            # Their controls must remain available even when this channel is
+            # currently set to direct publishing, because the dialog chooses
+            # the target configuration and channel itself.
             direct_enabled_var.set("开启" if mode_var.get() == "immediate" else "关闭")
-            schedule_enabled_var.set("开启" if youtube_enabled else "关闭")
-            script_enabled_var.set("开启" if script_enabled else "关闭")
-            mode_switch["busy"] = False
-            state = tk.NORMAL if youtube_enabled else tk.DISABLED
-            for widget in (
-                schedule_year_widget, schedule_month_widget, schedule_day_widget,
-                schedule_hour_widget, schedule_minute_widget,
-                schedule_timezone_widget, schedule_test_btn,
-            ):
-                widget.configure(state=state)
-            script_state = tk.NORMAL if script_enabled else tk.DISABLED
-            for widget in (
-                script_year_widget, script_month_widget, script_day_widget,
-                script_hour_widget, script_minute_widget,
-                script_interval_widget, script_timezone_widget,
-                script_missed_widget, script_unfinished_widget, rebuild_queue_btn,
-                queue_up_btn, queue_down_btn, queue_edit_btn,
-            ):
-                widget.configure(state=script_state)
-            visibility_widget.configure(state="disabled" if youtube_enabled else "readonly")
+            schedule_batch_btn.configure(state=tk.NORMAL)
+            script_schedule_batch_btn.configure(state=tk.NORMAL)
+            visibility_widget.configure(state="readonly")
 
         def request_mode(target: str, variable: tk.StringVar):
             if mode_switch["busy"]:
@@ -2742,8 +2900,6 @@ class PipelineGUI:
             refresh_schedule_ui()
 
         direct_enabled_widget.bind("<<ComboboxSelected>>", lambda _event: request_mode("immediate", direct_enabled_var))
-        schedule_enabled_widget.bind("<<ComboboxSelected>>", lambda _event: request_mode("youtube", schedule_enabled_var))
-        script_enabled_widget.bind("<<ComboboxSelected>>", lambda _event: request_mode("script", script_enabled_var))
 
         def rebuild(select_idx: int | None = None):
             busy["selecting"] = True
@@ -2770,6 +2926,8 @@ class PipelineGUI:
             name_var.set(str(profile.get("name") or ""))
             enabled_var.set("开启" if profile.get("enabled", True) else "关闭")
             chrome_var.set(str(profile.get("chrome_profile") or "Default"))
+            youtube_channel_id_var.set(str(profile.get("youtube_channel_id") or ""))
+            youtube_channel_name_var.set(str(profile.get("youtube_channel_name") or profile.get("name") or "未绑定"))
             flow_var.set(_normalize_profile_flow(str(profile.get("flow") or "simple")))
             visibility = str(profile.get("visibility") or "PRIVATE").upper()
             visibility_var.set(UPLOAD_VISIBILITY_LABELS.get(visibility, UPLOAD_VISIBILITY_LABELS["PRIVATE"]))
@@ -2787,49 +2945,20 @@ class PipelineGUI:
             ad_text.delete("1.0", tk.END)
             ad_text.insert("1.0", _upload_ad_template_to_text(profile.get("ad_suitability_template") or ""))
             mode_var.set(str(profile.get("publish_mode") or "immediate"))
-            year, month, day = _future_numeric_date_parts(str(profile.get("youtube_schedule_date") or ""))
-            hour, minute = _split_numeric_time(str(profile.get("youtube_schedule_time") or "18:00"))
-            schedule_year_var.set(year)
-            schedule_month_var.set(month)
-            schedule_day_var.set(day)
-            schedule_hour_var.set(hour)
-            schedule_minute_var.set(minute)
-            schedule_timezone_var.set(str(profile.get("youtube_schedule_timezone") or "Asia/Tokyo"))
-            year, month, day = _split_numeric_date(
-                str(profile.get("script_schedule_first_date") or ""),
-                datetime.now() + timedelta(days=1),
-            )
-            hour, minute = _split_numeric_time(str(profile.get("script_schedule_time") or "18:00"))
-            script_year_var.set(year)
-            script_month_var.set(month)
-            script_day_var.set(day)
-            script_hour_var.set(hour)
-            script_minute_var.set(minute)
-            script_interval_var.set(str(profile.get("script_schedule_interval_hours") or 24))
-            script_timezone_var.set(str(profile.get("script_schedule_timezone") or "Asia/Tokyo"))
-            script_missed_var.set("立即补发" if profile.get("script_schedule_missed_action") == "immediate" else "顺延到下一个时间")
-            script_unfinished_var.set("完成后立即补发" if profile.get("script_schedule_unfinished_action") == "immediate" else "顺延到下一个时间")
             refresh_flow_ui()
             refresh_schedule_ui()
-            refresh_queue_preview(str(profile.get("name") or ""))
 
         def flush(idx: int) -> bool:
             if idx < 0 or idx >= len(profiles):
                 return True
             try:
-                youtube_scheduled = _datetime_from_numeric_parts(
-                    schedule_year_var.get(), schedule_month_var.get(), schedule_day_var.get(),
-                    schedule_hour_var.get(), schedule_minute_var.get(),
-                )
-                script_scheduled = _datetime_from_numeric_parts(
-                    script_year_var.get(), script_month_var.get(), script_day_var.get(),
-                    script_hour_var.get(), script_minute_var.get(),
-                )
                 profile = _normalize_upload_profile(
                     {
                         "name": name_var.get(),
                         "enabled": enabled_var.get() == "开启",
                         "chrome_profile": chrome_var.get(),
+                        "youtube_channel_id": youtube_channel_id_var.get().strip(),
+                        "youtube_channel_name": youtube_channel_name_var.get().strip(),
                         "flow": flow_var.get(),
                         "visibility": UPLOAD_VISIBILITY_VALUES.get(visibility_var.get(), "PRIVATE"),
                         "upload_policy": policy_var.get(),
@@ -2843,15 +2972,15 @@ class PipelineGUI:
                         "description": desc_text.get("1.0", tk.END).strip(),
                         "ad_suitability_template": _upload_ad_template_from_text(ad_text.get("1.0", tk.END)),
                         "publish_mode": mode_var.get(),
-                        "youtube_schedule_date": youtube_scheduled.strftime("%Y-%m-%d"),
-                        "youtube_schedule_time": youtube_scheduled.strftime("%H:%M"),
-                        "youtube_schedule_timezone": schedule_timezone_var.get().strip(),
-                        "script_schedule_first_date": script_scheduled.strftime("%Y-%m-%d"),
-                        "script_schedule_time": script_scheduled.strftime("%H:%M"),
-                        "script_schedule_interval_hours": script_interval_var.get().strip(),
-                        "script_schedule_timezone": script_timezone_var.get().strip(),
-                        "script_schedule_missed_action": "immediate" if script_missed_var.get() == "立即补发" else "next_slot",
-                        "script_schedule_unfinished_action": "immediate" if script_unfinished_var.get() == "完成后立即补发" else "next_slot",
+                        "youtube_schedule_date": profiles[idx].get("youtube_schedule_date", ""),
+                        "youtube_schedule_time": profiles[idx].get("youtube_schedule_time", "18:00"),
+                        "youtube_schedule_timezone": profiles[idx].get("youtube_schedule_timezone", "Asia/Tokyo"),
+                        "script_schedule_first_date": profiles[idx].get("script_schedule_first_date", ""),
+                        "script_schedule_time": profiles[idx].get("script_schedule_time", "18:00"),
+                        "script_schedule_interval_hours": profiles[idx].get("script_schedule_interval_hours", 24),
+                        "script_schedule_timezone": profiles[idx].get("script_schedule_timezone", "Asia/Tokyo"),
+                        "script_schedule_missed_action": profiles[idx].get("script_schedule_missed_action", "next_slot"),
+                        "script_schedule_unfinished_action": profiles[idx].get("script_schedule_unfinished_action", "next_slot"),
                         "script_manual_queue": bool(profiles[idx].get("script_manual_queue", False)),
                     },
                     idx,
@@ -2923,91 +3052,6 @@ class PipelineGUI:
             rebuild(new_idx)
             fill(new_idx)
 
-        def refresh_queue_preview(profile_name: str = ""):
-            queue_tree.delete(*queue_tree.get_children())
-            profile_name = profile_name or name_var.get().strip()
-            state_labels = {
-                "pending": "等待", "retry": "待重试", "uploading": "上传中",
-                "published": "已发布", "failed": "失败", "needs_review": "需检查",
-            }
-            for position, item in enumerate(publish_scheduler.load_items(profile_name), start=1):
-                episode = int(item.get("episode") or 0)
-                scheduled = str(item.get("scheduled_at") or "").replace("T", " ")
-                job_id = str(item.get("job_id") or "")
-                queue_tree.insert(
-                    "", tk.END, iid=job_id,
-                    values=(
-                        position,
-                        str(item.get("display_title") or item.get("job_id") or ""),
-                        str(item.get("series") or ""),
-                        episode if episode else "单篇",
-                        scheduled,
-                        state_labels.get(str(item.get("state") or "pending"), str(item.get("state") or "")),
-                    ),
-                )
-
-        def rebuild_script_queue(show_message: bool = True) -> bool:
-            if not flush(current["idx"]):
-                return False
-            profile = profiles[current["idx"]]
-            try:
-                first_at = datetime.strptime(
-                    f"{str(profile.get('script_schedule_first_date') or '').strip()} "
-                    f"{str(profile.get('script_schedule_time') or '').strip()}",
-                    "%Y-%m-%d %H:%M",
-                )
-                interval = max(1, int(profile.get("script_schedule_interval_hours") or 24))
-                zone = ZoneInfo(str(profile.get("script_schedule_timezone") or "Asia/Tokyo"))
-            except (TypeError, ValueError):
-                messagebox.showerror("脚本定时格式不正确", "首次日期请填写 YYYY-MM-DD，时间填写 HH:MM，间隔填写整数小时。", parent=win)
-                return False
-            except Exception:
-                messagebox.showerror("脚本定时时区不正确", "请填写有效时区，例如 Asia/Tokyo。", parent=win)
-                return False
-            schedule_now = datetime.now(zone).replace(tzinfo=None)
-            if profile.get("script_schedule_missed_action") == "next_slot":
-                step = timedelta(hours=interval)
-                while first_at <= schedule_now:
-                    first_at += step
-            elif first_at <= schedule_now:
-                first_at = schedule_now.replace(second=0, microsecond=0)
-            statuses = [(row["job_id"], pr.load_status(row["job_id"])) for row in pr.list_jobs(limit=10000)]
-            profile["script_manual_queue"] = False
-            rows = publish_scheduler.rebuild_queue(str(profile.get("name") or ""), statuses, first_at, interval)
-            refresh_queue_preview(str(profile.get("name") or ""))
-            if show_message:
-                messagebox.showinfo("队列已更新", f"已识别并安排 {len(rows)} 个尚未发布的任务。", parent=win)
-            return True
-
-        def move_queue_item(delta: int):
-            selection = queue_tree.selection()
-            if not selection:
-                return
-            profile_name = name_var.get().strip()
-            if publish_scheduler.move_item(profile_name, str(selection[0]), delta):
-                refresh_queue_preview(profile_name)
-                queue_tree.selection_set(str(selection[0]))
-
-        def edit_queue_item():
-            selection = queue_tree.selection()
-            if not selection:
-                return
-            job_id = str(selection[0])
-            profile_name = name_var.get().strip()
-            item = next((row for row in publish_scheduler.load_items(profile_name) if str(row.get("job_id") or "") == job_id), None)
-            if not item:
-                return
-            series = simpledialog.askstring("修改系列", "请输入系列名称：", initialvalue=str(item.get("series") or ""), parent=win)
-            if series is None:
-                return
-            episode = simpledialog.askinteger(
-                "修改集数", "请输入集数；独立单篇填写 0：", initialvalue=int(item.get("episode") or 0), minvalue=0, parent=win
-            )
-            if episode is None:
-                return
-            publish_scheduler.update_item(profile_name, job_id, series=series.strip() or str(item.get("display_title") or job_id), episode=episode)
-            refresh_queue_preview(profile_name)
-
         def write_profiles_to_form(select_idx: int | None = None):
             if not flush(current["idx"]):
                 return False
@@ -3072,23 +3116,41 @@ class PipelineGUI:
                 widget.configure(values=names)
             return True
 
-        def start_schedule_test():
-            if 0 <= current["idx"] < len(profiles):
-                active_var.set(str(profiles[current["idx"]].get("name") or ""))
-                multi_var.set("关闭")
+        def open_youtube_batch_schedule():
+            # Persist the editor first.  The shared scheduling dialog loads
+            # its channel choices from the selected saved configuration.
+            # Without this, an editor showing a renamed channel could still
+            # open a dialog with its old saved name.
             if not write_profiles_to_form():
                 return
-            self._upload_selected_completed_jobs(schedule_test=True)
+            try:
+                self._apply_config_form(save_profile=True)
+            except Exception as exc:
+                set_status(f"保存频道方案失败：{exc}", "red")
+                return
+            # Deliberately use the same entry point as the task-list context
+            # menu, so these two places can never drift into different forms.
+            self._schedule_selected_jobs_on_youtube()
+
+        def open_script_batch_schedule():
+            if not write_profiles_to_form():
+                return
+            try:
+                self._apply_config_form(save_profile=True)
+            except Exception as exc:
+                set_status(f"保存频道方案失败：{exc}", "red")
+                return
+            self._schedule_selected_jobs_in_script()
 
         def save_and_close():
             if not write_profiles_to_form():
                 return
-            selected_profile = profiles[current["idx"]]
-            if selected_profile.get("publish_mode") == "script" and not rebuild_script_queue(show_message=False):
-                return
             try:
-                self._apply_config_form(save_profile=False)
-                config.save()
+                # The scheduler reads the selected configuration from
+                # data/profiles.  Saving only the global settings file left
+                # that configuration stale (for example "新频道3" while the
+                # editor showed "世界線より配信中").
+                self._apply_config_form(save_profile=True)
             except Exception as exc:
                 set_status(f"写入配置失败：{exc}", "red")
                 return
@@ -3102,8 +3164,7 @@ class PipelineGUI:
             multi_var.set("关闭")
             if write_profiles_to_form():
                 try:
-                    self._apply_config_form(save_profile=False)
-                    config.save()
+                    self._apply_config_form(save_profile=True)
                 except Exception:
                     pass
                 set_status(f"当前只上传：{active_var.get()}", "green")
@@ -3112,8 +3173,7 @@ class PipelineGUI:
             multi_var.set("开启")
             if write_profiles_to_form():
                 try:
-                    self._apply_config_form(save_profile=False)
-                    config.save()
+                    self._apply_config_form(save_profile=True)
                 except Exception:
                     pass
                 count = sum(1 for p in profiles if p.get("enabled", True))
@@ -3132,14 +3192,42 @@ class PipelineGUI:
 
             def worker():
                 try:
-                    from app.vendor.stage5_upload_browser import _restart_chrome
+                    from app.vendor.stage5_upload_browser import _restart_chrome, read_current_studio_channel
 
                     def log(line):
                         self.root.after(0, lambda line=line: set_status(str(line), "#555"))
 
                     ok = _restart_chrome(config, log, chrome_profile)
-                    final = f"已打开：{chrome_profile}，请确认 YouTube 登录。" if ok else f"打开失败：{chrome_profile}"
-                    self.root.after(0, lambda: set_status(final, "green" if ok else "red"))
+                    if not ok:
+                        self.root.after(0, lambda: set_status(f"打开失败：{chrome_profile}", "red"))
+                        return
+                    self.root.after(0, lambda: set_status("请在 Chrome 确认目标频道；正在读取并绑定频道 ID…", "#9a5b00"))
+                    identity = read_current_studio_channel(timeout_seconds=300)
+
+                    def finish_binding():
+                        if idx >= len(profiles):
+                            set_status("频道列表已变化，请重新打开并绑定。", "red")
+                            return
+                        channel_id = str(identity.get("channel_id") or "").strip()
+                        channel_name = str(identity.get("channel_name") or "").strip()
+                        from app.youtube_channel_bindings import save_binding
+                        save_binding(chrome_profile, str(profiles[idx].get("name") or ""), channel_id, channel_name)
+                        profiles[idx]["youtube_channel_id"] = channel_id
+                        profiles[idx]["youtube_channel_name"] = channel_name
+                        if current["idx"] == idx:
+                            youtube_channel_id_var.set(channel_id)
+                            youtube_channel_name_var.set(channel_name)
+                        if not write_profiles_to_form(idx):
+                            return
+                        try:
+                            self._apply_config_form(save_profile=True)
+                        except Exception as exc:
+                            set_status(f"绑定已读取但保存失败：{exc}", "red")
+                            return
+                        rebuild(idx)
+                        set_status(f"已绑定：{channel_name}（{channel_id}）", "green")
+
+                    self.root.after(0, finish_binding)
                 except Exception as exc:
                     self.root.after(0, lambda exc=exc: set_status(f"打开失败：{exc}", "red"))
 
@@ -3149,14 +3237,11 @@ class PipelineGUI:
         ttk.Button(left_btns, text="删除", command=delete_profile).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(left_btns, text="上移", command=lambda: move_profile(-1)).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(left_btns, text="下移", command=lambda: move_profile(1)).pack(side=tk.LEFT)
-        ttk.Button(action_box, text="打开此频道 Chrome 登录", command=open_selected_profile).pack(fill=tk.X, pady=(0, 4))
+        ttk.Button(action_box, text="打开登录并绑定当前 YouTube 频道", command=open_selected_profile).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(action_box, text="设为当前单频道上传", command=use_selected_only).pack(fill=tk.X, pady=(0, 4))
         ttk.Button(action_box, text="顺序上传全部启用频道", command=enable_all_profiles).pack(fill=tk.X)
-        schedule_test_btn.configure(command=start_schedule_test)
-        rebuild_queue_btn.configure(command=rebuild_script_queue)
-        queue_up_btn.configure(command=lambda: move_queue_item(-1))
-        queue_down_btn.configure(command=lambda: move_queue_item(1))
-        queue_edit_btn.configure(command=edit_queue_item)
+        schedule_batch_btn.configure(command=open_youtube_batch_schedule)
+        script_schedule_batch_btn.configure(command=open_script_batch_schedule)
         ttk.Button(form_btns, text="保存频道方案", style="Primary.TButton", command=save_and_close).pack(side=tk.RIGHT)
         ttk.Button(form_btns, text="关闭", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 6))
 
@@ -3412,6 +3497,7 @@ class PipelineGUI:
         selected_paths: list[str | Path] | tuple[str | Path, ...] | None = None,
         *,
         pair_within_parent: bool = False,
+        forced_project_id: str = "",
     ):
         """Import all related files in one selection, pairing them by filename."""
         selected = selected_paths
@@ -3426,12 +3512,23 @@ class PipelineGUI:
         if not matched["pairs"]:
             messagebox.showwarning("没有正文", "请选择至少一个正文 TXT。词典 TXT 需要与正文一起选择。")
             return
+        text_paths = [
+            text_path for text_path, _audio_path, _dictionary_path in matched["pairs"]
+        ]
+        project_assignments = (
+            self._project_assignments_for_forced_import(forced_project_id, text_paths)
+            if forced_project_id
+            else self._confirm_import_projects(text_paths)
+        )
+        if project_assignments is None:
+            return
 
         invalid_audio: list[tuple[Path, str]] = []
         invalid_dictionary: list[tuple[Path, str]] = []
         created = 0
         audio_attached = 0
         dictionary_attached = 0
+        project_attached = 0
         for text_path, audio_path, dictionary_path in matched["pairs"]:
             if audio_path:
                 try:
@@ -3446,18 +3543,25 @@ class PipelineGUI:
                 except Exception as exc:
                     invalid_dictionary.append((dictionary_path, str(exc)))
                     dictionary_path = None
+            project_choice = project_assignments.get(str(text_path.resolve(strict=False)), {})
             job_id = self._create_queued_job(
                 text_path.stem,
                 str(text_path),
                 dictionary_path=str(dictionary_path) if dictionary_path else "",
                 imported_audio_path=str(audio_path) if audio_path else None,
+                project_id=str(project_choice.get("project_id") or ""),
+                project_episode=int(project_choice.get("episode") or 0),
             )
             if job_id:
                 created += 1
                 audio_attached += int(audio_path is not None)
                 dictionary_attached += int(dictionary_path is not None)
+                project_attached += int(bool(project_choice))
 
-        report = [f"已创建 {created} 个任务，其中 {audio_attached} 个自动跳过 TTS，{dictionary_attached} 个自动附加读音词典。"]
+        report = [
+            f"已创建 {created} 个任务，其中 {project_attached} 个已归入小说项目，"
+            f"{audio_attached} 个自动跳过 TTS，{dictionary_attached} 个自动附加读音词典。"
+        ]
         if matched["ambiguous"]:
             report.append("以下文件名匹配到多个候选文件，未导入：\n" + "\n".join(
                 f"  - {text.name} 的 {kind}：{', '.join(path.name for path in candidates)}"
@@ -3478,6 +3582,103 @@ class PipelineGUI:
             messagebox.showinfo("文件导入完成", "\n\n".join(report))
         else:
             messagebox.showwarning("文件导入完成", "\n\n".join(report))
+
+    def _confirm_import_projects(self, text_paths: list[Path]) -> dict[str, dict] | None:
+        """Ask once per detected series before any task is created."""
+        groups = pr.detect_import_project_groups(text_paths)
+        assignments: dict[str, dict] = {}
+        for group in groups:
+            paths = [Path(path) for path in group.get("paths") or []]
+            existing = group.get("existing_project")
+            preview = "\n".join(f"  • {path.name}" for path in paths[:8])
+            if len(paths) > 8:
+                preview += f"\n  • ……另有 {len(paths) - 8} 个文件"
+            reason = str(group.get("reason") or "文件名称和目录匹配")
+            if isinstance(existing, dict) and existing.get("project_id"):
+                prompt = (
+                    f"检测到这些正文可能属于已有项目《{existing.get('name')}》。\n"
+                    f"判断依据：{reason}\n\n{preview}\n\n"
+                    "选择“是”：加入该项目并共享人物分析、人名关系和人设图。\n"
+                    "选择“否”：作为独立任务导入。\n"
+                    "选择“取消”：取消整次导入。"
+                )
+                project = existing
+            else:
+                prompt = (
+                    f"检测到 {len(paths)} 个正文可能属于同一系列《{group.get('name')}》。\n"
+                    f"判断依据：{reason}\n\n{preview}\n\n"
+                    "选择“是”：创建小说项目并共享人物分析、人名关系和人设图。\n"
+                    "选择“否”：作为独立任务导入。\n"
+                    "选择“取消”：取消整次导入。"
+                )
+                project = None
+            answer = messagebox.askyesnocancel(
+                "检测到小说项目",
+                prompt,
+                icon=messagebox.QUESTION,
+            )
+            if answer is None:
+                return None
+            if not answer:
+                continue
+            if project is None:
+                project = pr.create_novel_project(
+                    str(group.get("name") or "未命名项目"),
+                    aliases=[path.stem for path in paths],
+                    source_directories={str(path.parent) for path in paths},
+                    series_video_settings={
+                        "shared_novel_title": str(group.get("name") or "未命名项目"),
+                        "shared_novel_title_locked": False,
+                    },
+                )
+            episodes = group.get("episodes") if isinstance(group.get("episodes"), dict) else {}
+            for path in paths:
+                assignments[str(path.resolve(strict=False))] = {
+                    "project_id": str(project.get("project_id") or ""),
+                    "episode": int(episodes.get(str(path), 0) or 0),
+                }
+        return assignments
+
+    def _project_assignments_for_forced_import(
+        self,
+        project_id: str,
+        text_paths: list[Path],
+    ) -> dict[str, dict]:
+        project = pr.load_novel_project(project_id)
+        if not project:
+            raise FileNotFoundError(f"小说项目不存在：{project_id}")
+        settings = project.get("series_video_settings") or {}
+        try:
+            next_episode = max(1, int(settings.get("episode_start") or 1))
+        except (TypeError, ValueError):
+            next_episode = 1
+        used = set()
+        for job_id in project.get("jobs") or []:
+            status = pr.load_status(str(job_id), include_worker=False)
+            try:
+                episode = int(status.get("project_episode") or 0)
+            except (TypeError, ValueError):
+                episode = 0
+            if episode > 0:
+                used.add(episode)
+        assignments: dict[str, dict] = {}
+        ordered = sorted(
+            text_paths,
+            key=lambda path: self._natural_task_key(path.name),
+        )
+        for path in ordered:
+            episode = pr.infer_project_episode(path)
+            if episode <= 0 or episode in used:
+                while next_episode in used:
+                    next_episode += 1
+                episode = next_episode
+                next_episode += 1
+            used.add(episode)
+            assignments[str(path.resolve(strict=False))] = {
+                "project_id": project_id,
+                "episode": episode,
+            }
+        return assignments
 
     def _import_folder(self):
         """Recursively import selected novel folders after an explicit confirmation."""
@@ -3525,20 +3726,35 @@ class PipelineGUI:
         if not confirmed:
             return
 
+        all_text_paths = [
+            text_path
+            for _root, matched in imports
+            for text_path, _audio_path, _dictionary_path in matched["pairs"]
+        ]
+        project_assignments = self._confirm_import_projects(all_text_paths)
+        if project_assignments is None:
+            return
+
         created = 0
+        project_attached = 0
         for _root, matched in imports:
             for text_path, audio_path, dictionary_path in matched["pairs"]:
+                project_choice = project_assignments.get(str(text_path.resolve(strict=False)), {})
                 job_id = self._create_queued_job(
                     text_path.stem,
                     str(text_path),
                     dictionary_path=str(dictionary_path) if dictionary_path else "",
                     imported_audio_path=str(audio_path) if audio_path else None,
+                    project_id=str(project_choice.get("project_id") or ""),
+                    project_episode=int(project_choice.get("episode") or 0),
                 )
                 created += int(bool(job_id))
+                project_attached += int(bool(job_id and project_choice))
         messagebox.showinfo(
             "文件夹导入完成",
-            f"已从 {len(selected)} 个文件夹导入 {created} 个正文任务。\n"
-            "同一小说文件夹内的 _01、_02… 会自动共享洗稿人名和设定。",
+            f"已从 {len(selected)} 个文件夹导入 {created} 个正文任务，"
+            f"其中 {project_attached} 个已归入小说项目。\n"
+            "项目内任务会共享人物分析、人名关系和人设图。",
         )
 
     def _import_text_audio_pair(self):
@@ -3590,8 +3806,17 @@ class PipelineGUI:
             return
         initial = _match_batch_texts_and_dictionaries(list(files))
         if not initial["dictionaries"]:
+            project_assignments = self._confirm_import_projects(list(initial["texts"]))
+            if project_assignments is None:
+                return
             for text_path in initial["texts"]:
-                self._create_queued_job(text_path.stem, str(text_path))
+                project_choice = project_assignments.get(str(text_path.resolve(strict=False)), {})
+                self._create_queued_job(
+                    text_path.stem,
+                    str(text_path),
+                    project_id=str(project_choice.get("project_id") or ""),
+                    project_episode=int(project_choice.get("episode") or 0),
+                )
             return
 
         valid_dictionaries: list[Path] = []
@@ -3604,12 +3829,18 @@ class PipelineGUI:
                 invalid_dictionaries.append((dictionary_path, str(exc)))
 
         matched = _match_batch_texts_and_dictionaries([*initial["texts"], *valid_dictionaries])
+        project_assignments = self._confirm_import_projects(list(initial["texts"]))
+        if project_assignments is None:
+            return
         created_with_dictionary = 0
         for text_path, dictionary_path in matched["pairs"]:
+            project_choice = project_assignments.get(str(text_path.resolve(strict=False)), {})
             self._create_queued_job(
                 text_path.stem,
                 str(text_path),
                 dictionary_path=str(dictionary_path),
+                project_id=str(project_choice.get("project_id") or ""),
+                project_episode=int(project_choice.get("episode") or 0),
             )
             created_with_dictionary += 1
 
@@ -3620,7 +3851,14 @@ class PipelineGUI:
         for text_path in texts_without_dictionary:
             # An explicit empty value prevents a previously selected global
             # dictionary from being attached to the wrong batch item.
-            self._create_queued_job(text_path.stem, str(text_path), dictionary_path="")
+            project_choice = project_assignments.get(str(text_path.resolve(strict=False)), {})
+            self._create_queued_job(
+                text_path.stem,
+                str(text_path),
+                dictionary_path="",
+                project_id=str(project_choice.get("project_id") or ""),
+                project_episode=int(project_choice.get("episode") or 0),
+            )
 
         report = [
             f"成功创建 {created_with_dictionary + len(texts_without_dictionary)} 个正文任务："
@@ -3795,6 +4033,8 @@ class PipelineGUI:
         input_text: str,
         dictionary_path: str | None = None,
         imported_audio_path: str | None = None,
+        project_id: str = "",
+        project_episode: int = 0,
     ) -> str:
         source = Path(str(input_text)).expanduser()
         if source.is_file():
@@ -3853,7 +4093,24 @@ class PipelineGUI:
             progress=0.0,
         )
         pr.append_log(job_dir, f"queued: {title}")
-        pr.register_imported_series_job(job_id, input_text)
+        if project_id:
+            try:
+                pr.assign_job_to_project(
+                    job_id,
+                    project_id,
+                    episode=project_episode,
+                    source_path=input_text if source.is_file() else "",
+                )
+            except Exception as exc:
+                try:
+                    pr.delete_job(job_id)
+                except Exception:
+                    pass
+                messagebox.showerror("加入小说项目失败", f"任务未创建：\n{exc}")
+                self._refresh_jobs()
+                return ""
+        else:
+            pr.register_imported_series_job(job_id, input_text)
         selected_dictionary = (
             self.pronunciation_dictionary_var.get().strip()
             if dictionary_path is None
@@ -3910,8 +4167,23 @@ class PipelineGUI:
             self._start_job(job_id, selected_job_ids=ids)
 
     def _continue_selected(self):
-        """Resume selected jobs from their saved artifacts and settings snapshot."""
-        for job_id in self._selected_job_ids():
+        """Resume only incomplete stages, retaining every valid job artifact."""
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先选择要从失败处继续的任务。")
+            return
+        # The operator may have just updated an API key, balance-related route,
+        # or other visible setting.  Apply it before dispatching: start_worker
+        # passes current secrets to the worker while the task snapshot retains
+        # the rest of the task's pinned production settings.
+        try:
+            self._apply_config_form(save_profile=False)
+        except Exception as exc:
+            messagebox.showerror("继续任务失败", f"无法应用当前接口配置：\n{exc}")
+            return
+        started = 0
+        queued = 0
+        for job_id in ids:
             status = pr.load_status(job_id)
             if status.get("worker_alive"):
                 messagebox.showwarning("任务正在运行", f"{job_id} 正在运行，无需继续启动。")
@@ -3921,12 +4193,30 @@ class PipelineGUI:
                 messagebox.showwarning("缺少输入", f"{job_id} 没有 input")
                 continue
             try:
-                pr.start_worker(input_text, job_id=job_id, resume=True)
+                _, pid = pr.start_worker(input_text, job_id=job_id, resume=True)
+                if pid:
+                    started += 1
+                else:
+                    queued += 1
             except Exception as exc:
                 messagebox.showerror("继续任务失败", str(exc))
         self._refresh_jobs()
+        if started or queued:
+            detail = []
+            if started:
+                detail.append(f"已从断点启动 {started} 个")
+            if queued:
+                detail.append(f"已加入等待队列 {queued} 个")
+            self._append_log("；".join(detail) + "；已保留已完成的文本、配音和图片，只重试失败或缺失步骤。")
 
-    def _ask_batch_schedule_datetimes(self, title: str, ids: list[str], mode: str) -> tuple[list[datetime], str, str, list[str]] | None:
+    def _ask_batch_schedule_datetimes(self, title: str, ids: list[str], mode: str) -> tuple[list[datetime], str, str, str, list[str]] | None:
+        # Keep the scheduler and channel editor on one authoritative saved
+        # configuration, even when scheduling starts from the task menu.
+        try:
+            self._apply_config_form(save_profile=True)
+        except Exception as exc:
+            messagebox.showerror("无法读取频道方案", f"保存当前配置失败：\n{exc}")
+            return None
         now = datetime.now()
         initial = now + timedelta(days=1)
         if mode == "script":
@@ -3961,7 +4251,10 @@ class PipelineGUI:
 
         def load_channels(configuration_name: str) -> list[dict]:
             try:
-                _cleaned, settings = config.profile_settings(configuration_name)
+                if configuration_name == str(config.get("active_profile", "") or "").strip():
+                    settings = config.as_dict()
+                else:
+                    _cleaned, settings = config.profile_settings(configuration_name)
             except Exception:
                 return []
             return [
@@ -3974,7 +4267,27 @@ class PipelineGUI:
             messagebox.showerror("没有可用频道", "所选配置中没有启用的频道方案，请先在“编辑频道上传方案”中启用频道。")
             return None
         profile_names = [str(item.get("name") or "").strip() for item in channel_profiles]
-        _cleaned, selected_settings = config.profile_settings(selected_configuration)
+
+        def known_channel_accounts() -> list[str]:
+            """List the local Chrome login profiles without changing their data."""
+            accounts = {"Default"}
+            for configuration_name in configuration_names:
+                for item in load_channels(configuration_name):
+                    account = str(item.get("chrome_profile") or "").strip()
+                    if account:
+                        accounts.add(account)
+            try:
+                account_root = Path("data/chrome_debug_profiles")
+                if account_root.is_dir():
+                    accounts.update(item.name for item in account_root.iterdir() if item.is_dir())
+            except OSError:
+                pass
+            return sorted(accounts, key=lambda value: (value != "Default", value.lower()))
+
+        if selected_configuration == active_configuration:
+            selected_settings = config.as_dict()
+        else:
+            _cleaned, selected_settings = config.profile_settings(selected_configuration)
         active_name = str(selected_settings.get("browser_active_profile", "") or "").strip()
         selected_profile_name = active_name if active_name in profile_names else profile_names[0]
         script_items = {
@@ -3982,13 +4295,13 @@ class PipelineGUI:
             for item in publish_scheduler.load_items(selected_profile_name)
         } if mode == "script" else {}
 
+        previous_grab = self.root.grab_current()
         win = tk.Toplevel(self.root)
         win.title(title)
         win.geometry("940x520")
         win.minsize(760, 360)
         try:
-            win.transient(self.root)
-            win.grab_set()
+            win.transient(previous_grab if previous_grab is not None else self.root)
         except Exception:
             pass
         outer = ttk.Frame(win, padding=12)
@@ -4008,15 +4321,18 @@ class PipelineGUI:
             state="readonly", width=20,
         )
         configuration_picker.pack(side=tk.LEFT, padx=(4, 14))
-        ttk.Label(channel_bar, text="频道方案：").pack(side=tk.LEFT)
+        ttk.Label(channel_bar, text="目标 YouTube 频道：").pack(side=tk.LEFT)
         channel_var = tk.StringVar(value=selected_profile_name)
         channel_picker = ttk.Combobox(
             channel_bar, textvariable=channel_var, values=profile_names,
             state="readonly", width=28,
         )
         channel_picker.pack(side=tk.LEFT, padx=(4, 14))
-        channel_detail_var = tk.StringVar()
-        ttk.Label(channel_bar, textvariable=channel_detail_var, foreground="#555").pack(side=tk.LEFT)
+        ttk.Label(channel_bar, text="绑定 Chrome 资料：").pack(side=tk.LEFT)
+        # A schedule must never be allowed to override this value.  The
+        # channel editor owns the mapping: channel scheme -> Chrome profile.
+        channel_account_var = tk.StringVar()
+        ttk.Label(channel_bar, textvariable=channel_account_var, width=18, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 0))
 
         def refresh_channel_detail(*_args):
             chosen = next(
@@ -4024,9 +4340,9 @@ class PipelineGUI:
                 None,
             )
             if chosen is None:
-                channel_detail_var.set("未选择频道")
+                channel_account_var.set("")
                 return
-            channel_detail_var.set(f"频道账号：{str(chosen.get('chrome_profile') or 'Default')}")
+            channel_account_var.set(str(chosen.get("chrome_profile") or "Default"))
 
         def refresh_configuration_channels(*_args):
             nonlocal channel_profiles
@@ -4035,10 +4351,14 @@ class PipelineGUI:
             channel_picker.configure(values=names)
             if not names:
                 channel_var.set("")
-                channel_detail_var.set("此配置没有启用的频道方案")
+                channel_account_var.set("")
                 return
             try:
-                _cleaned, settings = config.profile_settings(configuration_var.get().strip())
+                selected_name = configuration_var.get().strip()
+                if selected_name == str(config.get("active_profile", "") or "").strip():
+                    settings = config.as_dict()
+                else:
+                    _cleaned, settings = config.profile_settings(selected_name)
             except Exception:
                 settings = {}
             preferred = str(settings.get("browser_active_profile", "") or "").strip()
@@ -4219,6 +4539,14 @@ class PipelineGUI:
             if chosen_profile not in channel_names:
                 messagebox.showerror("请选择频道", "请选择要使用的频道方案。", parent=win)
                 return
+            chosen = next(
+                (item for item in channel_profiles if str(item.get("name") or "").strip() == chosen_profile),
+                None,
+            )
+            chosen_account = str((chosen or {}).get("chrome_profile") or "").strip()
+            if not chosen_account:
+                messagebox.showerror("频道方案不完整", "该频道方案没有绑定 Chrome 资料，请回到“编辑频道上传方案”设置。", parent=win)
+                return
             scheduled_rows = []
             for index, row in enumerate(row_vars):
                 values = row["values"]
@@ -4238,21 +4566,38 @@ class PipelineGUI:
             result["job_ids"] = [str(row["job_id"]) for row in row_vars]
             result["configuration_name"] = chosen_configuration
             result["profile_name"] = chosen_profile
+            result["channel_account"] = chosen_account
             win.destroy()
 
         ttk.Button(actions, text="确定", style="Primary.TButton", command=accept).pack(side=tk.RIGHT)
         ttk.Button(actions, text="取消", command=win.destroy).pack(side=tk.RIGHT, padx=(0, 6))
         win.bind("<Escape>", lambda _event: win.destroy())
-        self.root.wait_window(win)
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        try:
+            # On macOS a nested modal must be visible before taking the grab.
+            # Otherwise the channel editor keeps the grab and every button in
+            # this window, including Cancel, appears unresponsive.
+            win.wait_visibility()
+            win.grab_set()
+            win.focus_force()
+            self.root.wait_window(win)
+        finally:
+            try:
+                if previous_grab is not None and previous_grab.winfo_exists():
+                    previous_grab.grab_set()
+                    previous_grab.focus_force()
+            except Exception:
+                pass
         values = result.get("values")
         configuration_name = result.get("configuration_name")
         profile_name = result.get("profile_name")
-        if not isinstance(values, list) or not isinstance(configuration_name, str) or not isinstance(profile_name, str):
+        channel_account = result.get("channel_account")
+        if not isinstance(values, list) or not isinstance(configuration_name, str) or not isinstance(profile_name, str) or not isinstance(channel_account, str):
             return None
         ordered_ids = result.get("job_ids")
         if not isinstance(ordered_ids, list):
             return None
-        return values, configuration_name, profile_name, [str(job_id) for job_id in ordered_ids]
+        return values, configuration_name, profile_name, channel_account, [str(job_id) for job_id in ordered_ids]
 
     def _switch_active_channel_schedule_mode(self, mode: str, scheduled: datetime,
                                              profile_name_override: str = "") -> str | None:
@@ -4391,7 +4736,7 @@ class PipelineGUI:
         schedule_choice = self._ask_batch_schedule_datetimes("油管内定时任务", ids, "youtube")
         if not schedule_choice:
             return
-        scheduled_rows, selected_configuration_name, selected_profile_name, ids = schedule_choice
+        scheduled_rows, selected_configuration_name, selected_profile_name, selected_channel_account, ids = schedule_choice
         try:
             _cleaned, selected_settings = config.profile_settings(selected_configuration_name)
         except Exception as exc:
@@ -4406,7 +4751,7 @@ class PipelineGUI:
             messagebox.showerror("没有频道方案", "请先在“编辑频道上传方案”中建立并选择频道。")
             return
         profile_name = str(active_profile.get("name") or selected_profile_name)
-        channel_account = str(active_profile.get("chrome_profile") or "Default")
+        channel_account = selected_channel_account
         timezone_text = str(active_profile.get("youtube_schedule_timezone") or "Asia/Tokyo")
         preview = "\n".join(
             f"{index + 1}. {job_id} → {scheduled_rows[index].strftime('%Y-%m-%d %H:%M')}"
@@ -4422,6 +4767,7 @@ class PipelineGUI:
         try:
             pr.apply_profile_to_jobs(ids, selected_configuration_name)
             config.load_profile(selected_configuration_name)
+            config.save_profile(selected_configuration_name)
             config.save()
             self._refresh_config_form()
             if hasattr(self, "profile_var"):
@@ -4448,6 +4794,8 @@ class PipelineGUI:
         def worker():
             errors = []
             for job_id, target in zip(ids, scheduled_rows):
+                upload_job = browser_upload._Job()
+                self._active_browser_upload_jobs[job_id] = upload_job
                 try:
                     url = pr.upload_completed_job(
                         job_id,
@@ -4456,7 +4804,10 @@ class PipelineGUI:
                         schedule_enabled_override=True,
                         scheduled_at_override=target.strftime("%Y-%m-%dT%H:%M"),
                         schedule_timezone_override=timezone_text,
+                        browser_upload_job=upload_job,
                     )
+                    if upload_job.is_cancelled():
+                        raise RuntimeError("用户停止了一切任务")
                     pr.write_status(
                         pr.job_dir_for(job_id),
                         publish_schedule_state="scheduled",
@@ -4469,6 +4820,9 @@ class PipelineGUI:
                         publish_schedule_error=str(exc),
                     )
                     errors.append(f"{job_id}: {exc}")
+                finally:
+                    if self._active_browser_upload_jobs.get(job_id) is upload_job:
+                        self._active_browser_upload_jobs.pop(job_id, None)
             self.root.after(0, lambda: self._finish_manual_upload(ids, errors, scheduled=True))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -4484,7 +4838,7 @@ class PipelineGUI:
         schedule_choice = self._ask_batch_schedule_datetimes("脚本内定时任务", ids, "script")
         if not schedule_choice:
             return
-        scheduled_rows, selected_configuration_name, selected_profile_name, ids = schedule_choice
+        scheduled_rows, selected_configuration_name, selected_profile_name, selected_channel_account, ids = schedule_choice
         try:
             _cleaned, selected_settings = config.profile_settings(selected_configuration_name)
         except Exception as exc:
@@ -4499,7 +4853,7 @@ class PipelineGUI:
             messagebox.showerror("没有频道方案", "请先在“编辑频道上传方案”中建立并选择频道。")
             return
         profile_name = str(active_profile.get("name") or selected_profile_name)
-        channel_account = str(active_profile.get("chrome_profile") or "Default")
+        channel_account = selected_channel_account
         timezone_text = str(active_profile.get("script_schedule_timezone") or "Asia/Tokyo")
         preview = "\n".join(
             f"{index + 1}. {job_id} → {scheduled_rows[index].strftime('%Y-%m-%d %H:%M')}"
@@ -4516,6 +4870,7 @@ class PipelineGUI:
         try:
             pr.apply_profile_to_jobs(ids, selected_configuration_name)
             config.load_profile(selected_configuration_name)
+            config.save_profile(selected_configuration_name)
             config.save()
             self._refresh_config_form()
             if hasattr(self, "profile_var"):
@@ -4551,6 +4906,13 @@ class PipelineGUI:
         )
 
     def _upload_selected_completed_jobs(self, schedule_test: bool = False):
+        """Upload selected completed videos now.
+
+        This is deliberately an immediate-upload action.  Scheduling has its
+        own explicit task-list actions, so a channel's saved scheduling mode
+        must never turn this button into a hidden schedule test or require a
+        future timestamp.
+        """
         ids = self._selected_job_ids()
         if not ids:
             messagebox.showwarning("没有选择任务", "请先在任务队列中选择已完成的视频。")
@@ -4565,66 +4927,37 @@ class PipelineGUI:
             messagebox.showerror("上传失败", f"无法保存上传设置：\n{exc}")
             return
 
-        publish_mode = str(config.get("youtube_publish_mode", "immediate") or "immediate")
-        if publish_mode == "script" and not schedule_test:
-            profiles = _parse_upload_profiles(str(config.get("browser_profiles", "[]") or "[]"))
-            active_name = str(config.get("browser_active_profile", "") or "").strip()
-            profile = next((item for item in profiles if str(item.get("name") or "") == active_name), None)
-            if profile is None:
-                messagebox.showerror("脚本内定时", "找不到当前频道上传方案，请先保存频道方案。")
-                return
-            try:
-                first_at = datetime.strptime(
-                    f"{profile.get('script_schedule_first_date', '')} {profile.get('script_schedule_time', '')}",
-                    "%Y-%m-%d %H:%M",
-                )
-                interval = max(1, int(profile.get("script_schedule_interval_hours") or 24))
-            except (TypeError, ValueError):
-                messagebox.showerror("脚本内定时", "请先在“脚本内定时”页填写正确的首次日期、时间和发布间隔。")
-                return
-            statuses = [(row["job_id"], pr.load_status(row["job_id"])) for row in pr.list_jobs(limit=10000)]
-            publish_scheduler.ensure_jobs(active_name, statuses, first_at, interval)
-            messagebox.showinfo("已交给脚本内定时", "选中的视频不会立即上传，将按照“脚本内定时”的待发布队列执行。")
-            return
-
-        schedule_enabled = publish_mode == "youtube"
-        if schedule_test and not schedule_enabled:
-            messagebox.showwarning("尚未开启定时发布", "请先在“编辑频道上传方案”的“油管内定时”页签中选择开启。")
-            return
-        if schedule_enabled:
-            if len(ids) != 1:
-                messagebox.showwarning("测试阶段仅支持一个视频", "请只选择一个已完成视频进行定时发布测试。")
-                return
-            date_text = str(config.get("youtube_schedule_date", "") or "").strip()
-            time_text = str(config.get("youtube_schedule_time", "") or "").strip()
-            try:
-                scheduled_local = datetime.strptime(f"{date_text} {time_text}", "%Y-%m-%d %H:%M")
-            except ValueError:
-                messagebox.showerror("定时时间格式不正确", "发布日期请填写 YYYY-MM-DD，发布时间请填写 HH:MM。")
-                return
-            if scheduled_local <= datetime.now() + timedelta(minutes=5):
-                messagebox.showerror("定时时间太近", "测试时间必须至少晚于当前时间 5 分钟。")
-                return
-            timezone_text = str(config.get("youtube_schedule_timezone", "Asia/Tokyo") or "Asia/Tokyo")
-            confirm_text = (
-                f"将上传选中的视频并预约公开：\n\n"
-                f"{date_text} {time_text}\n时区：{timezone_text}\n\n"
-                "不会重新制作视频。继续吗？"
-            )
-            confirm_title = "测试定时发布"
-        else:
-            confirm_text = f"将单独上传选中的 {len(ids)} 个已完成视频，不会重新制作视频。继续吗？"
-            confirm_title = "执行选中任务"
+        # ``schedule_test`` is retained for compatibility with older menu
+        # bindings, but this action has one unambiguous meaning: upload now.
+        schedule_enabled = False
+        confirm_text = (
+            f"将立即上传选中的 {len(ids)} 个已完成视频，不会重新制作视频。\n\n"
+            "公开视频范围仍按当前频道方案执行。需要定时发布，请使用任务列表中的“油管内定时”或“脚本内定时”。\n\n"
+            "继续吗？"
+        )
+        confirm_title = "立即上传选中成片"
         if not messagebox.askyesno(confirm_title, confirm_text):
             return
 
         def worker():
             errors = []
             for job_id in ids:
+                upload_job = browser_upload._Job()
+                self._active_browser_upload_jobs[job_id] = upload_job
                 try:
-                    pr.upload_completed_job(job_id, on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message))
+                    pr.upload_completed_job(
+                        job_id,
+                        on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message),
+                        schedule_enabled_override=False,
+                        browser_upload_job=upload_job,
+                    )
+                    if upload_job.is_cancelled():
+                        raise RuntimeError("用户停止了一切任务")
                 except Exception as exc:
                     errors.append(f"{job_id}: {exc}")
+                finally:
+                    if self._active_browser_upload_jobs.get(job_id) is upload_job:
+                        self._active_browser_upload_jobs.pop(job_id, None)
             self.root.after(0, lambda: self._finish_manual_upload(ids, errors, scheduled=schedule_enabled))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -4804,9 +5137,6 @@ class PipelineGUI:
             pr.set_job_series_animation_mode(job_id, "series" if answer else "single")
             st = pr.load_status(job_id)
         try:
-            # Persist the form currently on screen before the worker creates
-            # its per-job snapshot.  This makes the selected profile and its
-            # displayed fields the exact settings used by this task.
             self._apply_config_form(save_profile=False)
         except Exception as exc:
             messagebox.showerror("启动失败", f"无法应用当前配置方案：\n{exc}")
@@ -4864,7 +5194,8 @@ class PipelineGUI:
             return
         message = (
             "将从头重新执行选中的任务，包括文本处理、分镜、全部配图、封面、配音、字幕和视频合成。\n\n"
-            "旧图片、旧配音和旧成片会被删除，并重新调用相关 AI 接口；原始输入文件、手动读音词典和导入的 MP3 会保留。\n"
+            "旧图片和旧配音会被删除，并重新调用相关 AI 接口；旧成片会一直保留，只有新成片合成并验证成功后才会被覆盖。\n"
+            "原始输入文件、手动读音词典和导入的 MP3 会保留。\n"
             "本次会使用界面当前显示的配置。继续吗？"
         )
         if not messagebox.askyesno("全部重试（重新生图）", message):
@@ -4893,7 +5224,8 @@ class PipelineGUI:
             return
         message = (
             "会从洗稿、朗读净化和切片重新开始，并重做全部配音、字幕和成片。\n"
-            "已有图片会被复用，不会调用任何生图 API；新音频会按现有图片数量平均分配画面时长。继续吗？"
+            "已有图片会被复用，不会调用任何生图 API；新音频会按现有图片数量平均分配画面时长。\n"
+            "旧成片会一直保留，只有新成片合成并验证成功后才会被覆盖。继续吗？"
         )
         if not messagebox.askyesno("重试（生图除外）", message):
             return
@@ -4995,7 +5327,11 @@ class PipelineGUI:
         ttk.Label(body, text="请选择配音处理方式", font=(UI_FONT, UI_HEADING_FONT_SIZE, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
             body,
-            text="全段修复：只补未完成、失败或异常的段。\n重做 TTS：重做全部配音；保留现有图片和封面，只重新合成视频。",
+            text=(
+                "全段修复：只补未完成、失败或异常的段。\n"
+                "重做 TTS：重做全部配音；保留现有图片和封面，只重新合成视频。\n"
+                "两种方式都会保留旧成片，直到新成片成功后再覆盖。"
+            ),
             justify=tk.LEFT,
             wraplength=420,
         ).grid(row=1, column=0, columnspan=2, pady=(10, 16), sticky="w")
@@ -5072,7 +5408,7 @@ class PipelineGUI:
         ids = self._selected_job_ids()
         if not ids:
             return
-        active_stages = {"queued", "worker_starting", "starting", "scrape", "clean", "tts", "images_prefetch", "pacing", "images", "image_decision", "cover", "compose", "upload", "stopping"}
+        active_stages = {"queued", "worker_starting", "starting", "scrape", "clean", "api_preprocessing", "tts", "images_prefetch", "pacing", "images", "image_decision", "cover", "compose", "upload", "stopping"}
         running = [
             job_id for job_id in ids
             if (status := pr.load_status(job_id)).get("worker_alive") or status.get("stage") in active_stages
@@ -5098,7 +5434,7 @@ class PipelineGUI:
         active_stages = {
             "queued", "worker_starting", "starting", "scrape", "clean", "tts",
             "images_prefetch", "pacing", "images", "image_decision", "cover",
-            "compose", "upload", "stopping",
+            "compose", "upload", "stopping", "api_preprocessing",
         }
         rows = pr.list_jobs(limit=10000)
         running = []
@@ -5109,17 +5445,25 @@ class PipelineGUI:
             status = pr.load_status(job_id)
             if status.get("worker_alive") or status.get("stage") in active_stages:
                 running.append(job_id)
-        if not running and not self._script_upload_running:
+        browser_upload_count = len(self._active_browser_upload_jobs)
+        if not running and not self._script_upload_running and not browser_upload_count:
             messagebox.showinfo("无需停止", "当前没有正在运行或上传的任务。")
             return
         upload_count = sum(1 for job_id in running if pr.load_status(job_id).get("stage") == "upload")
         detail = f"将停止全部 {len(running)} 个活动任务"
         if upload_count:
             detail += f"，其中 {upload_count} 个正在上传"
+        if self._script_upload_running:
+            detail += "，并中止正在执行的脚本内定时上传"
         detail += "。已生成的中间文件会保留，可之后续跑。继续吗？"
         if not messagebox.askyesno("确认停止一切任务", detail):
             return
         errors = []
+        # Browser uploads run in GUI threads rather than pipeline worker
+        # processes.  They need their own cancellation token.
+        self._script_publish_paused = True
+        for upload_job in list(self._active_browser_upload_jobs.values()):
+            upload_job.cancelled = True
         for job_id in running:
             try:
                 pr.stop_job(job_id)
@@ -5130,7 +5474,7 @@ class PipelineGUI:
         if errors:
             messagebox.showerror("部分任务停止失败", "\n".join(errors))
         else:
-            messagebox.showinfo("已停止", f"已请求停止 {len(running)} 个活动任务。")
+            messagebox.showinfo("已停止", f"已请求停止 {len(running)} 个活动任务；本次运行的脚本内定时上传已暂停。")
 
     def _delete_selected_jobs(self):
         ids = self._selected_job_ids()
@@ -5197,6 +5541,612 @@ class PipelineGUI:
             return True
         except (OSError, ValueError):
             return False
+
+    def _create_series_project_before_import(self):
+        project_name = simpledialog.askstring(
+            "新建系列项目",
+            "请输入内部项目名称，用于在软件里查找和管理：",
+            parent=self.root,
+        )
+        if not project_name or not project_name.strip():
+            return
+        shared_title = simpledialog.askstring(
+            "统一小说名",
+            "请输入已经起好的统一小说名。\n"
+            "该名称默认锁定，AI 不会重新生成或修改：",
+            initialvalue=project_name.strip(),
+            parent=self.root,
+        )
+        if not shared_title or not shared_title.strip():
+            return
+        try:
+            project = pr.create_novel_project(
+                project_name.strip(),
+                series_video_settings={
+                    "shared_novel_title": shared_title.strip(),
+                    "shared_novel_title_locked": True,
+                    "ai_episode_title_enabled": True,
+                    "ai_cover_copy_enabled": True,
+                    "episode_start": 1,
+                    "episode_label_style": "第{episode}集",
+                    "upload_title_template": "{series_title}｜{episode_label}｜{ai_title}",
+                    "cover_label_template": "{series_title}【{episode_label}】",
+                },
+            )
+        except Exception as exc:
+            messagebox.showerror("新建系列项目失败", str(exc))
+            return
+        self._rebuild_project_tree()
+        project_id = str(project.get("project_id") or "")
+        selected_iid = next(
+            (
+                iid for iid, value in self._project_tree_ids.items()
+                if value == project_id
+            ),
+            "",
+        )
+        if selected_iid:
+            self.project_tree.selection_set(selected_iid)
+            self.project_tree.see(selected_iid)
+        self._load_current_project_series_settings()
+        messagebox.showinfo(
+            "系列项目已建立",
+            f"已建立《{project.get('name')}》。\n"
+            f"统一小说名《{shared_title.strip()}》已锁定。\n\n"
+            "现在可以点击“导入正文到此项目…”。",
+        )
+
+    def _load_current_project_series_settings(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            self.project_shared_novel_title_var.set("")
+            self.project_shared_title_locked_var.set(True)
+            self.project_ai_episode_title_var.set(True)
+            self.project_ai_cover_copy_var.set(True)
+            self.project_episode_start_var.set("1")
+            self.project_episode_label_style_var.set("第{episode}集")
+            self.project_upload_title_template_var.set(
+                "{series_title}｜{episode_label}｜{ai_title}"
+            )
+            self.project_cover_label_template_var.set(
+                "{series_title}【{episode_label}】"
+            )
+            return
+        project = pr.load_novel_project(project_id)
+        settings = project.get("series_video_settings") or {}
+        self.project_shared_novel_title_var.set(
+            str(settings.get("shared_novel_title") or project.get("name") or "")
+        )
+        self.project_shared_title_locked_var.set(
+            bool(settings.get("shared_novel_title_locked", True))
+        )
+        self.project_ai_episode_title_var.set(
+            bool(settings.get("ai_episode_title_enabled", True))
+        )
+        self.project_ai_cover_copy_var.set(
+            bool(settings.get("ai_cover_copy_enabled", True))
+        )
+        self.project_episode_start_var.set(str(settings.get("episode_start") or 1))
+        self.project_episode_label_style_var.set(
+            str(settings.get("episode_label_style") or "第{episode}集")
+        )
+        self.project_upload_title_template_var.set(
+            str(
+                settings.get("upload_title_template")
+                or "{series_title}｜{episode_label}｜{ai_title}"
+            )
+        )
+        self.project_cover_label_template_var.set(
+            str(
+                settings.get("cover_label_template")
+                or "{series_title}【{episode_label}】"
+            )
+        )
+
+    def _save_current_project_series_settings(self, *, show_result: bool = True) -> dict | None:
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先选择一个具体的小说项目。")
+            return None
+        shared_title = self.project_shared_novel_title_var.get().strip()
+        if not shared_title:
+            messagebox.showwarning("统一小说名为空", "请填写统一小说名。")
+            return None
+        try:
+            episode_start = max(1, int(self.project_episode_start_var.get().strip() or "1"))
+        except ValueError:
+            messagebox.showwarning("集数起点无效", "集数起点必须填写正整数。")
+            return None
+        try:
+            project = pr.update_novel_project_series_settings(
+                project_id,
+                {
+                    "shared_novel_title": shared_title,
+                    "shared_novel_title_locked": self.project_shared_title_locked_var.get(),
+                    "ai_episode_title_enabled": self.project_ai_episode_title_var.get(),
+                    "ai_cover_copy_enabled": self.project_ai_cover_copy_var.get(),
+                    "episode_start": episode_start,
+                    "episode_label_style": self.project_episode_label_style_var.get().strip(),
+                    "upload_title_template": self.project_upload_title_template_var.get().strip(),
+                    "cover_label_template": self.project_cover_label_template_var.get().strip(),
+                },
+            )
+        except Exception as exc:
+            messagebox.showerror("保存系列设置失败", str(exc))
+            return None
+        if show_result:
+            messagebox.showinfo(
+                "系列设置已保存",
+                f"统一小说名：{shared_title}\n"
+                + (
+                    "名称已锁定，AI 不会重新生成系列名。"
+                    if self.project_shared_title_locked_var.get()
+                    else "名称未锁定，允许流水线生成系列短名。"
+                ),
+            )
+        return project
+
+    def _import_into_current_project(self):
+        project = self._save_current_project_series_settings(show_result=False)
+        if project is None:
+            return
+        try:
+            selected = _choose_import_files_and_folders()
+        finally:
+            if sys.platform == "darwin":
+                self.root.after(100, self.root.focus_force)
+        if not selected:
+            return
+        explicit_files = [path for path in selected if path.is_file()]
+        folders, _nested_count = _remove_nested_import_folders(
+            [path for path in selected if path.is_dir()]
+        )
+        discovered = list(explicit_files)
+        for folder in folders:
+            discovered.extend(
+                path for path in folder.rglob("*")
+                if path.is_file()
+                and path.suffix.lower() in {".txt", ".mp3"}
+                and path.name != ".novel_video_series_bible.json"
+            )
+        discovered = list(
+            dict.fromkeys(path.resolve(strict=False) for path in discovered)
+        )
+        if not discovered:
+            messagebox.showwarning(
+                "没有可导入文件",
+                "所选内容中没有找到正文 TXT、MP3 或读音词典。",
+            )
+            return
+        self._import_files(
+            discovered,
+            pair_within_parent=True,
+            forced_project_id=str(project.get("project_id") or ""),
+        )
+        self._rebuild_project_tree()
+
+    def _rebuild_project_tree(self):
+        tree = self.project_tree
+        previous = self._selected_project_filter()
+        tree.delete(*tree.get_children())
+        self._project_tree_ids.clear()
+        statuses = [
+            pr.load_status(row["job_id"], include_worker=False)
+            for row in pr.list_jobs(limit=10000)
+        ]
+        all_iid = tree.insert("", tk.END, text="全部任务", values=(len(statuses),), open=True)
+        self._project_tree_ids[all_iid] = ""
+        independent_count = sum(not str(status.get("project_id") or "") for status in statuses)
+        independent_iid = tree.insert(
+            all_iid,
+            tk.END,
+            text="独立任务",
+            values=(independent_count,),
+        )
+        self._project_tree_ids[independent_iid] = "__independent__"
+        selected_iid = independent_iid if previous == "__independent__" else all_iid
+        for project in pr.list_novel_projects():
+            project_id = str(project.get("project_id") or "")
+            jobs = [
+                str(value) for value in project.get("jobs") or []
+                if pr.job_dir_for(str(value)).is_dir()
+            ]
+            iid = tree.insert(
+                all_iid,
+                tk.END,
+                text=str(project.get("name") or project_id),
+                values=(len(jobs),),
+            )
+            self._project_tree_ids[iid] = project_id
+            if previous == project_id:
+                selected_iid = iid
+        tree.selection_set(selected_iid)
+        tree.see(selected_iid)
+        self._load_current_project_series_settings()
+
+    def _selected_project_filter(self) -> str:
+        if not hasattr(self, "project_tree"):
+            return ""
+        selection = self.project_tree.selection()
+        return self._project_tree_ids.get(str(selection[0]), "") if selection else ""
+
+    def _on_project_selected(self, _event=None):
+        if not getattr(self, "_project_tab_active", False):
+            return
+        self.job_tree.selection_remove(self.job_tree.selection())
+        self._selected_job = ""
+        self._load_current_project_series_settings()
+        self._refresh_jobs()
+
+    def _project_job_rows(self) -> list[tuple[dict, dict]]:
+        rows = [
+            (row, pr.load_status(row["job_id"]))
+            for row in pr.list_jobs(limit=10000)
+        ]
+        selected = self._selected_project_filter()
+        if selected == "__independent__":
+            rows = [(row, status) for row, status in rows if not status.get("project_id")]
+        elif selected:
+            rows = [
+                (row, status)
+                for row, status in rows
+                if str(status.get("project_id") or "") == selected
+            ]
+            rows.sort(
+                key=lambda item: (
+                    int(item[1].get("project_episode") or 10**9),
+                    self._natural_task_key(item[0].get("title") or item[0]["job_id"]),
+                )
+            )
+        return rows
+
+    def _remove_selected_jobs_from_project(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先在下方任务队列中选择要移出项目的任务。")
+            return
+        attached = [
+            job_id for job_id in ids
+            if pr.load_status(job_id, include_worker=False).get("project_id")
+        ]
+        if not attached:
+            messagebox.showinfo("无需处理", "选中的任务没有归属小说项目。")
+            return
+        if not messagebox.askyesno(
+            "移出小说项目",
+            f"确定将 {len(attached)} 个任务移出项目吗？\n"
+            "任务、视频和项目共享资料都不会被删除。",
+        ):
+            return
+        errors = []
+        for job_id in attached:
+            try:
+                pr.remove_job_from_project(job_id)
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("部分任务移出失败", "\n".join(errors))
+
+    def _assign_selected_jobs_to_current_project(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先在项目树中选择一个具体项目。")
+            return
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先在下方任务队列中选择任务。")
+            return
+        project = pr.load_novel_project(project_id)
+        if not messagebox.askyesno(
+            "加入小说项目",
+            f"确定将 {len(ids)} 个任务加入《{project.get('name') or project_id}》吗？\n"
+            "如果任务原来属于其他项目，会先解除旧归属。",
+        ):
+            return
+        errors = []
+        for job_id in ids:
+            try:
+                status = pr.load_status(job_id, include_worker=False)
+                old_project_id = str(status.get("project_id") or "")
+                if old_project_id and old_project_id != project_id:
+                    pr.remove_job_from_project(job_id)
+                source = str(status.get("source_path") or status.get("input") or "")
+                episode = int(
+                    status.get("project_episode")
+                    or status.get("series_episode")
+                    or pr.infer_project_episode(source)
+                    or 0
+                )
+                pr.assign_job_to_project(
+                    job_id,
+                    project_id,
+                    episode=episode,
+                    source_path=source,
+                )
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("部分任务加入失败", "\n".join(errors))
+
+    def _assign_selected_jobs_to_project_dialog(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先在任务队列中选择任务。")
+            return
+        available = pr.list_novel_projects()
+        names = [str(project.get("name") or "") for project in available]
+        hint = "、".join(names[:8]) if names else "当前还没有项目"
+        name = simpledialog.askstring(
+            "加入小说项目",
+            "请输入已有项目名称；如果名称不存在，会询问是否新建。\n\n"
+            f"现有项目：{hint}",
+            parent=self.root,
+        )
+        if not name or not name.strip():
+            return
+        clean_name = name.strip()
+        project = next(
+            (item for item in available if str(item.get("name") or "").strip() == clean_name),
+            None,
+        )
+        if project is None:
+            if not messagebox.askyesno(
+                "创建小说项目",
+                f"没有找到《{clean_name}》。是否创建这个新项目？",
+            ):
+                return
+            source_directories = []
+            for job_id in ids:
+                status = pr.load_status(job_id, include_worker=False)
+                source = str(status.get("source_path") or status.get("input") or "")
+                if source and Path(source).suffix:
+                    source_directories.append(str(Path(source).expanduser().parent))
+            project = pr.create_novel_project(
+                clean_name,
+                source_directories=source_directories,
+            )
+        # Retain the task selection while assigning; the project tab will be
+        # rebuilt only after every status and project index has been updated.
+        errors = []
+        for job_id in ids:
+            try:
+                status = pr.load_status(job_id, include_worker=False)
+                old_project_id = str(status.get("project_id") or "")
+                if old_project_id and old_project_id != project["project_id"]:
+                    pr.remove_job_from_project(job_id)
+                source = str(status.get("source_path") or status.get("input") or "")
+                episode = int(
+                    status.get("project_episode")
+                    or status.get("series_episode")
+                    or pr.infer_project_episode(source)
+                    or 0
+                )
+                pr.assign_job_to_project(
+                    job_id,
+                    str(project["project_id"]),
+                    episode=episode,
+                    source_path=source,
+                )
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        if hasattr(self, "project_tree"):
+            self._rebuild_project_tree()
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("部分任务加入失败", "\n".join(errors))
+
+    def _open_selected_project_dir(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先选择一个具体的小说项目。")
+            return
+        path = pr.novel_project_dir(project_id)
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif sys.platform == "win32":
+                __import__("os").startfile(str(path))
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            messagebox.showerror("打开项目文件夹失败", str(exc))
+
+    def _show_project_details(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先选择一个具体的小说项目。")
+            return
+        project = pr.load_novel_project(project_id)
+        directory = pr.novel_project_dir(project_id)
+        profiles = {}
+        try:
+            profiles = json.loads(
+                (directory / "character_profiles.json").read_text(encoding="utf-8")
+            )
+        except Exception:
+            profiles = {}
+        relationships = {}
+        try:
+            relationships = json.loads(
+                (directory / "character_relationships.json").read_text(encoding="utf-8")
+            )
+        except Exception:
+            relationships = {}
+        characters = [
+            str(item.get("name") or "")
+            for item in profiles.get("characters") or []
+            if isinstance(item, dict) and str(item.get("name") or "")
+        ]
+        sources = [str(value) for value in project.get("source_directories") or []]
+        new_name = simpledialog.askstring(
+            "项目详情/改名",
+            f"项目：{project.get('name') or project_id}\n"
+            f"任务数：{len(project.get('jobs') or [])}\n"
+            f"人物数：{len(characters)}\n"
+            f"人物关系：{len(relationships.get('relationships') or [])}"
+            + (f"\n人物：{'、'.join(characters[:12])}" if characters else "")
+            + (f"\n来源：{sources[0]}" if sources else "")
+            + "\n\n可在下面修改项目名称；保持原名直接确定即可。",
+            initialvalue=str(project.get("name") or ""),
+            parent=self.root,
+        )
+        if not new_name or new_name.strip() == str(project.get("name") or "").strip():
+            return
+        try:
+            pr.rename_novel_project(project_id, new_name.strip())
+        except Exception as exc:
+            messagebox.showerror("项目改名失败", str(exc))
+            return
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+
+    def _show_project_characters(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先选择一个具体的小说项目。")
+            return
+        project = pr.load_novel_project(project_id)
+        win = tk.Toplevel(self.root)
+        win.title(f"人物档案｜{project.get('name') or project_id}")
+        win.geometry("920x460")
+        win.transient(self.root)
+        box = ttk.Frame(win, padding=10)
+        box.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(
+            box,
+            text="“已确认锁定”的人物不会被后续分集自动分析覆盖。",
+            foreground="#666",
+        ).pack(anchor=tk.W, pady=(0, 8))
+        columns = ("name", "aliases", "importance", "status", "reference")
+        tree = ttk.Treeview(box, columns=columns, show="headings", selectmode="browse")
+        labels = {
+            "name": "人物",
+            "aliases": "别名",
+            "importance": "重要程度",
+            "status": "记录状态",
+            "reference": "人设图",
+        }
+        widths = {"name": 130, "aliases": 180, "importance": 110, "status": 110, "reference": 340}
+        for column in columns:
+            tree.heading(column, text=labels[column])
+            tree.column(column, width=widths[column], minwidth=70, anchor=tk.W)
+        tree.pack(fill=tk.BOTH, expand=True)
+        identities: dict[str, str] = {}
+        reference_paths: dict[str, str] = {}
+
+        def refresh():
+            tree.delete(*tree.get_children())
+            identities.clear()
+            reference_paths.clear()
+            payload = pr.load_project_character_profiles(project_id)
+            for index, character in enumerate(payload.get("characters") or []):
+                if not isinstance(character, dict):
+                    continue
+                iid = f"character_{index}"
+                identity = str(character.get("trigger") or character.get("name") or iid)
+                status = str(character.get("record_status") or "auto")
+                reference = str(character.get("reference_image") or "")
+                tree.insert(
+                    "",
+                    tk.END,
+                    iid=iid,
+                    values=(
+                        str(character.get("name") or ""),
+                        "、".join(str(value) for value in character.get("aliases") or []),
+                        str(character.get("importance") or ""),
+                        "已确认锁定"
+                        if status == "confirmed"
+                        else "待确认冲突"
+                        if status == "conflicted"
+                        else "自动分析",
+                        reference,
+                    ),
+                )
+                identities[iid] = identity
+                reference_paths[iid] = reference
+
+        def set_status(status: str):
+            selection = tree.selection()
+            if not selection:
+                messagebox.showwarning("没有选择人物", "请先选择一个人物。", parent=win)
+                return
+            try:
+                pr.set_project_character_record_status(
+                    project_id,
+                    identities[str(selection[0])],
+                    status,
+                )
+            except Exception as exc:
+                messagebox.showerror("更新人物状态失败", str(exc), parent=win)
+                return
+            refresh()
+
+        def open_reference():
+            selection = tree.selection()
+            path = Path(reference_paths.get(str(selection[0]), "")) if selection else Path()
+            if not selection or not path.is_file():
+                messagebox.showwarning("没有人设图", "这个人物还没有可打开的人设图。", parent=win)
+                return
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", str(path)])
+                elif sys.platform == "win32":
+                    __import__("os").startfile(str(path))
+                else:
+                    subprocess.Popen(["xdg-open", str(path)])
+            except Exception as exc:
+                messagebox.showerror("打开人设图失败", str(exc), parent=win)
+
+        actions = ttk.Frame(box)
+        actions.pack(fill=tk.X, pady=(8, 0))
+        ttk.Button(actions, text="确认并锁定", command=lambda: set_status("confirmed")).pack(side=tk.LEFT)
+        ttk.Button(actions, text="取消锁定", command=lambda: set_status("auto")).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(actions, text="打开人设图", command=open_reference).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(actions, text="关闭", command=win.destroy).pack(side=tk.RIGHT)
+        refresh()
+
+    def _archive_selected_project(self):
+        project_id = self._selected_project_filter()
+        if not project_id or project_id == "__independent__":
+            messagebox.showwarning("没有选择项目", "请先选择一个具体的小说项目。")
+            return
+        project = pr.load_novel_project(project_id)
+        if not messagebox.askyesno(
+            "删除小说项目",
+            f"确定删除项目《{project.get('name') or project_id}》吗？\n\n"
+            "项目内任务和视频不会删除，只会解除项目归属。\n"
+            "共享人物资料和人设图会移动到 data/projects/.trash，仍可人工恢复。",
+            icon=messagebox.WARNING,
+        ):
+            return
+        try:
+            destination = pr.archive_novel_project(project_id)
+        except Exception as exc:
+            messagebox.showerror("删除项目失败", str(exc))
+            return
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+        messagebox.showinfo("项目已删除", f"共享资料已移到：\n{destination}")
+
+    def _migrate_legacy_projects(self):
+        if not messagebox.askyesno(
+            "迁移旧系列",
+            "程序会把旧任务中相同系列标记的分集建立为小说项目，并复制旧人物档案。\n"
+            "不会移动或删除旧任务、人设图和视频。继续吗？",
+        ):
+            return
+        try:
+            created = pr.migrate_legacy_series_projects()
+        except Exception as exc:
+            messagebox.showerror("迁移失败", str(exc))
+            return
+        self._rebuild_project_tree()
+        self._refresh_jobs()
+        messagebox.showinfo("迁移完成", f"已建立 {len(created)} 个小说项目。")
 
     def _choose_task_category_root(self):
         selected = filedialog.askdirectory(
@@ -5425,6 +6375,8 @@ class PipelineGUI:
         rows_with_status = (
             self._classified_job_rows()
             if getattr(self, "_task_category_active", False)
+            else self._project_job_rows()
+            if getattr(self, "_project_tab_active", False)
             else [(row, pr.load_status(row["job_id"])) for row in pr.list_jobs(limit=500)]
         )
         for row, st in rows_with_status:
@@ -5459,7 +6411,6 @@ class PipelineGUI:
             self.job_tree.yview_moveto(yview[0])
         if xview:
             self.job_tree.xview_moveto(xview[0])
-
     def _job_tree_font(self):
         font = getattr(self, "_job_id_font", None)
         if font is None:
@@ -5467,6 +6418,30 @@ class PipelineGUI:
             font = tkfont.Font(root=self.root, font=font_spec)
             self._job_id_font = font
         return font
+
+    def _remember_job_column_resize_start(self, event):
+        """Record only header-separator drags, not ordinary table clicks."""
+        self._job_tree_column_resize_started = (
+            self.job_tree.identify_region(event.x, event.y) == "separator"
+        )
+
+    def _finish_job_column_resize(self, _event):
+        """Persist the operator's table widths after a header drag completes."""
+        if getattr(self, "_job_tree_column_resize_started", False):
+            self._job_tree_column_resize_started = False
+            widths = {
+                column: int(self.job_tree.column(column, "width"))
+                for column in self.job_tree["columns"]
+            }
+            if widths != config.get("job_table_column_widths", {}):
+                config.set("job_table_column_widths", widths)
+                try:
+                    config.save()
+                except OSError:
+                    # A transient settings write issue should not make a normal
+                    # table resize fail or interfere with task selection.
+                    pass
+        self.root.after_idle(self._refresh_job_table_display)
 
     def _display_job_column(self, column: str, value: str) -> str:
         """Fit long table content to a resizable column with a visible ellipsis."""
@@ -5559,7 +6534,7 @@ class PipelineGUI:
             self.root.after(15000, self._poll_script_publish_queue)
 
     def _run_script_publish_queue_once(self):
-        if self._script_upload_running or not bool(config.get("upload_enabled", False)):
+        if self._script_publish_paused or self._script_upload_running or not bool(config.get("upload_enabled", False)):
             return
         profiles = _parse_upload_profiles(str(config.get("browser_profiles", "[]") or "[]"))
         active_name = str(config.get("browser_active_profile", "") or "").strip()
@@ -5621,6 +6596,8 @@ class PipelineGUI:
             publish_schedule_profile=profile_name,
         )
         self._script_upload_running = True
+        upload_job = browser_upload._Job()
+        self._active_browser_upload_jobs[job_id] = upload_job
         pr.append_log(pr.job_dir_for(job_id), f"脚本内定时：到达 {scheduled_text.replace('T', ' ')}，开始自动上传")
 
         def worker():
@@ -5630,7 +6607,13 @@ class PipelineGUI:
                     on_log=lambda message: pr.append_log(pr.job_dir_for(job_id), message),
                     profile_name_override=profile_name,
                     schedule_enabled_override=False,
+                    browser_upload_job=upload_job,
                 )
+                if upload_job.is_cancelled():
+                    publish_scheduler.update_item(profile_name, job_id, state="paused", last_error="用户停止了一切任务")
+                    pr.write_status(pr.job_dir_for(job_id), stage="stopped", publish_schedule_state="paused")
+                    self.root.after(0, lambda: self._append_probe_log(f"[脚本内定时] 已停止：{job_id}"))
+                    return
                 publish_scheduler.update_item(profile_name, job_id, state="published", youtube_url=url, last_error="")
                 pr.write_status(
                     pr.job_dir_for(job_id),
@@ -5640,6 +6623,11 @@ class PipelineGUI:
                 )
                 self.root.after(0, lambda: self._append_probe_log(f"[脚本内定时] 已发布：{job_id} {url}"))
             except Exception as exc:
+                if upload_job.is_cancelled():
+                    publish_scheduler.update_item(profile_name, job_id, state="paused", last_error="用户停止了一切任务")
+                    pr.write_status(pr.job_dir_for(job_id), stage="stopped", publish_schedule_state="paused")
+                    self.root.after(0, lambda: self._append_probe_log(f"[脚本内定时] 已停止：{job_id}"))
+                    return
                 publish_scheduler.update_item(
                     profile_name,
                     job_id,
@@ -5655,6 +6643,8 @@ class PipelineGUI:
                 self.root.after(0, lambda exc=exc: self._append_probe_log(f"[脚本内定时] 上传失败，1 小时后重试：{exc}"))
             finally:
                 self._script_upload_running = False
+                if self._active_browser_upload_jobs.get(job_id) is upload_job:
+                    self._active_browser_upload_jobs.pop(job_id, None)
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -5723,6 +6713,9 @@ class PipelineGUI:
     def _on_job_select(self, _event=None):
         ids = self._selected_job_ids()
         if ids:
+            if ids[0] != self._selected_job:
+                self._rendered_log_job = ""
+                self._rendered_log_text = None
             self._selected_job = ids[0]
             self._update_log()
 
@@ -5732,17 +6725,37 @@ class PipelineGUI:
 
     def _update_log(self):
         if not self._selected_job:
+            if self._rendered_log_job == "" and self._rendered_log_text == "请选择任务":
+                return
             self.log_text.configure(state=tk.NORMAL)
             self.log_text.delete("1.0", tk.END)
             self.log_text.insert(tk.END, "请在左侧选择一个任务以查看实时日志")
             self.log_text.configure(state=tk.DISABLED)
+            self._rendered_log_job = ""
+            self._rendered_log_text = "请选择任务"
             return
         text = pr.tail_log(self._selected_job, lines=500)
+        if self._rendered_log_job == self._selected_job and self._rendered_log_text == text:
+            return
+        # Replacing a Tk Text widget clears its selection.  While the user is
+        # selecting/copying text, keep the visible log stable and apply the
+        # pending refresh on the next poll after the selection is cleared.
+        if self._rendered_log_job == self._selected_job and self.log_text.tag_ranges(tk.SEL):
+            return
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.insert(tk.END, text)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.NORMAL)
+        self._rendered_log_job = self._selected_job
+        self._rendered_log_text = text
+
+    def _copy_all_log(self):
+        """Copy the currently displayed task log without requiring selection."""
+        text = self.log_text.get("1.0", tk.END).rstrip()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
 
     def _open_selected_output_dir(self):
         """Open this task's own job folder, where its completed MP4 is kept."""

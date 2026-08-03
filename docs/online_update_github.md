@@ -92,6 +92,7 @@ dist/latest.json
 - `data/settings.json`
 - `data/profiles/`
 - `data/jobs/`
+- `data/projects/`
 - `data/runtime/`
 - `data/chrome_debug_profile/`
 - `data/chrome_debug_profiles/`
@@ -126,6 +127,7 @@ data/updates/apply_update_<version>_<time>.log
 并排除：
 
 - `data/jobs/`
+- `data/projects/`
 - `data/runtime/`
 - `data/chrome_debug_profile/`
 - `data/chrome_debug_profiles/`

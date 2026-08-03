@@ -119,13 +119,15 @@ GUI 里的 `人设图 workflow(仅 ComfyUI)`、`剧情参考 workflow(仅 ComfyU
 
 ## 洗稿提示词怎么改
 
-GUI 里显示为 AI 洗稿。对应配置：
+GUI 里显示为“AI 洗稿改写”。对应配置：
 
 - `ai_rewrite_enabled`：是否启用。
 - `ai_rewrite_batch_chars`：每批处理字符数。
-- `ai_rewrite_prompt`：洗稿任务说明。
+- `ai_rewrite_prompt`：洗稿系统提示词。
 
-洗稿发生在切片和 TTS 前。输出会写到任务目录的 `text_rewritten.txt`，报告写到 `text_rewrite_report.json`。如果没有 LLM key，或当前后端不可用，会跳过而不是中断整条流水线。
+开启后，洗稿发生在切片和 TTS 前。程序按批次请求文字模型，通过后写入 `text_rewritten.txt` 与 `text_rewrite_report.json`；接口不可用或请求失败时保留原文。
+
+TTS 朗读净化由独立开关控制，可在洗稿关闭时单独执行并写入 `text_tts_ready.txt`。Edge 会处理容易读成“ダッシュ”的连续破折号并统一装饰标点；VOICEVOX 不删除或改写正常日文标点和原始换行，只清理明确的技术性垃圾字符。
 
 ## 修改后的验证方法
 

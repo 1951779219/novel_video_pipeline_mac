@@ -32,6 +32,14 @@ DEFAULT_CHARACTER_ANALYSIS_PROMPT = """
   },
   "protagonists": ["主角姓名"],
   "supporting_characters": ["重要配角姓名"],
+  "relationships": [
+    {
+      "from": "人物姓名",
+      "to": "另一人物姓名",
+      "relation": "亲属、同伴、敌对、爱慕、上下级等简短关系",
+      "record_status": "auto"
+    }
+  ],
   "characters": [
     {
       "name": "人物姓名或身份名",
@@ -130,6 +138,23 @@ def normalize_analysis(data: Any, *, raw: str = "") -> dict[str, Any]:
     if not isinstance(visual_rules, list):
         visual_rules = []
 
+    relationships = []
+    for item in data.get("relationships") or data.get("character_relationships") or []:
+        if not isinstance(item, dict):
+            continue
+        source = str(item.get("from") or item.get("source") or "").strip()
+        target = str(item.get("to") or item.get("target") or "").strip()
+        relation = str(item.get("relation") or item.get("type") or "").strip()
+        if source and target and relation:
+            relationships.append({
+                "from": source,
+                "to": target,
+                "relation": relation,
+                "record_status": "confirmed"
+                if str(item.get("record_status") or "").lower() == "confirmed"
+                else "auto",
+            })
+
     return {
         "enabled": True,
         "plot_summary": str(data.get("plot_summary") or "").strip(),
@@ -137,6 +162,7 @@ def normalize_analysis(data: Any, *, raw: str = "") -> dict[str, Any]:
         "visual_theme": _normalize_visual_theme(data.get("visual_theme")),
         "protagonists": protagonists[:6],
         "supporting_characters": supporting[:12],
+        "relationships": relationships[:80],
         "characters": normalized[:40],
         "visual_rules": [str(x).strip() for x in visual_rules if str(x).strip()][:12],
         "raw_response": raw[:6000],

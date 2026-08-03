@@ -25,7 +25,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 36
+SETTINGS_SCHEMA_VERSION = 42
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
 DEFAULT_YOUTUBE_DESCRIPTION = ""
 
@@ -62,6 +62,8 @@ PROFILE_LOCAL_FIELDS = PROFILE_CONNECTION_FIELDS | {
     "task_category_selected_path",
     "task_category_sort",
     "task_category_direction",
+    # Table layout is an operator preference, not part of a production profile.
+    "job_table_column_widths",
 }
 
 
@@ -76,6 +78,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "task_category_selected_path": "",
     "task_category_sort": "名称自然排序",
     "task_category_direction": "升序",
+    # The task table writes the widths here after the operator drags a header
+    # separator.  Keep this as data (instead of Tk geometry) so it survives a
+    # restart as well as profile switching.
+    "job_table_column_widths": {},
     "active_profile": "配置1",
 
     # 爬取
@@ -101,7 +107,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "ai_api_enabled": True,
     "ai_api_base_url": "",
     "ai_api_key": "",
-    "ai_api_text_model": "gpt-4o-mini",
+    "ai_api_text_model": "gemini-3.5-flash",
     "ai_api_image_model": "gpt-image-2",
     "ai_api_image_width": 1792,
     "ai_api_image_height": 1008,
@@ -110,7 +116,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "llm_provider": "openai",  # openai / claude / gemini / deepseek / ollama / custom
     "llm_base_url": "https://api.openai.com/v1",
     "llm_api_key": "",
-    "llm_model": "gpt-4o-mini",
+    "llm_model": "gemini-3.5-flash",
     "llm_storyboard_prompt": (
         "You are a visual prompt director for long-form novel recap / tweet-style video images.\n"
         "Convert each novel paragraph into ONE finished English image-generation prompt. "
@@ -180,6 +186,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "  },\n"
         '  "protagonists": ["主角姓名"],\n'
         '  "supporting_characters": ["重要配角姓名"],\n'
+        '  "relationships": [\n'
+        "    {\n"
+        '      "from": "人物姓名",\n'
+        '      "to": "另一人物姓名",\n'
+        '      "relation": "亲属、同伴、敌对、爱慕、上下级等简短关系",\n'
+        '      "record_status": "auto"\n'
+        "    }\n"
+        "  ],\n"
         '  "characters": [\n'
         "    {\n"
         '      "name": "人物姓名或身份名",\n'
@@ -265,20 +279,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "\"tags\":[\"#タグ1\",\"#タグ2\",\"#タグ3\"]}"
     ),
     "ai_rewrite_enabled": False,
-    # When enabled, standalone labels such as "第九話" are included in TTS.
-    "narrate_chapter_headings": False,
     "ai_rewrite_batch_chars": 3500,
     "ai_rewrite_prompt": (
-        "你是小说视频旁白的文本编辑。处理原创或已获得改编授权的文本。"
-        "将输入正文整理为适合中文/日文长视频 TTS 朗读的版本。"
-        "必须完整保留主线与关键细节：人物关系、事件顺序、场景推进、对话信息、情绪变化、"
-        "世界设定、能力规则、伏笔、冲突、反转和结局均不得遗漏、合并或改写成概述。"
-        "不要压缩、总结、提纲化或大幅缩短原文；除去明确重复、网页残留、乱码和不适合朗读的装饰符号外，"
-        "篇幅应尽量接近输入文本。不得新增剧情、颠倒事件、改变人物立场、能力、关系或结局。"
-        "如需替换人名、地名、国家、组织、称号或其他专有名词，先在内部建立一对一对应表，"
-        "全文（包括昵称、敬称、代词指代和回忆段落）必须严格一致，不得遗漏、混用或改变人物关系。"
-        "语言应自然连贯、有画面感，保留段落分隔并适合 TTS 朗读。"
-        "只输出正文，不要标题、说明、编号、替换表、标签或 JSON。"
+        "你是小说推文视频的洗稿改写编辑。"
+        "请把输入的小说正文改写成适合中文/日文推文长视频旁白的版本："
+        "保留原剧情、人物关系、事件顺序、情绪转折和关键设定，不新增剧情，不改变结局；"
+        "去掉生硬网页痕迹、重复废话、作者口癖和不适合朗读的表达；"
+        "语言更顺、更有悬念和画面感，适合 TTS 朗读；"
+        "保持段落分隔，不要输出标题、解释、编号、标签或 JSON，只输出改写后的正文。"
     ),
     # Make the rewritten script safe to display and narrate before it is split.
     "tts_clean_rewritten_text": True,
@@ -289,7 +297,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "pronunciation_dictionary_dedicated_api_enabled": False,
     "pronunciation_dictionary_base_url": "",
     "pronunciation_dictionary_api_key": "",
-    "pronunciation_dictionary_model": "gpt-4o-mini",
+    "pronunciation_dictionary_model": "gemini-3.5-flash",
     "pronunciation_dictionary_prompt": (
         "你是日语 TTS 生词词典助手。只为用户给出的候选词提供准确的日语假名读音。"
         "只输出严格的“原词=假名读音”，每行一条；不得输出解释、标题或 Markdown，"
@@ -856,6 +864,26 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             "marketing_candidates_retry_delay_seconds",
         ):
             data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 39:
+        data.pop("acceleration_mode_enabled", None)
+    if saved_version < 40:
+        data.pop("acceleration_mode_enabled", None)
+    if saved_version < 42:
+        data["ai_rewrite_prompt"] = DEFAULT_SETTINGS["ai_rewrite_prompt"]
+        for key in (
+            "narrate_chapter_headings",
+            "ai_rewrite_replace_entities",
+            "ai_rewrite_entity_max_chars",
+            "ai_rewrite_min_length_ratio",
+            "ai_rewrite_language_check_enabled",
+            "ai_rewrite_japanese_kana_min_ratio",
+            "ai_rewrite_stop_on_failure",
+            "ai_rewrite_api_timeout_seconds",
+            "ai_rewrite_retry_attempts",
+            "ai_rewrite_entity_prompt",
+            "ai_rewrite_user_template",
+        ):
+            data.pop(key, None)
     # Cover prompts describe aspect ratio only. Older profiles hard-coded a
     # pixel size even when the GUI's actual cover dimensions were different.
     for key in ("cover_prompt_template", "cover_ai_analysis_prompt", "cover_poster_method_prompt"):

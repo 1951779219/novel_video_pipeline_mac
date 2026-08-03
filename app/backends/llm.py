@@ -1,6 +1,8 @@
 """LLM backend：用于把日语小说段落转换为 SD 文生图 prompt。
 所有 provider 都走 OpenAI 兼容接口（绝大多数都支持），ollama 也支持 /v1。
 """
+from __future__ import annotations
+
 from app.utils.http import http_post
 from app.utils.secrets import clean_api_key, redact_secret_text
 

@@ -1548,7 +1548,7 @@ video {
       </div>
       <div class="field">
         <label for="imageModel">图片模型</label>
-        <input id="imageModel" placeholder="如 gpt-image-1 / flux...">
+        <input id="imageModel" placeholder="如 gpt-image-2...">
       </div>
     </div>
     <div class="row3">
