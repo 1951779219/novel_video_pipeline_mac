@@ -38,7 +38,13 @@ from app.autotune import run_startup_autotune
 from app.config import DATA_DIR, config
 from app.config import API_KEY_FIELDS
 from app.version import VERSION
-from app.backends.tts import EDGE_MULTI_VOICES, VOICEVOX_FREQUENT_VOICES
+from app.backends.tts import (
+    EDGE_MULTI_VOICES,
+    VOICEVOX_FREQUENT_VOICES,
+    discover_edge_voices,
+    edge_voice_choices,
+    preferred_available_edge_voice,
+)
 from app.utils.secrets import clean_api_key, redact_secret_text
 
 
@@ -477,6 +483,10 @@ class PipelineGUI:
         self._active_browser_upload_jobs: dict[str, browser_upload._Job] = {}
         self._image_failure_prompted: set[str] = set()
         self._pronunciation_resolution_cache: dict[str, dict[str, str]] = {}
+        self._edge_available_voices: set[str] | None = None
+        self._edge_voice_probe_running = False
+        self._edge_voice_probe_error = ""
+        self._last_valid_edge_voice = ""
         self._build_style()
         self._build_ui()
         self._poll_jobs()
@@ -484,6 +494,7 @@ class PipelineGUI:
         self.root.after(350, self._emit_dependency_startup_logs)
         self.root.after(1600, self._maybe_start_dependency_check)
         self.root.after(700, self._maybe_start_hardware_autotune)
+        self.root.after(900, self._start_edge_voice_detection)
         self.root.after(2400, self._maybe_check_update_on_startup)
         self.root.after(3500, self._poll_script_publish_queue)
 
@@ -1026,6 +1037,7 @@ class PipelineGUI:
             ("加入排队序列", self._enqueue_selected_jobs),
             ("停止选中", self._stop_selected_jobs),
             ("清除图片缓存", self._clear_selected_media_cache),
+            ("预备分模式", self._prepare_selected_jobs_for_preliminary_scoring),
         ):
             self.job_context_menu.add_command(label=label, command=command)
         self.job_schedule_menu = tk.Menu(self.job_context_menu, tearoff=False)
@@ -1037,6 +1049,7 @@ class PipelineGUI:
         self.job_retry_menu = tk.Menu(self.job_context_menu, tearoff=False)
         for label, command in (
             ("全部重试（重新生图）", self._retry_all),
+            ("重新生成标题概梗", self._regenerate_selected_marketing),
             ("重做 TTS", self._redo_tts),
             ("指定段配音修复", self._retry_tts_segments),
             ("重试（生图除外）", self._retry_from_clean_reuse_images),
@@ -1592,12 +1605,31 @@ class PipelineGUI:
             "tts_provider",
             ["edge", "voicevox", "openai", "azure", "elevenlabs", "custom"],
         )
-        combo("常用音色", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
+        combo("音色（自动检测）", "tts_voice", EDGE_MULTI_VOICES, config.tts_voice)
+        tts_voice_widget = self.combo_widgets["tts_voice"]
+        tts_voice_widget.configure(postcommand=self._schedule_tts_voice_dropdown_style)
+        tts_voice_widget.bind("<<ComboboxSelected>>", self._on_tts_voice_selected, add="+")
+        voice_status_line = ttk.Frame(section_parent)
+        voice_status_line.pack(fill=tk.X, pady=(0, 3))
+        ttk.Label(voice_status_line, text="", width=18).pack(side=tk.LEFT)
+        self._tts_voice_status_var = tk.StringVar(value="Edge 音色：等待自动检测…")
+        self._tts_voice_status_label = ttk.Label(
+            voice_status_line,
+            textvariable=self._tts_voice_status_var,
+            foreground="#666666",
+            wraplength=390,
+        )
+        self._tts_voice_status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(
+            voice_status_line,
+            text="重新检测",
+            command=lambda: self._start_edge_voice_detection(force=True),
+        ).pack(side=tk.RIGHT, padx=(6, 0))
         self.combo_widgets["tts_provider"].bind(
-            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options()
+            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options(), add="+"
         )
         tts_provider_in_section.bind(
-            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options()
+            "<<ComboboxSelected>>", lambda _event: self._refresh_tts_voice_options(), add="+"
         )
         self._refresh_tts_voice_options()
         row("语速", "tts_rate", "+0%")
@@ -2486,13 +2518,156 @@ class PipelineGUI:
         var = self.vars.get("tts_voice")
         if widget is None or var is None:
             return
-        choices = VOICEVOX_FREQUENT_VOICES if provider == "voicevox" else EDGE_MULTI_VOICES
+        if provider == "voicevox":
+            choices = VOICEVOX_FREQUENT_VOICES
+            self._set_tts_voice_status("VOICEVOX 音色由本地服务提供。", ok=True)
+        elif provider == "edge":
+            choices = edge_voice_choices(self._edge_available_voices, self._ui_value("tts_voice"))
+            if self._edge_available_voices is None and not self._edge_voice_probe_running:
+                self.root.after_idle(self._start_edge_voice_detection)
+            elif self._edge_available_voices is not None:
+                current = self._ui_value("tts_voice")
+                if current not in self._edge_available_voices:
+                    replacement = preferred_available_edge_voice(current, self._edge_available_voices)
+                    if replacement:
+                        var.set(replacement)
+                        self._last_valid_edge_voice = replacement
+                unavailable_count = len(set(EDGE_MULTI_VOICES).difference(self._edge_available_voices))
+                self._set_tts_voice_status(
+                    f"Edge 当前可用 {len(self._edge_available_voices)} 个音色；"
+                    f"{unavailable_count} 个内置旧音色已置灰且不可选择。",
+                    ok=True,
+                )
+        else:
+            choices = EDGE_MULTI_VOICES
+            self._set_tts_voice_status("当前 Provider 的音色可通过上方“检测 TTS API”刷新。", ok=True)
         widget.configure(values=choices)
         if self._ui_value("tts_voice") not in choices:
             var.set(choices[0])
 
+    def _set_tts_voice_status(self, text: str, *, ok: bool | None = None):
+        status_var = getattr(self, "_tts_voice_status_var", None)
+        status_label = getattr(self, "_tts_voice_status_label", None)
+        if status_var is not None:
+            status_var.set(text)
+        if status_label is not None:
+            color = "#267A3E" if ok is True else ("#A33A2B" if ok is False else "#666666")
+            status_label.configure(foreground=color)
+
+    def _start_edge_voice_detection(self, force: bool = False):
+        """Refresh Edge voices without blocking the Tk event loop."""
+        if self._edge_voice_probe_running:
+            return
+        if self._edge_available_voices is not None and not force:
+            return
+        self._edge_voice_probe_running = True
+        self._edge_voice_probe_error = ""
+        self._set_tts_voice_status("Edge 音色：正在检测本机当前可用列表…")
+
+        def worker():
+            try:
+                voices = discover_edge_voices()
+                if not voices:
+                    raise RuntimeError("Edge 返回了空音色列表")
+            except Exception as exc:
+                self.root.after(0, lambda exc=exc: self._finish_edge_voice_detection([], exc))
+                return
+            self.root.after(0, lambda voices=voices: self._finish_edge_voice_detection(voices, None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_edge_voice_detection(self, voices: list[str], error: Exception | None):
+        self._edge_voice_probe_running = False
+        if error is not None:
+            self._edge_voice_probe_error = redact_secret_text(error)
+            self._set_tts_voice_status(
+                f"Edge 音色检测失败：{self._edge_voice_probe_error}；未将任何音色判为不可用。",
+                ok=False,
+            )
+            self._append_probe_log(f"[Edge TTS] 音色检测失败：{self._edge_voice_probe_error}")
+            return
+
+        self._edge_voice_probe_error = ""
+        self._edge_available_voices = set(voices)
+        current = self._ui_value("tts_voice")
+        replacement = preferred_available_edge_voice(current, self._edge_available_voices)
+        if self._ui_value("tts_provider").lower() == "edge" and current not in self._edge_available_voices:
+            if replacement:
+                self.vars["tts_voice"].set(replacement)
+                self._last_valid_edge_voice = replacement
+                self._append_probe_log(
+                    f"[Edge TTS] 配置音色 {current or '(空)'} 当前不可用，已切换为 {replacement}。"
+                )
+        elif current in self._edge_available_voices:
+            self._last_valid_edge_voice = current
+        self._refresh_tts_voice_options()
+        unavailable_count = len(set(EDGE_MULTI_VOICES).difference(self._edge_available_voices))
+        self._set_tts_voice_status(
+            f"Edge 当前可用 {len(self._edge_available_voices)} 个音色；{unavailable_count} 个内置旧音色已置灰且不可选择。",
+            ok=True,
+        )
+        self._style_tts_voice_dropdown()
+
+    def _schedule_tts_voice_dropdown_style(self):
+        # ttk populates its internal Listbox only after postcommand returns.
+        self.root.after_idle(self._style_tts_voice_dropdown)
+
+    def _style_tts_voice_dropdown(self):
+        """Grey unavailable Edge entries in ttk's native pop-down listbox."""
+        if self._ui_value("tts_provider").lower() != "edge" or self._edge_available_voices is None:
+            return
+        widget = self.combo_widgets.get("tts_voice")
+        if widget is None:
+            return
+        try:
+            popdown = widget.tk.call("ttk::combobox::PopdownWindow", str(widget))
+            listbox = f"{popdown}.f.l"
+            default_foreground = widget.tk.call(listbox, "cget", "-foreground")
+            default_select_foreground = widget.tk.call(listbox, "cget", "-selectforeground")
+            for index, voice in enumerate(widget.cget("values")):
+                unavailable = str(voice) not in self._edge_available_voices
+                widget.tk.call(
+                    listbox,
+                    "itemconfigure",
+                    index,
+                    "-foreground",
+                    "#9A9A9A" if unavailable else default_foreground,
+                    "-selectforeground",
+                    "#9A9A9A" if unavailable else default_select_foreground,
+                )
+        except tk.TclError:
+            # Some platform themes do not expose per-item styling. Selection
+            # blocking below still guarantees that an unavailable item cannot
+            # become the saved voice.
+            return
+
+    def _on_tts_voice_selected(self, _event=None):
+        if self._ui_value("tts_provider").lower() != "edge" or self._edge_available_voices is None:
+            return
+        selected = self._ui_value("tts_voice")
+        if selected in self._edge_available_voices:
+            self._last_valid_edge_voice = selected
+            return
+        replacement = preferred_available_edge_voice(
+            self._last_valid_edge_voice,
+            self._edge_available_voices,
+        )
+        if replacement:
+            self.vars["tts_voice"].set(replacement)
+        self.root.after_idle(
+            lambda selected=selected: messagebox.showwarning(
+                "Edge 音色不可用",
+                f"{selected} 不在 Edge 当前返回的可用列表中，无法选择。\n\n"
+                "灰色音色可能已被微软下线，请选择正常颜色的音色。",
+                parent=self.root,
+            )
+        )
+
     def _show_probe_result(self, kind: str, result):
         text = result.to_text()
+        tts_provider = self._ui_value("tts_provider").lower() if kind == "tts" else ""
+        if kind == "tts" and tts_provider == "edge" and result.models:
+            self._finish_edge_voice_detection(result.models, None)
         target_key = {
             "llm": "llm_model",
             "unified_llm": "ai_api_text_model",
@@ -2503,13 +2678,13 @@ class PipelineGUI:
             "character_reference": "character_reference_model",
             "scene_reference": "scene_reference_model",
         }.get(kind)
-        if kind == "tts" and self._ui_value("tts_provider") in {"openai", "custom"}:
+        if kind == "tts" and tts_provider in {"openai", "custom"}:
             target_key = "tts_model"
-        elif kind == "tts" and self._ui_value("tts_provider") in {"edge", "elevenlabs"}:
+        elif kind == "tts" and tts_provider in {"edge", "elevenlabs"}:
             target_key = "tts_voice"
         if target_key and result.models:
             widget = self.combo_widgets.get(target_key)
-            if widget is not None:
+            if widget is not None and not (kind == "tts" and tts_provider == "edge"):
                 widget.configure(values=result.models)
             text += f"\n\n已识别 {len(result.models)} 个候选，已更新 {target_key} 下拉列表。"
         current_value = self._ui_value(target_key) if target_key else ""
@@ -4207,7 +4382,12 @@ class PipelineGUI:
                 detail.append(f"已从断点启动 {started} 个")
             if queued:
                 detail.append(f"已加入等待队列 {queued} 个")
-            self._append_log("；".join(detail) + "；已保留已完成的文本、配音和图片，只重试失败或缺失步骤。")
+            # Task logs live in each job's log.txt; PipelineGUI has no
+            # _append_log method.  Writing there also lets the selected-task
+            # log panel show the resume result on its next refresh.
+            message = "；".join(detail) + "；已保留已完成的文本、配音和图片，只重试失败或缺失步骤。"
+            for job_id in ids:
+                pr.append_log(pr.job_dir_for(job_id), message)
 
     def _ask_batch_schedule_datetimes(self, title: str, ids: list[str], mode: str) -> tuple[list[datetime], str, str, str, list[str]] | None:
         # Keep the scheduler and channel editor on one authoritative saved
@@ -5007,6 +5187,51 @@ class PipelineGUI:
         else:
             messagebox.showinfo("封面生成完成", f"已重新生成 {len(completed)} 个选中任务的封面。")
 
+    def _regenerate_selected_marketing(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先选择要重新生成标题概梗的任务。")
+            return
+        running = [job_id for job_id in ids if pr.load_status(job_id).get("worker_alive")]
+        if running:
+            messagebox.showwarning("任务正在运行", "请先停止选中的运行中任务，再重新生成标题概梗。")
+            return
+        if not messagebox.askyesno(
+            "重新生成标题概梗",
+            f"将使用当前设置，为选中的 {len(ids)} 个任务重新生成 3 个标题、2 个概梗和内容标签。\n\n"
+            "封面、配音、剧情图、字幕和成片均不会改变；下次上传会从新标题中重新选择。继续吗？",
+        ):
+            return
+        try:
+            self._apply_config_form(save_profile=False)
+        except Exception as exc:
+            messagebox.showerror("重新生成标题概梗失败", f"无法保存当前设置：\n{exc}")
+            return
+
+        def worker():
+            errors = []
+            completed = []
+            for job_id in ids:
+                try:
+                    pr.regenerate_job_marketing(
+                        job_id,
+                        on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message),
+                    )
+                    completed.append(job_id)
+                except Exception as exc:
+                    errors.append(f"{job_id}: {redact_secret_text(exc)}")
+            self.root.after(0, lambda: self._finish_marketing_regeneration(completed, errors))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_marketing_regeneration(self, completed: list[str], errors: list[str]):
+        self._refresh_jobs()
+        if errors:
+            summary = f"已完成 {len(completed)} 个，失败 {len(errors)} 个。\n\n" + "\n".join(errors)
+            messagebox.showerror("部分标题概梗生成失败", summary)
+        else:
+            messagebox.showinfo("标题概梗生成完成", f"已重新生成 {len(completed)} 个任务的标题、概梗和标签。")
+
     def _finish_manual_upload(self, ids: list[str], errors: list[str], *, scheduled: bool = False):
         self._refresh_jobs()
         if errors:
@@ -5186,6 +5411,40 @@ class PipelineGUI:
         self._refresh_jobs()
         if errors:
             messagebox.showerror("清除失败", "\n".join(errors))
+
+    def _prepare_selected_jobs_for_preliminary_scoring(self):
+        """Create compact, non-resumable preliminary-scoring packages."""
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先选择一个或多个任务，再进入预备分模式。")
+            return
+        running = [job_id for job_id in ids if pr.is_worker_running(job_id)]
+        message = (
+            f"将把 {len(ids)} 个任务整理为预备分包，仅保留 _source_input、成片 MP4、"
+            "audio_full.mp3、cover 和 images。\n\n"
+            "其余文件（包括状态、字幕、分镜、日志和可续跑数据）会永久删除，任务无法再从此目录继续运行。"
+            "整理后的目录会放入 data/预备分，并命名为“预备分_原任务名”。"
+        )
+        if running:
+            message += f"\n\n其中 {len(running)} 个任务正在运行，会先停止它们。"
+        if not messagebox.askyesno("确认进入预备分模式", message):
+            return
+        errors = []
+        prepared = 0
+        for job_id in ids:
+            try:
+                if pr.is_worker_running(job_id):
+                    pr.stop_job(job_id)
+                pr.prepare_job_for_preliminary_scoring(job_id)
+                prepared += 1
+            except Exception as exc:
+                errors.append(f"{job_id}: {exc}")
+        self._selected_job = ""
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("预备分模式未完全完成", "\n".join(errors))
+        elif prepared:
+            messagebox.showinfo("已进入预备分模式", f"已整理 {prepared} 个任务。")
 
     def _retry_all(self):
         ids = self._selected_job_ids()
@@ -6384,7 +6643,7 @@ class PipelineGUI:
             full_values = {
                 "title": str(row.get("title", "") or ""),
                 "video": str(row.get("video", "") or ""),
-                "youtube": str(st.get("youtube_url", "") or ""),
+                "youtube": self._youtube_queue_status(row["job_id"], st),
             }
             self._job_table_full_values[str(row["job_id"])] = full_values
             values = (
@@ -6411,6 +6670,43 @@ class PipelineGUI:
             self.job_tree.yview_moveto(yview[0])
         if xview:
             self.job_tree.xview_moveto(xview[0])
+
+    def _youtube_queue_status(self, job_id: str, status: dict) -> str:
+        """Return a clear upload state for the queue's YouTube column."""
+        youtube_url = str(status.get("youtube_url") or "").strip()
+        if youtube_url:
+            return "✓ 已上传"
+
+        if str(status.get("stage") or "").strip().lower() == "upload":
+            try:
+                progress = max(0, min(100, round(float(status.get("upload_progress") or 0))))
+            except (TypeError, ValueError):
+                progress = 0
+            return f"上传中 {progress}%"
+
+        if str(status.get("upload_error") or "").strip():
+            return "上传失败"
+
+        # YouTube often does not return a watch URL immediately after a
+        # scheduled upload.  Use its saved receipt so this is not shown as a
+        # blank cell and an operator does not accidentally upload it twice.
+        receipt_path = pr.job_dir_for(str(job_id)) / "upload_result.json"
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path.exists() else {}
+        except (OSError, json.JSONDecodeError):
+            receipt = {}
+        if isinstance(receipt, dict):
+            schedule_status = str(receipt.get("schedule_status") or "").strip().lower()
+            publish_mode = str(receipt.get("publish_mode") or "").strip().lower()
+            scheduled_at = str(receipt.get("scheduled_at") or "").strip()
+            if schedule_status == "scheduled" or publish_mode == "scheduled":
+                time_text = scheduled_at.replace("T", " ") if scheduled_at else ""
+                return f"✓ 已上传·定时 {time_text}".strip()
+            if str(receipt.get("video_id") or "").strip() or str(receipt.get("url") or "").strip():
+                return "✓ 已上传"
+
+        return "未上传"
+
     def _job_tree_font(self):
         font = getattr(self, "_job_id_font", None)
         if font is None:

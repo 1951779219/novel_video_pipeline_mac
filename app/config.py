@@ -62,6 +62,11 @@ PROFILE_LOCAL_FIELDS = PROFILE_CONNECTION_FIELDS | {
     "task_category_selected_path",
     "task_category_sort",
     "task_category_direction",
+    # The editorial cover system is shared by every production profile.
+    # Profiles keep only their genre/medium direction in cover_custom_prompt.
+    "cover_prompt_template",
+    "cover_ai_analysis_prompt",
+    "cover_poster_method_prompt",
     # Table layout is an operator preference, not part of a production profile.
     "job_table_column_widths",
 }
@@ -359,34 +364,48 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "cover_title_bg": "#050505",
     "cover_title_area_ratio": 0.24,
     "cover_prompt_template": (
-        "(masterpiece:1.2, best quality), horizontal 16:9.\n"
-        "Japanese LINE manga advertisement.\n"
+        "Design one finished horizontal 16:9 Japanese LINE Manga editorial advertisement.\n"
         "Story input: {excerpt}\n"
-        "Show one decisive event: protagonist action, visible reaction, and a meaningful prop or setting.\n"
-        "Use Center / Left / Right / Background labels for a clean poster layout.\n"
-        "Main title, Hook, Subtitle: short concrete Japanese copy; no other text or watermark.\n"
-        "{custom} {style}"
+        "Generated title candidate: {title}\n"
+        "Series identifier when supplied: {series_badge}\n"
+        "Prioritize commercial editorial design over illustration. Build the composition around 3-5 exact Japanese editorial "
+        "text blocks with a clear hierarchy: one huge selling point, one secondary headline, one or two sticker/badge blocks, "
+        "and optionally one short supporting line. Count a supplied series identifier inside the 3-5 blocks. Use bold, layered, "
+        "compact, rhythmic typography with strong size contrast "
+        "and thumbnail readability. The supporting story image communicates one decisive event through character action, "
+        "reaction, and a meaningful prop or setting.\n"
+        "{custom}"
     ),
     "cover_custom_prompt": (
-        "dramatic lighting, high contrast, one clear story climax, adult-looking characters"
+        "Japanese LINE Manga editorial advertisement, commercial editorial design, typography-led composition, bold layered "
+        "compact Japanese type, strong size contrast, bright editorial color blocks, stickers and badges, clean manga rendering "
+        "as supporting story imagery, highly readable at thumbnail size"
     ),
     "cover_ai_analysis_prompt": (
-        "Choose the strongest supported event or reversal from the candidates. Return one compact English image prompt only: "
-        "scene; Center, Left, Right, Background characters/actions; lighting; then Main title, Hook, Subtitle in Japanese. "
-        "Use concrete actions, not static posing. Do not copy a long source title, add extra text, analysis, JSON, logo, UI, or watermark."
+        "Think like a Japanese manga editor maximizing click-through rate. Choose the strongest supported event or reversal and "
+        "turn it into one story-specific advertising concept, composition, and visual storytelling device. Prioritize commercial "
+        "editorial design over illustration. Write exact natural Japanese copy for 3-5 clearly differentiated editorial text "
+        "blocks: one huge selling point, one secondary headline, one or two stickers/badges, and optionally one short supporting "
+        "line. Count a supplied series identifier as one of the 3-5 blocks. Create rhythm through strong size contrast, layering, "
+        "compact grouping, and placement. Make the composition and "
+        "storytelling concept specific to this story. Return one complete image-generation prompt only."
     ),
     "cover_prompt_max_tokens": 420,
     "cover_policy_prompt_versions": 3,
     "cover_transient_retries": 3,
     "cover_poster_method_prompt": (
-        "Fixed compact cover method:\n"
-        "Return one 120-220 word English image prompt for a horizontal 16:9 Japanese LINE manga-ad thumbnail. Start with "
-        "(masterpiece:1.2, best quality). Describe only the story-specific scene and people. Use Center, Left, Right, and "
-        "Background labels when useful: one decisive protagonist action, visible reaction, and one meaningful prop/setting. "
-        "Keep 1-3 main characters; do not pad with generic quality/style synonyms.\n"
-        "End exactly with Main title, Hook, Subtitle in concise Japanese. The title explains the event; hook is short; subtitle "
-        "clarifies it. Make the text readable and clear of faces/action. No extra text, logo, UI, watermark, moodboard, grid, "
-        "nudity, gore, or graphic injury."
+        "Japanese LINE Manga editorial-ad method:\n"
+        "Return one 180-280 word English image prompt for one finished horizontal 16:9 commercial manga advertisement. Choose "
+        "one story-supported high-CTR event and one distinctive advertising concept. Let typography and graphic layout lead; use "
+        "character action, reaction, a meaningful prop, and the setting as supporting evidence for the selling point.\n"
+        "Specify 3-5 exact natural Japanese editorial text blocks: one huge selling point, one secondary headline, one or two "
+        "sticker/badge blocks, and optionally one short supporting line. Count a supplied series identifier as one of these blocks. "
+        "For every block give the exact text, position, relative "
+        "scale, color, outline or panel shape, angle, and overlap relationship. Make the hierarchy bold, layered, compact, rhythmic, "
+        "and readable at thumbnail size. Create rhythm through extreme size contrast and intentional grouping.\n"
+        "Use clean story-appropriate rendering, bold editorial color fields, cutout framing, borders, stickers, arrows, bursts, or "
+        "cropped panels when they serve the chosen concept. Give every cover its own advertising concept, composition, and storytelling. "
+        "Return one finished prompt with the explicitly planned Japanese text blocks."
     ),
 
     # 图音配比
@@ -1032,7 +1051,10 @@ class Config:
         for key in PROFILE_LOCAL_FIELDS:
             if key in self._data:
                 data[key] = self._data[key]
-        data.update(saved)
+        # Older profile files may still contain copies of the shared cover
+        # system. Ignore those stale copies so switching profiles cannot bring
+        # back an incompatible title hierarchy or composition method.
+        data.update({key: value for key, value in saved.items() if key not in PROFILE_LOCAL_FIELDS})
         _apply_compat_migrations(data, saved)
         data["active_profile"] = cleaned
         return cleaned, data

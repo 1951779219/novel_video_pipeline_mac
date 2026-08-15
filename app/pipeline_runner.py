@@ -29,7 +29,7 @@ from typing import Callable, Iterable
 
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from app.config import API_KEY_FIELDS, JOBS_DIR, ROOT, api_key_env_name, config
+from app.config import API_KEY_FIELDS, DATA_DIR, JOBS_DIR, ROOT, api_key_env_name, config
 from app import project_manager as projects
 from app.concurrency import external_api_slot, ffmpeg_slot, pid_alive
 from app.scrapers.base import BookSearchResult, Novel, NovelChapter
@@ -74,6 +74,8 @@ TTS_REDO_REUSE_IMAGES_FILE = "tts_redo_reuse_images.json"
 SETTINGS_SNAPSHOT_FILE = "settings_snapshot.json"
 ACCELERATION_PREFETCH_REPORT = "acceleration_prefetch.json"
 SOURCE_INPUT_SNAPSHOT_DIR = "_source_input"
+PRELIMINARY_JOB_PREFIX = "预备分_"
+PRELIMINARY_JOBS_DIR = DATA_DIR / "预备分"
 
 
 class ImageGenerationFailed(RuntimeError):
@@ -752,6 +754,78 @@ def delete_job(job_id: str, *, stop_running: bool = False) -> bool:
     if last_error:
         raise last_error
     return True
+
+
+def prepare_job_for_preliminary_scoring(job_id: str) -> str:
+    """Keep only delivery assets and rename a finished job for preliminary scoring.
+
+    This is intentionally destructive: the retained folder is a compact
+    hand-off package, not a resumable pipeline job.  Moving the retained files
+    into a sibling staging directory first prevents a partly-deleted job when
+    an individual file operation fails.
+    """
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 仍在运行，不能进入预备分模式")
+    path = _safe_job_path(job_id)
+    if not path.exists():
+        raise FileNotFoundError(f"任务不存在：{job_id}")
+
+    target_name = job_id if job_id.startswith(PRELIMINARY_JOB_PREFIX) else f"{PRELIMINARY_JOB_PREFIX}{job_id}"
+    target_root = PRELIMINARY_JOBS_DIR.resolve()
+    target = (target_root / target_name).resolve()
+    if target_root not in target.parents:
+        raise ValueError(f"unsafe preliminary job path: {target}")
+    if target != path and target.exists():
+        raise FileExistsError(f"预备分任务目录已存在：{target_name}")
+
+    status = load_status(job_id, include_worker=False)
+    project_id = str(status.get("project_id") or "")
+    video_path = video_output_path(path)
+    # Older jobs can use final.mp4, while newer jobs use a title-based name.
+    # Keep exactly one completed video: prefer the current configured output.
+    if not video_path.exists() and (path / "final.mp4").exists():
+        video_path = path / "final.mp4"
+    keep_names = [
+        SOURCE_INPUT_SNAPSHOT_DIR,
+        "audio_full.mp3",
+        "cover",
+        "images",
+    ]
+    if video_path.exists() and video_path.parent == path:
+        keep_names.append(video_path.name)
+
+    staged = JOBS_DIR / f".{job_id}.preliminary-staging-{secrets.token_hex(8)}"
+    moved: list[str] = []
+    try:
+        staged.mkdir()
+        for name in keep_names:
+            source = path / name
+            if source.exists() or source.is_symlink():
+                shutil.move(str(source), str(staged / name))
+                moved.append(name)
+        shutil.rmtree(path)
+        target_root.mkdir(parents=True, exist_ok=True)
+        staged.rename(target)
+    except Exception:
+        # Before the source directory is deleted, return retained files to it
+        # so the operator can retry without losing the working task.
+        if path.exists() and staged.exists():
+            for name in moved:
+                source = staged / name
+                if source.exists() or source.is_symlink():
+                    try:
+                        shutil.move(str(source), str(path / name))
+                    except Exception:
+                        pass
+            try:
+                staged.rmdir()
+            except OSError:
+                pass
+        raise
+
+    if project_id:
+        projects.remove_job(project_id, job_id)
+    return target.name
 
 
 def clear_job_media_cache(job_id: str) -> None:
@@ -3831,8 +3905,8 @@ def _policy_safe_image_prompt(prompt: str, *, fallback_text: str = "", allow_tit
     value = re.sub(r"\s{2,}", " ", value).strip(" ,.;")
     if allow_title_text:
         guard = (
-            "Family-friendly cinematic cover illustration, adult-looking characters, symbolic emotional drama, "
-            "fully clothed characters, clean composition, subject-appropriate high-contrast lighting, readable faces, only the requested Japanese poster text, "
+            "Family-friendly commercial cover advertisement, adult-looking characters, clear emotional storytelling, "
+            "fully clothed characters, clean composition, readable faces, only the requested Japanese editorial text, "
             "no extra captions, logos, UI, or watermarks"
         )
     else:
@@ -5428,7 +5502,24 @@ def _normalize_cover_prompt(prompt: str) -> str:
 def _full_cover_poster_method_prompt() -> str:
     """Use only the complete poster method currently editable in the GUI."""
     configured = str(config.get("cover_poster_method_prompt", "") or "").strip()
-    return _cover_prompt_aspect_only(configured)
+    return _cover_prompt_for_target(configured)
+
+
+def _cover_target_format() -> str:
+    """Describe the configured cover orientation without hard-coding one profile."""
+    width = max(1, int(config.get("cover_width", 1280) or 1280))
+    height = max(1, int(config.get("cover_height", 720) or 720))
+    return "vertical 9:16" if height > width else "horizontal 16:9"
+
+
+def _cover_prompt_for_target(value: str) -> str:
+    """Adapt shared cover instructions to the active profile's orientation."""
+    text = _cover_prompt_aspect_only(value)
+    return re.sub(
+        r"(?i)\b(?:horizontal\s+16:9|16:9\s+horizontal|vertical\s+9:16|9:16\s+vertical)\b",
+        _cover_target_format(),
+        text,
+    )
 
 
 def _cover_planner_quality_error(prompt: str) -> str:
@@ -5463,9 +5554,20 @@ def _build_cover_prompt(
         if bool(config.get("series_animation_enabled", True))
         else ""
     )
-    style = str(config.llm_image_style_suffix or "").strip()
     custom = str(config.get("cover_custom_prompt", "") or "").strip()
-    template = _cover_prompt_aspect_only(str(config.get("cover_prompt_template", "") or ""))
+    style = str(config.llm_image_style_suffix or "").strip()
+    # An explicitly typography-led editorial cover must not inherit a scene-art
+    # suffix such as "cinematic lighting" or "film still".  The cover-specific
+    # custom prompt remains available to describe the supporting illustration.
+    custom_lower = custom.lower()
+    shared_method_lower = _full_cover_poster_method_prompt().lower()
+    if (
+        "editorial advertisement" in custom_lower
+        or "commercial editorial design" in custom_lower
+        or "editorial-ad method" in shared_method_lower
+    ):
+        style = ""
+    template = _cover_prompt_for_target(str(config.get("cover_prompt_template", "") or ""))
     title_list = "\n".join(f"{index}. {value}" for index, value in enumerate(bundle["titles"], start=1))
     synopsis_list = "\n".join(f"{index}. {value}" for index, value in enumerate(bundle["synopses"], start=1))
     context = {
@@ -5482,7 +5584,7 @@ def _build_cover_prompt(
         template,
         context,
         fallback=(
-            f'Create a cinematic YouTube cover illustration for a novel video. '
+            f'Create a commercial Japanese manga editorial advertisement for a novel video. '
             f'Render the exact title text "{title}" as the main large readable cover title inside the image. '
             + (f'Render the exact recurring series identifier "{series_badge}" as a prominent primary text element near the upper edge, clearly separate from the episode hook. ' if series_badge else "")
             + f'Story excerpt: {excerpt}. {custom} {style}'
@@ -5492,7 +5594,7 @@ def _build_cover_prompt(
     if _can_call_text_llm():
         try:
             route = _llm_route_settings()
-            analysis_prompt = _cover_prompt_aspect_only(str(config.get("cover_ai_analysis_prompt", "") or "")).strip()
+            analysis_prompt = _cover_prompt_for_target(str(config.get("cover_ai_analysis_prompt", "") or "")).strip()
             poster_method = _full_cover_poster_method_prompt()
             system_prompt = "\n\n".join(x for x in (analysis_prompt, poster_method) if x)
             llm = LLMBackend(
@@ -5507,7 +5609,8 @@ def _build_cover_prompt(
             )
             request = (
                 "Choose one supported climax. Return one compact prompt only; never use the source title as poster copy.\n"
-                + (f'Prominent primary series identifier, exact text: "{series_badge}". Keep it clearly separate from the episode headline.\n' if series_badge else "")
+                f"Target cover format: {_cover_target_format()}.\n"
+                + (f'Prominent primary series identifier, exact text: "{series_badge}". Count this inside the total 3-5 editorial text blocks and keep it clearly separate from the episode headline.\n' if series_badge else "")
                 + f"Candidates:{json.dumps(bundle, ensure_ascii=False, separators=(',', ':'))}\n"
                 f"Base:{custom} {style}\n"
                 "No logo, UI, watermark, or post-production overlay."
@@ -5524,7 +5627,7 @@ def _build_cover_prompt(
                 raise RuntimeError(f"incomplete cover planner output: {quality_error}")
             return _policy_safe_image_prompt(
                 _normalize_cover_prompt(
-                    f"{prompt}. Only the specified Japanese title, hook and subtitle; no other text or watermark."
+                    f"{prompt}. Render only the explicitly specified Japanese editorial text blocks, including any supplied series identifier; no other text or watermark."
                 ),
                 fallback_text=excerpt,
                 allow_title_text=True,
@@ -5570,7 +5673,7 @@ def _rewrite_cover_prompt_for_policy(
         return ""
     bundle = _cover_marketing_bundle(novel, segments, metadata)
     route = _llm_route_settings()
-    analysis_prompt = _cover_prompt_aspect_only(str(config.get("cover_ai_analysis_prompt", "") or "")).strip()
+    analysis_prompt = _cover_prompt_for_target(str(config.get("cover_ai_analysis_prompt", "") or "")).strip()
     poster_method = _full_cover_poster_method_prompt()
     system_prompt = "\n\n".join(x for x in (analysis_prompt, poster_method) if x)
     llm = LLMBackend(
@@ -5583,13 +5686,24 @@ def _rewrite_cover_prompt_for_policy(
         temperature=0.45,
         max_tokens=int(config.get("cover_prompt_max_tokens", 1400) or 1400),
     )
+    series_label = (
+        str((metadata or {}).get("series_cover_label") or "").strip()
+        if bool(config.get("series_animation_enabled", True))
+        else ""
+    )
+    series_instruction = (
+        f'Keep the exact series identifier "{series_label}" and count it inside the total 3-5 editorial text blocks.\n\n'
+        if series_label
+        else ""
+    )
     request = (
         "The image provider rejected the previous prompt for content-policy reasons. Rewrite it as exactly ONE complete English "
         "image-generation prompt. Keep the same factual story event, premium manga-ad style, subject-specific palette, Japanese "
-        "headline hierarchy and horizontal 16:9 composition, but replace any risky physical action, injury, threat, sexualized detail, "
+        f"headline hierarchy and {_cover_target_format()} composition, but replace any risky physical action, injury, threat, sexualized detail, "
         "minor depiction or graphic wording with a fully clothed adult-looking, non-contact, symbolic emotional confrontation. "
         "Do not return analysis or alternatives.\n\n"
-        f"Marketing candidates:\n{json.dumps(bundle, ensure_ascii=False, separators=(',', ':'))}\n\n"
+        + series_instruction
+        + f"Marketing candidates:\n{json.dumps(bundle, ensure_ascii=False, separators=(',', ':'))}\n\n"
         f"Provider rejection summary:\n{redact_secret_text(error_text)[:700]}\n\n"
         f"Previous prompt:\n{previous_prompt[:5000]}"
     )
@@ -5603,7 +5717,7 @@ def _rewrite_cover_prompt_for_policy(
             ).strip()
         return _policy_safe_image_prompt(
             _normalize_cover_prompt(
-                f"{rewritten}. Only the specified Japanese title, hook and subtitle; no other text or watermark."
+                f"{rewritten}. Render the explicitly specified 3-5 Japanese editorial text blocks in total, including any supplied series identifier; no other text or watermark."
             ),
             fallback_text=" ".join(bundle["synopses"]),
             allow_title_text=True,
@@ -6243,6 +6357,50 @@ def regenerate_job_marketing_and_cover(
     metadata = apply_series_presentation(metadata, job_dir, on_log=on_log)
     _write_json(job_dir / "metadata.json", metadata)
     return regenerate_job_cover(job_id, on_log=on_log, allow_running=True)
+
+
+def regenerate_job_marketing(
+    job_id: str, on_log: LogFn = _noop, *, allow_running: bool = False
+) -> dict:
+    """Force-regenerate publishing titles, synopses and tags only."""
+    if is_worker_running(job_id) and not allow_running:
+        raise RuntimeError(f"{job_id} 正在运行，请先停止任务后再重新生成标题概梗。")
+    job_dir = _safe_job_path(job_id)
+    novel = _read_saved_novel(job_dir / "novel.json")
+    segments = _read_saved_segments(job_dir / "segments.json")
+    if novel is None or segments is None:
+        raise RuntimeError("任务缺少已保存的正文或分段，无法单独重新生成标题概梗。")
+
+    saved_context = _read_json(job_dir / "story_visual_context.json", {})
+    story_context = saved_context.get("context") if isinstance(saved_context, dict) else {}
+    if not isinstance(story_context, dict):
+        story_context = {}
+
+    generated_paths = (
+        job_dir / "marketing_candidates.json",
+        job_dir / "タイトル・あらすじ候補.txt",
+        job_dir / "metadata.json",
+        job_dir / "upload_title_selection.json",
+    )
+    backups = {path: path.read_bytes() for path in generated_paths if path.is_file()}
+    for path in generated_paths:
+        path.unlink(missing_ok=True)
+
+    on_log("manual marketing regeneration started: force new titles/synopses/tags; preserve all media")
+    try:
+        metadata = stage_metadata(novel, job_dir, story_context, segments=segments, on_log=on_log)
+        metadata = apply_series_presentation(metadata, job_dir, on_log=on_log)
+        _write_json(job_dir / "metadata.json", metadata)
+    except Exception:
+        for path in generated_paths:
+            path.unlink(missing_ok=True)
+        for path, content in backups.items():
+            path.write_bytes(content)
+        on_log("manual marketing regeneration failed; restored previous title/synopsis files")
+        raise
+
+    on_log("manual marketing regeneration completed; next upload will choose from the new titles")
+    return metadata
 
 
 def queue_marketing_cover_rebuild(job_ids: Iterable[str], on_log: LogFn = _noop) -> tuple[list[str], list[tuple[str, int]]]:

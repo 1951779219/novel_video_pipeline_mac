@@ -339,6 +339,68 @@ EDGE_MULTI_VOICES = [
 
 EDGE_JA_VOICES = EDGE_MULTI_VOICES
 
+
+def edge_voice_choices(available_voices, current_voice: str = "") -> list[str]:
+    """Return curated voices first, followed by every voice discovered online.
+
+    Curated entries are deliberately retained even when Microsoft removes them
+    so the GUI can render an old saved choice as unavailable instead of silently
+    hiding why a profile stopped working.
+    """
+    available = {
+        str(voice or "").strip()
+        for voice in (available_voices or [])
+        if str(voice or "").strip()
+    }
+    current = str(current_voice or "").strip()
+    choices = list(dict.fromkeys(EDGE_MULTI_VOICES))
+    if current and current not in choices:
+        choices.append(current)
+    choices.extend(sorted(available.difference(choices), key=str.casefold))
+    return choices
+
+
+def preferred_available_edge_voice(current_voice: str, available_voices) -> str:
+    """Choose a stable replacement, preferring the saved voice's locale."""
+    available = {
+        str(voice or "").strip()
+        for voice in (available_voices or [])
+        if str(voice or "").strip()
+    }
+    current = str(current_voice or "").strip()
+    if current in available:
+        return current
+
+    locale = "-".join(current.split("-")[:2]) if current else ""
+    same_locale = [voice for voice in EDGE_MULTI_VOICES if voice in available and voice.startswith(f"{locale}-")]
+    if same_locale:
+        return same_locale[0]
+    curated = [voice for voice in EDGE_MULTI_VOICES if voice in available]
+    if curated:
+        return curated[0]
+    return sorted(available, key=str.casefold)[0] if available else ""
+
+
+def discover_edge_voices() -> list[str]:
+    """Fetch the Edge endpoint's current voice catalog.
+
+    Call this from a worker thread because it performs network I/O.
+    """
+    import edge_tts
+
+    async def _list() -> list[str]:
+        voices = await edge_tts.list_voices()
+        return sorted(
+            {
+                str(item.get("ShortName") or "").strip()
+                for item in voices
+                if str(item.get("ShortName") or "").strip()
+            },
+            key=str.casefold,
+        )
+
+    return asyncio.run(_list())
+
 # GUI codes: first digit = gender (1 female / 2 male), second = character,
 # third = style.  Values are translated to VOICEVOX's own speaker IDs above.
 VOICEVOX_FREQUENT_VOICE_IDS = {
