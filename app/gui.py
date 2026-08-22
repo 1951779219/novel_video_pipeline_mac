@@ -192,18 +192,20 @@ def _choose_import_files_and_folders() -> list[Path]:
 ObjC.import('AppKit');
 (function () {
     var app = $.NSApplication.sharedApplication;
-    app.setActivationPolicy($.NSApplicationActivationPolicyAccessory);
+    // This panel is hosted by the short-lived osascript process rather than
+    // the Tk process.  Accessory apps and a manually forced normal window
+    // level can leave it behind the main window on macOS, so let AppKit make
+    // this a normal foreground modal panel and manage its level itself.
+    app.setActivationPolicy($.NSApplicationActivationPolicyRegular);
     app.activateIgnoringOtherApps(true);
     var panel = $.NSOpenPanel.openPanel;
     panel.canChooseFiles = true;
     panel.canChooseDirectories = true;
     panel.allowsMultipleSelection = true;
     panel.resolvesAliases = true;
-    panel.level = $.NSNormalWindowLevel;
     panel.message = '选择小说 TXT、同名 MP3、读音词典或包含它们的文件夹';
     panel.prompt = '导入';
     panel.center;
-    app.activateIgnoringOtherApps(true);
     var response = panel.runModal;
     if (response != $.NSModalResponseOK) return '';
     var urls = panel.URLs;
@@ -1280,25 +1282,6 @@ class PipelineGUI:
             self.entry_widgets[key] = widget
             return var
 
-        def directory_row(label: str, key: str):
-            line = ttk.Frame(section_parent)
-            line.pack(fill=tk.X, pady=3)
-            ttk.Label(line, text=label, width=18).pack(side=tk.LEFT)
-            var = tk.StringVar(value=str(config.get(key, "") or ""))
-            ttk.Entry(line, textvariable=var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
-            def choose_directory():
-                selected = filedialog.askdirectory(
-                    title="选择成品视频保存目录",
-                    initialdir=var.get().strip() or str(Path.home()),
-                )
-                if selected:
-                    var.set(selected)
-
-            ttk.Button(line, text="选择…", command=choose_directory).pack(side=tk.LEFT, padx=(6, 0))
-            self.vars[key] = var
-            return var
-
         def secret_row(label: str, key: str, default=""):
             line = ttk.Frame(section_parent)
             line.pack(fill=tk.X, pady=3)
@@ -1751,7 +1734,7 @@ class PipelineGUI:
         textrow("视频图 AI 分析用户模板", "llm_storyboard_user_template", str(config.get("llm_storyboard_user_template", "")), height=4)
         check("智能选择旁白高光点（不增加图片数）", "storyboard_highlight_enabled")
         check("按高光旁白调整换图时间", "storyboard_highlight_align_timeline")
-        row("全篇背景分析最大字数", "storyboard_highlight_context_max_chars", "18000")
+        row("全篇背景分析最大字数", "storyboard_highlight_context_max_chars", "10000")
         row("每图高光最多连续段数", "storyboard_highlight_max_segments", "3")
 
         section("封面")
@@ -1826,15 +1809,113 @@ class PipelineGUI:
         check("内嵌字幕（强制）", "video_subtitle")
         check("导出 SRT", "video_external_subtitle")
 
-        section("输出目录")
-        directory_row("成品视频保存到", "output_directory")
-        check("本地 TXT 导入的成品输出回原文件夹", "output_to_input_directory")
+        section("Short 竖屏短视频")
+        check("生成Short视频", "short_video_enabled")
         ttk.Label(
             section_parent,
-            text="可选一个统一的成品目录；或勾选“输出回原文件夹”，在原 TXT 同级生成 MP4、cover 和标题.txt。后者优先，适合分段小说。",
+            text="Short作为主视频的独立子产物保存到任务 shorts 目录；生成失败不会影响主视频完成或上传。",
             foreground="#666",
             wraplength=520,
-        ).pack(anchor=tk.W, pady=(0, 4))
+        ).pack(anchor=tk.W, pady=(0, 5))
+
+        short_mode_labels = {
+            "复用主视频前一分钟": "reuse_main",
+            "独立制作": "independent",
+        }
+        short_mode_values = {value: label for label, value in short_mode_labels.items()}
+        short_mode_line = ttk.Frame(section_parent)
+        short_mode_line.pack(fill=tk.X, pady=3)
+        ttk.Label(short_mode_line, text="制作模式", width=18).pack(side=tk.LEFT)
+        short_mode_var = tk.StringVar(
+            value=short_mode_values.get(str(config.get("short_video_mode", "reuse_main")), "复用主视频前一分钟")
+        )
+        ttk.Combobox(
+            short_mode_line,
+            textvariable=short_mode_var,
+            values=list(short_mode_labels),
+            state="readonly",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.vars["short_video_mode"] = short_mode_var
+        self._short_video_mode_labels = short_mode_labels
+
+        row("Short最长秒数", "short_video_duration_seconds", "58")
+        row("Short视频宽", "short_video_width", "1080")
+        row("Short视频高", "short_video_height", "1920")
+        row("模糊背景强度", "short_video_blur_sigma", "28")
+        ttk.Label(
+            section_parent,
+            text="模式一：截取主视频开头，中央原画保持比例；上下使用同画面放大、模糊、压暗的背景，不裁人物、不拉伸。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(3, 9))
+
+        subheading("模式二 · Short文案")
+        check("标题阶段预生成Short文案", "short_video_prebuild_script_enabled")
+        row("Short文案最大字数", "short_video_script_max_chars", "350")
+        ttk.Label(
+            section_parent,
+            text="开启后，标题/概梗读取小说前、中、后段时，会在同一次文本模型请求中一起生成Short旁白并缓存；后续制作Short直接复用。350字通常可控制在一分钟以内。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(0, 5))
+        row("文案最短秒数", "short_video_script_min_seconds", "45")
+        row("文案最长秒数", "short_video_script_max_seconds", "58")
+        textrow(
+            "Short文案提示词",
+            "short_video_script_prompt",
+            str(config.get("short_video_script_prompt", "")),
+            height=6,
+        )
+
+        subheading("模式二 · 竖屏插图")
+        short_prompt_labels = {
+            "沿用主视频提示词（本地只改尺寸）": "reuse_main",
+            "重写Short专用提示词": "rewrite",
+        }
+        short_prompt_values = {value: label for label, value in short_prompt_labels.items()}
+        short_prompt_line = ttk.Frame(section_parent)
+        short_prompt_line.pack(fill=tk.X, pady=3)
+        ttk.Label(short_prompt_line, text="插图提示词来源", width=18).pack(side=tk.LEFT)
+        short_prompt_var = tk.StringVar(
+            value=short_prompt_values.get(
+                str(config.get("short_video_image_prompt_mode", "reuse_main")),
+                "沿用主视频提示词（本地只改尺寸）",
+            )
+        )
+        ttk.Combobox(
+            short_prompt_line,
+            textvariable=short_prompt_var,
+            values=list(short_prompt_labels),
+            state="readonly",
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.vars["short_video_image_prompt_mode"] = short_prompt_var
+        self._short_video_image_prompt_labels = short_prompt_labels
+        row("竖屏插图数量", "short_video_image_count", "6")
+        row("插图输出宽", "short_video_image_width", "1024")
+        row("插图输出高", "short_video_image_height", "1792")
+        textrow(
+            "专用插图提示词",
+            "short_video_image_prompt",
+            str(config.get("short_video_image_prompt", "")),
+            height=6,
+        )
+        textrow(
+            "9:16附加词",
+            "short_video_portrait_suffix",
+            str(config.get("short_video_portrait_suffix", "")),
+            height=3,
+        )
+        ttk.Label(
+            section_parent,
+            text="沿用模式不会调用文本AI：复制主视频 prompts.json，只在本地替换明确的16:9和横屏输出尺寸描述；人物、场景、动作、镜头和画风保持原样。实际生图接口宽高也会改为9:16。9:16附加词只用于“重写Short专用提示词”。",
+            foreground="#666",
+            wraplength=520,
+        ).pack(anchor=tk.W, pady=(3, 6))
+        row("Short字幕字号", "short_video_subtitle_size", "58")
+        row("Short字幕底边距", "short_video_subtitle_margin_v", "300")
+        row("Short每行字数", "short_video_subtitle_chars_per_line", "13")
+        row("Short字幕最多行", "short_video_subtitle_max_lines", "2")
+        buttons(("为选中任务重新生成Short", self._regenerate_selected_shorts))
 
         section("批量与上传")
         synced_check("检测系列动画", "series_animation_enabled")
@@ -1978,6 +2059,12 @@ class PipelineGUI:
             "short_title_min_chars", "short_title_max_chars",
             "marketing_title_min_chars", "marketing_title_max_chars", "youtube_title_max_chars",
             "script_schedule_interval_hours",
+            "short_video_duration_seconds", "short_video_width", "short_video_height",
+            "short_video_script_min_seconds", "short_video_script_max_seconds",
+            "short_video_script_max_chars",
+            "short_video_image_count", "short_video_image_width", "short_video_image_height",
+            "short_video_subtitle_size", "short_video_subtitle_margin_v",
+            "short_video_subtitle_chars_per_line", "short_video_subtitle_max_lines",
         }
         float_keys = {
             "tts_volume", "tts_waveform_min_rms_db", "tts_waveform_max_silence_ratio",
@@ -1985,6 +2072,7 @@ class PipelineGUI:
             "pacing_seconds_per_image", "video_motion_cycle_seconds",
             "video_transition_duration", "cover_title_area_ratio",
             "video_subtitle_outline", "video_subtitle_shadow", "video_subtitle_spacing",
+            "short_video_blur_sigma",
         }
         bool_keys = {
             "video_long_mode", "ken_burns", "video_subtitle", "video_external_subtitle",
@@ -2003,6 +2091,8 @@ class PipelineGUI:
             "update_check_on_startup", "browser_upload_all_profiles",
             "youtube_schedule_enabled",
             "series_animation_enabled",
+            "short_video_enabled",
+            "short_video_prebuild_script_enabled",
         }
         return int_keys, float_keys, bool_keys
 
@@ -2013,6 +2103,10 @@ class PipelineGUI:
             value = var.get()
             if key == "pacing_mode":
                 value = getattr(self, "_pacing_mode_labels", {}).get(str(value), str(value))
+            elif key == "short_video_mode":
+                value = getattr(self, "_short_video_mode_labels", {}).get(str(value), str(value))
+            elif key == "short_video_image_prompt_mode":
+                value = getattr(self, "_short_video_image_prompt_labels", {}).get(str(value), str(value))
             if key in bool_keys:
                 value = str(value) == "开启"
             elif key in int_keys:
@@ -2153,6 +2247,12 @@ class PipelineGUI:
                 var.set("开启" if bool(value) else "关闭")
             elif key == "pacing_mode":
                 var.set(getattr(self, "_pacing_mode_values_to_labels", {}).get(str(value), "按时长"))
+            elif key == "short_video_mode":
+                labels = {v: k for k, v in getattr(self, "_short_video_mode_labels", {}).items()}
+                var.set(labels.get(str(value), "复用主视频前一分钟"))
+            elif key == "short_video_image_prompt_mode":
+                labels = {v: k for k, v in getattr(self, "_short_video_image_prompt_labels", {}).items()}
+                var.set(labels.get(str(value), "沿用主视频提示词（本地只改尺寸）"))
             else:
                 var.set(str(value))
         self._refresh_pacing_mode_controls()
@@ -4264,10 +4364,10 @@ class PipelineGUI:
             output_basename=output_basename,
             source_path=input_text if Path(str(input_text)).is_file() else "",
             source_directory=str(Path(input_text).parent) if Path(str(input_text)).is_file() else "",
-            stage="queued",
+            stage="pending",
             progress=0.0,
         )
-        pr.append_log(job_dir, f"queued: {title}")
+        pr.append_log(job_dir, f"imported and waiting for manual start: {title}")
         if project_id:
             try:
                 pr.assign_job_to_project(
@@ -4338,8 +4438,56 @@ class PipelineGUI:
 
     def _start_selected(self):
         ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先选择要启动的任务。")
+            return
+        if len(ids) == 1:
+            self._start_job(ids[0], selected_job_ids=ids)
+            return
+
+        # A multi-selection is one production batch: launch its first
+        # runnable task and leave every later task in the durable queue.  Do
+        # not call _start_job repeatedly here, otherwise the configured
+        # concurrency limit can make several selected jobs look like they all
+        # started at once.
+        start_job_id = ""
+        queued = 0
+        skipped = 0
         for job_id in ids:
-            self._start_job(job_id, selected_job_ids=ids)
+            status = pr.load_status(job_id)
+            if status.get("worker_alive"):
+                skipped += 1
+                continue
+            if not str(status.get("input") or "").strip():
+                skipped += 1
+                continue
+            if not start_job_id:
+                start_job_id = job_id
+                continue
+            pr.clear_worker_pid(job_id)
+            pr.write_status(
+                pr.job_dir_for(job_id),
+                job_id=job_id,
+                stage="queued",
+                worker_pid=None,
+                error="",
+                queued_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            pr.append_log(pr.job_dir_for(job_id), "queued by batch '启动选中'")
+            queued += 1
+
+        if not start_job_id:
+            messagebox.showwarning("无法启动", "所选任务正在运行或缺少输入内容。")
+            return
+        self._start_job(start_job_id, selected_job_ids=ids)
+        self._refresh_jobs()
+        if queued or skipped:
+            detail = []
+            if queued:
+                detail.append(f"已启动 1 个任务，其余 {queued} 个已进入队列")
+            if skipped:
+                detail.append(f"跳过 {skipped} 个正在运行或缺少输入的任务")
+            messagebox.showinfo("批量启动", "；".join(detail) + "。")
 
     def _continue_selected(self):
         """Resume only incomplete stages, retaining every valid job artifact."""
@@ -5186,6 +5334,51 @@ class PipelineGUI:
             messagebox.showerror("部分封面生成失败", summary)
         else:
             messagebox.showinfo("封面生成完成", f"已重新生成 {len(completed)} 个选中任务的封面。")
+
+    def _regenerate_selected_shorts(self):
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先在任务队列中选择要生成Short的任务。")
+            return
+        running = [job_id for job_id in ids if pr.load_status(job_id).get("worker_alive")]
+        if running:
+            messagebox.showwarning("任务正在运行", "请先停止选中的运行中任务，再重新生成Short。")
+            return
+        if not messagebox.askyesno(
+            "重新生成Short",
+            f"将使用当前Short设置，为选中的 {len(ids)} 个任务生成或替换 shorts/short.mp4。\n\n"
+            "主视频、封面和上传结果不会改变。独立制作模式可能调用文本、TTS和图片接口。继续吗？",
+        ):
+            return
+        try:
+            self._apply_config_form(save_profile=False)
+        except Exception as exc:
+            messagebox.showerror("重新生成Short失败", f"无法保存当前Short设置：\n{exc}")
+            return
+
+        def worker():
+            errors = []
+            completed = []
+            for job_id in ids:
+                try:
+                    pr.regenerate_job_short(
+                        job_id,
+                        on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message),
+                    )
+                    completed.append(job_id)
+                except Exception as exc:
+                    errors.append(f"{job_id}: {redact_secret_text(exc)}")
+            self.root.after(0, lambda: self._finish_short_regeneration(completed, errors))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_short_regeneration(self, completed: list[str], errors: list[str]):
+        self._refresh_jobs()
+        if errors:
+            summary = f"已完成 {len(completed)} 个，失败 {len(errors)} 个。\n\n" + "\n".join(errors)
+            messagebox.showerror("部分Short生成失败", summary)
+        else:
+            messagebox.showinfo("Short生成完成", f"已为 {len(completed)} 个选中任务生成Short视频。")
 
     def _regenerate_selected_marketing(self):
         ids = self._selected_job_ids()

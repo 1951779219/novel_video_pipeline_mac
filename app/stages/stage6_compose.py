@@ -232,28 +232,96 @@ def concat_audios(audios: list[Path], out_path: Path, on_log: Callable[[str], No
     list_file = out_path.with_suffix(".concat.txt")
     tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
     tmp_path.unlink(missing_ok=True)
-    list_file.write_text("\n".join(_concat_file_path(p) for p in audios), encoding="utf-8")
-    _run(
-        [
-            ffmpeg_path(),
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-c:a",
-            "libmp3lame",
-            "-b:a",
-            "192k",
-            str(tmp_path),
-        ],
-        on_log,
-    )
-    tmp_path.replace(out_path)
-    list_file.unlink(missing_ok=True)
+    try:
+        list_file.write_text("\n".join(_concat_file_path(p) for p in audios), encoding="utf-8")
+        _run(
+            [
+                ffmpeg_path(),
+                "-y",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(list_file),
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                str(tmp_path),
+            ],
+            on_log,
+        )
+        tmp_path.replace(out_path)
+    finally:
+        list_file.unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
+
+
+def build_blurred_portrait_short(
+    source_video: Path,
+    out_path: Path,
+    on_log: Callable[[str], None],
+    *,
+    duration: float = 58.0,
+    width: int = 1080,
+    height: int = 1920,
+    fps: int = 30,
+    blur_sigma: float = 28.0,
+    video_encoder: str = "libx264",
+    video_encoder_preset: str = "veryfast",
+    video_encoder_quality: int | float = 20,
+) -> None:
+    """Turn the start of a landscape master into a portrait Short.
+
+    The foreground always keeps its original aspect ratio. A separately scaled
+    copy fills the portrait canvas behind it and is blurred/darkened, so no
+    source pixels are stretched and no people are cropped from the foreground.
+    """
+    source_video = Path(source_video)
+    if not source_video.exists():
+        raise FileNotFoundError(f"source video not found: {source_video}")
+    width = max(2, int(width) // 2 * 2)
+    height = max(2, int(height) // 2 * 2)
+    fps = max(1, int(fps))
+    duration = max(0.1, min(60.0, float(duration or 58.0)))
+    blur_sigma = max(0.0, min(100.0, float(blur_sigma or 0.0)))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = out_path.with_name(out_path.stem + ".tmp" + out_path.suffix)
     tmp_path.unlink(missing_ok=True)
+    filter_complex = (
+        f"[0:v]split=2[short_bg][short_fg];"
+        f"[short_bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+        f"crop={width}:{height},gblur=sigma={blur_sigma:.2f},eq=brightness=-0.12[short_bgv];"
+        f"[short_fg]scale={width}:{height}:force_original_aspect_ratio=decrease[short_fgv];"
+        f"[short_bgv][short_fgv]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={fps}[v]"
+    )
+
+    def make_cmd(encoder_args: list[str]) -> list[str]:
+        return [
+            ffmpeg_path(), "-y", "-i", str(source_video),
+            "-filter_complex", filter_complex,
+            "-map", "[v]", "-map", "0:a:0?",
+            "-t", f"{duration:.3f}",
+            *encoder_args,
+            "-c:a", "aac", "-b:a", "192k",
+            "-shortest", str(tmp_path),
+        ]
+
+    try:
+        _run_encoder_command(
+            make_cmd,
+            tmp_path,
+            on_log,
+            video_encoder,
+            video_encoder_preset,
+            video_encoder_quality,
+        )
+        if not tmp_path.exists() or tmp_path.stat().st_size < 1000:
+            raise RuntimeError("portrait Short encoder returned no valid output")
+        tmp_path.replace(out_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def build_video(
@@ -288,7 +356,10 @@ def build_video(
     motion = _normalize_motion(motion)
     motion_overscan = 1.22
     zoom_amount = 0.10
-    if (long_mode or not ken_burns) and motion in {"", "none", "static"}:
+    # An explicit static selection must always bypass per-image motion.  The
+    # Ken Burns checkbox controls the default effect, not a user's explicit
+    # "静态" choice.
+    if motion in {"", "none", "static"}:
         _build_video_from_image_list(
             images=images,
             image_durations=image_durations,
@@ -348,26 +419,28 @@ def _build_video_from_image_list(
     video_encoder_preset: str,
     video_encoder_quality: int | float,
 ):
-    list_file = out_path.parent / "images.concat.txt"
-    lines: list[str] = []
-    for img, dur in zip(images, image_durations):
-        lines.append(_concat_file_path(img))
-        lines.append(f"duration {max(0.05, float(dur)):.3f}")
-    lines.append(_concat_file_path(images[-1]))
-    list_file.write_text("\n".join(lines), encoding="utf-8")
-
-    cmd = [
-        ffmpeg_path(),
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        str(list_file),
-        "-i",
-        str(audio_path),
-    ]
+    list_file: Path | None = None
+    if len(images) == 1:
+        # A concat demuxer with one still image can stall when finalizing a
+        # long MP4 on macOS.  Loop the image directly instead.
+        cmd = [
+            # Decode the still once per second; the fps filter below duplicates
+            # frames for the target video rate without repeatedly decoding PNG.
+            ffmpeg_path(), "-y", "-loop", "1", "-framerate", "1",
+            "-i", str(images[0]), "-i", str(audio_path),
+        ]
+    else:
+        list_file = out_path.parent / "images.concat.txt"
+        lines: list[str] = []
+        for img, dur in zip(images, image_durations):
+            lines.append(_concat_file_path(img))
+            lines.append(f"duration {max(0.05, float(dur)):.3f}")
+        lines.append(_concat_file_path(images[-1]))
+        list_file.write_text("\n".join(lines), encoding="utf-8")
+        cmd = [
+            ffmpeg_path(), "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_file), "-i", str(audio_path),
+        ]
     filter_complex: list[str] = []
     hard_subtitle, soft_subtitle = _subtitle_mode(subtitle_ass, on_log)
     video_filter = (
@@ -420,13 +493,14 @@ def _build_video_from_image_list(
                     "default",
                 ]
             )
-        final_cmd.extend(["-shortest", "-movflags", "+faststart", str(out_path)])
+        final_cmd.extend(["-t", f"{sum(float(duration) for duration in image_durations):.3f}", "-shortest", str(out_path)])
         return final_cmd
 
     try:
         _run_encoder_command(make_cmd, out_path, on_log, video_encoder, video_encoder_preset, video_encoder_quality)
     finally:
-        list_file.unlink(missing_ok=True)
+        if list_file:
+            list_file.unlink(missing_ok=True)
 
 
 def _build_video_from_clips(
@@ -626,14 +700,14 @@ def _build_video_from_clips(
         video_args = ["-c:v", "copy"]
         cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k"])
         _append_soft_subtitle_args(cmd, soft_subtitle_index)
-        cmd.extend(["-shortest", "-movflags", "+faststart", str(out_path)])
+        cmd.extend(["-shortest", str(out_path)])
         _run(cmd, on_log)
     else:
         cmd.extend(["-c:v", "copy", "-map", "0:v", "-map", audio_map])
         video_args = []
         cmd.extend([*video_args, "-c:a", "aac", "-b:a", "192k"])
         _append_soft_subtitle_args(cmd, soft_subtitle_index)
-        cmd.extend(["-shortest", "-movflags", "+faststart", str(out_path)])
+        cmd.extend(["-shortest", str(out_path)])
         _run(cmd, on_log)
 
     if cleanup_temp:

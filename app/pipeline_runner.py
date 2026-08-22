@@ -39,7 +39,13 @@ from app.scrapers.qingtian import QingtianAggregateScraper, parse_host_list
 from app.scrapers.source_catalog import SourceCatalogScraper
 from app.scrapers.syosetu import SyosetuScraper
 from app.stages.stage2_clean import Segment, split_segments
-from app.stages.stage6_compose import build_ass, build_srt, build_video, concat_audios
+from app.stages.stage6_compose import (
+    build_ass,
+    build_blurred_portrait_short,
+    build_srt,
+    build_video,
+    concat_audios,
+)
 from app.stages.stage_pacing import ImagePlan, plan_images
 from app.backends.image import ImageBackend
 from app.backends.llm import LLMBackend
@@ -257,79 +263,6 @@ def video_output_path(job_dir: Path) -> Path:
     return job_dir / f"{safe_job_name(output_basename)}.mp4"
 
 
-def export_completed_video(
-    video_path: Path,
-    cover_path: Path | None,
-    title: str,
-    short_title: str = "",
-    source_path: str = "",
-    on_log: LogFn = _noop,
-) -> Path | None:
-    """Export one completed task as a self-contained delivery folder.
-
-    The working copy deliberately stays in the job folder, because it is used
-    for resume and optional YouTube upload.  The delivery folder is an
-    additional stable hand-off package for workflows where publishing is off.
-    """
-    source = Path(str(source_path or "")).expanduser()
-    if bool(config.get("output_to_input_directory", False)) and source.is_file():
-        try:
-            destination_dir = source.parent.resolve()
-            base = safe_job_name(source.stem, fallback="article")
-            destination_video = destination_dir / f"{base}.mp4"
-            temporary_video = destination_video.with_name(
-                f".{destination_video.stem}.{os.getpid()}.new{destination_video.suffix}"
-            )
-            temporary_video.unlink(missing_ok=True)
-            try:
-                shutil.copy2(video_path, temporary_video)
-                if temporary_video.stat().st_size < 1000:
-                    raise RuntimeError("copied video is unexpectedly small")
-                os.replace(temporary_video, destination_video)
-            finally:
-                temporary_video.unlink(missing_ok=True)
-            if cover_path is not None and cover_path.exists():
-                shutil.copy2(cover_path, destination_dir / f"{base}_cover{cover_path.suffix.lower() or '.jpg'}")
-            title_lines = [f"系列标题：{title.strip() or video_path.stem}"]
-            if short_title.strip():
-                title_lines.append(f"本集标题：{short_title.strip()}")
-            (destination_dir / f"{base}_标题.txt").write_text("\n".join(title_lines) + "\n", encoding="utf-8")
-            on_log(f"  OK 成品已输出回原文件夹: {destination_dir}")
-            return destination_dir
-        except Exception as exc:
-            on_log(f"  ⚠️ 输出回原文件夹失败（任务内成品仍保留）: {exc}")
-            return None
-
-    configured = str(config.get("output_directory", "") or "").strip()
-    if not configured:
-        return None
-    try:
-        destination_dir = Path(configured).expanduser().resolve()
-        destination_dir.mkdir(parents=True, exist_ok=True)
-        destination = destination_dir / safe_job_name(video_path.stem, fallback="article")
-        sequence = 2
-        while destination.exists():
-            destination = destination_dir / f"{safe_job_name(video_path.stem, fallback='article')}_{sequence}"
-            sequence += 1
-        temporary = destination.with_name(f".{destination.name}.copying")
-        if temporary.exists():
-            shutil.rmtree(temporary)
-        temporary.mkdir()
-        shutil.copy2(video_path, temporary / video_path.name)
-        if cover_path is not None and cover_path.exists():
-            shutil.copy2(cover_path, temporary / cover_path.name)
-        title_lines = [f"原始标题：{title.strip() or video_path.stem}"]
-        if short_title.strip():
-            title_lines.append(f"生成短标题：{short_title.strip()}")
-        (temporary / "标题.txt").write_text("\n".join(title_lines) + "\n", encoding="utf-8")
-        temporary.replace(destination)
-        on_log(f"  OK 成品文件夹已导出: {destination}")
-        return destination
-    except Exception as exc:
-        on_log(f"  ⚠️ 成品文件夹导出失败（任务内成品仍保留）: {exc}")
-        return None
-
-
 def append_log(job_dir: Path, message: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     with (job_dir / "log.txt").open("a", encoding="utf-8") as f:
@@ -403,7 +336,7 @@ def worker_pid(job_id: str) -> int:
     # durable PID file existed.  This is intentionally an exact argv match.
     legacy_active_stages = {
         "worker_starting", "starting", "scrape", "clean", "api_preprocessing", "tts",
-        "images_prefetch", "pacing", "images", "cover", "compose",
+        "images_prefetch", "pacing", "images", "cover", "compose", "short",
         "upload", "stopping",
     }
     if os.name != "nt" and status.get("stage") in legacy_active_stages:
@@ -457,6 +390,9 @@ def load_status(job_id: str, *, include_worker: bool = True) -> dict:
 
 
 _STAGE_LABELS = {
+    # Imported jobs have not been scheduled yet.  Keep this distinct from the
+    # durable worker queue so the task list reflects the operator's intent.
+    "pending": "待启动",
     "queued": "已加入队列",
     "paused": "已暂停",
     "starting": "启动中",
@@ -471,6 +407,7 @@ _STAGE_LABELS = {
     "images": "4/6 生成图片",
     "cover": "5/6 生成封面",
     "compose": "5/6 合成视频",
+    "short": "生成Short竖屏视频",
     "upload": "6/6 上传",
     "completed": "完成",
     "failed": "失败",
@@ -598,7 +535,7 @@ def start_acceleration_preprocess_next(
         if st.get("stage") == "preprocessed" and bool(st.get("acceleration_enabled")):
             return None
     if require_active_stage and source_job_id is None:
-        active_stages = {"tts", "images_prefetch", "pacing", "images", "cover", "compose"}
+        active_stages = {"tts", "images_prefetch", "pacing", "images", "cover", "compose", "short"}
         if not any(
             bool(row.get("worker_alive")) and str(row.get("stage") or "") in active_stages
             for row in rows
@@ -835,7 +772,7 @@ def clear_job_media_cache(job_id: str) -> None:
     path = _safe_job_path(job_id)
     if not path.exists():
         return
-    for name in ("images", "cover", "_clips"):
+    for name in ("images", "cover", "_clips", "shorts"):
         target = path / name
         if target.exists():
             shutil.rmtree(target)
@@ -852,7 +789,7 @@ def clear_job_media_cache(job_id: str) -> None:
     for video_path in {path / "final.mp4", video_output_path(path)}:
         video_path.unlink(missing_ok=True)
         video_path.with_name(video_path.stem + ".tmp" + video_path.suffix).unlink(missing_ok=True)
-    write_status(path, stage="queued", progress=0.0, video="", youtube_url="", cover="")
+    write_status(path, stage="queued", progress=0.0, video="", short_video="", short_error="", youtube_url="", cover="")
     append_log(path, "media cache cleared: images/cover/final video will regenerate")
 
 
@@ -876,7 +813,7 @@ def reset_full_job(job_id: str) -> dict:
     )
 
     imported_audio = (path / IMPORTED_AUDIO_MANIFEST).exists()
-    for name in ("images", "_prefetch_images", "cover", "characters", "_clips"):
+    for name in ("images", "_prefetch_images", "cover", "characters", "_clips", "shorts"):
         target = path / name
         if target.exists():
             shutil.rmtree(target)
@@ -924,6 +861,8 @@ def reset_full_job(job_id: str) -> dict:
         worker_pid=None,
         error="",
         cover="",
+        short_video="",
+        short_error="",
         youtube_url="",
         image_failure=None,
     )
@@ -1128,7 +1067,7 @@ def start_next_queued_job(*, exclude_job_id: str | None = None, on_log: LogFn = 
 
 
 def queue_all_pending_jobs(*, on_log: LogFn = _noop) -> tuple[list[str], list[tuple[str, int]]]:
-    """Queue every restartable pending job and fill the available worker slots.
+    """Queue every manually pending or restartable job and fill worker slots.
 
     This is deliberately separate from ``start_worker``: a batch request must
     remain useful when its size is greater than ``max_concurrent_jobs``.  Jobs
@@ -1140,7 +1079,7 @@ def queue_all_pending_jobs(*, on_log: LogFn = _noop) -> tuple[list[str], list[tu
         if not job_id or row.get("worker_alive"):
             continue
         status = load_status(job_id)
-        if status.get("stage") not in {"queued", "failed"}:
+        if status.get("stage") not in {"pending", "queued", "failed"}:
             continue
         if not str(status.get("input") or "").strip():
             continue
@@ -2827,6 +2766,9 @@ def _clear_downstream_after_tts_change(job_dir: Path) -> None:
         target = job_dir / name
         if target.exists():
             shutil.rmtree(target)
+    short_dir = job_dir / "shorts"
+    if short_dir.exists():
+        shutil.rmtree(short_dir)
     for name in (
         "durations.json",
         "imported_audio_timing.json",
@@ -4294,10 +4236,23 @@ def stage_storyboard_and_image(
                     )
                     attempt_prompt = prompt
                     if attempt > 1 and last_exc is not None and _is_image_policy_error(last_exc):
+                        # Keep the current story's visual lock on a policy retry.
+                        # Retrying with only a generic "calm symbolic scene" prompt
+                        # lets the image model invent a different cast, era, and style.
+                        retry_context = " ".join(
+                            part for part in (theme_context, character_context) if part
+                        )
                         attempt_prompt = _policy_safe_image_prompt(
-                            "A calm symbolic scene showing the same story mood through facial expressions, "
-                            "distance, lighting, and environment; no direct harm or explicit content.",
-                            fallback_text=plan.text,
+                            f"{config.llm_image_prompt_prefix} "
+                            "Create a calm, family-friendly symbolic interpretation of the selected story moment. "
+                            "Keep the same fantasy world, character designs, costumes, palette, and illustration style "
+                            "as this video's other scenes. Show emotion through facial expressions, distance, lighting, "
+                            "and environment only; no direct harm or explicit content. "
+                            f"{retry_context}",
+                            # Do not inject the raw narration here: a policy rejection
+                            # can be caused by material in that text, but the visual
+                            # locks above still preserve continuity.
+                            fallback_text="",
                         )
                         if isinstance(prompts_log[i], dict):
                             prompts_log[i]["prompt"] = attempt_prompt
@@ -4591,6 +4546,49 @@ def _candidate_synopsis(value: str) -> str:
     return re.sub(r"\s+", " ", text).strip().strip('"')
 
 
+def _clean_prebuilt_short_script(value: str, max_chars: int) -> str:
+    text = html.unescape(str(value or ""))
+    text = re.sub(r"^```(?:text|markdown)?\s*", "", text.strip(), flags=re.I)
+    text = re.sub(r"\s*```$", "", text)
+    text = re.sub(r"(?i)^\s*(?:Short文案|短视频文案|旁白|script)\s*[:：]\s*", "", text)
+    text = re.sub(r"\s+", " ", text).strip().strip('"')
+    limit = max(50, min(2000, int(max_chars or 350)))
+    if len(text) <= limit:
+        return text
+    prefix = text[:limit]
+    cut = max((prefix.rfind(mark) for mark in "。！？!?…"), default=-1)
+    if cut >= int(limit * 0.6):
+        return prefix[: cut + 1].strip()
+    return prefix.rstrip("，、；;:： ")
+
+
+def _fallback_prebuilt_short_script(novel: Novel, story_material: str, max_chars: int) -> str:
+    source = re.sub(r"\s+", " ", str(novel.full_text or story_material or "")).strip()
+    clean_title = _clean_display_title(novel.title)
+    if clean_title and source.startswith(clean_title):
+        source = source[len(clean_title):].strip()
+    return _clean_prebuilt_short_script(source, max_chars)
+
+
+def _looks_like_japanese_short_script(value: str) -> bool:
+    text = re.sub(r"\s+", "", str(value or ""))
+    kana_count = len(re.findall(r"[\u3040-\u30ff]", text))
+    return kana_count >= max(3, int(len(text) * 0.02))
+
+
+def _prebuilt_short_script_error(bundle: dict, required: bool, max_chars: int) -> str:
+    if not required:
+        return ""
+    script = str(bundle.get("short_script") or "").strip()
+    if len(script) < 30:
+        return "short_script is missing or too short"
+    if len(script) > max_chars:
+        return f"short_script exceeds {max_chars} chars"
+    if not _looks_like_japanese_short_script(script):
+        return "short_script must be natural Japanese only"
+    return ""
+
+
 def _candidate_tags(value) -> list[str]:
     rows = value if isinstance(value, list) else re.findall(r"#[^#\s【】]+", str(value or ""))
     tags: list[str] = []
@@ -4629,6 +4627,9 @@ def _parse_marketing_candidates(raw) -> dict:
         "tags": tags,
         "tag_line": "".join(tags),
         "series_short_title": series_short_title[:18],
+        "short_script": str(
+            data.get("short_script") or data.get("shorts_script") or data.get("Short文案") or ""
+        ).strip(),
     }
 
 
@@ -4729,6 +4730,9 @@ def _write_marketing_candidates_text(path: Path, bundle: dict) -> None:
     tags = _candidate_tags(bundle.get("tags") or bundle.get("tag_line") or [])
     if tags:
         rows.extend(["", "【タグ候補】", "", "".join(tags)])
+    short_script = str(bundle.get("short_script") or "").strip()
+    if short_script:
+        rows.extend(["", "【Short文案】", "", short_script])
     rows.append("")
     path.write_text("\n".join(rows), encoding="utf-8")
 
@@ -5076,10 +5080,21 @@ def stage_metadata(
     )
     min_chars = max(20, int(config.get("marketing_title_min_chars", 40) or 40))
     max_chars = max(min_chars, int(config.get("marketing_title_max_chars", 70) or 70))
+    prebuild_short_script = bool(config.get("short_video_prebuild_script_enabled", False))
+    short_script_max_chars = max(
+        50,
+        min(2000, int(config.get("short_video_script_max_chars", 350) or 350)),
+    )
     story_material = sampled_story_input(
         novel,
         list(segments or []),
-        int(config.get("storyboard_highlight_context_max_chars", 18000) or 18000),
+        int(config.get("storyboard_highlight_context_max_chars", 10000) or 10000),
+    )
+    expanded_story_material = sampled_story_input(
+        novel,
+        list(segments or []),
+        int(config.get("storyboard_highlight_context_max_chars", 10000) or 10000),
+        expand_to_limit=True,
     )
     route = _llm_route_settings()
     prompt = str(config.get("marketing_candidates_prompt", "") or "").strip()
@@ -5095,6 +5110,19 @@ def stage_metadata(
         "この範囲を超えるタイトルは返さず、文の途中で切らず、句読点または意味の完結する位置で"
         "内容を組み直してください。プログラム側でタイトルを途中切断することはありません。"
     )
+    if prebuild_short_script:
+        short_script_prompt = str(config.get("short_video_script_prompt", "") or "").strip()
+        prompt += (
+            "\n\n【Short文案も同時生成】冒頭・中盤・終盤の資料は事実確認の証拠であり、順番に要約・朗読する対象ではありません。"
+            "資料全体から作品の最も強い人物関係、危機、異常事態、秘密、逆転、未解決の選択を内部で抽出し、"
+            "視聴者が本編を見たくなる一段落のShort予告ナレーションへ再構成してください。最初の一文で最強の衝突・異常・結果を"
+            "直接提示し、その後は必要最小限の人物説明と危機の加速だけを書き、真相・反転・結末が明らかになる直前で止めてください。"
+            f"最大{short_script_max_chars}文字。出力本文は自然な日本語だけを使用し、中国語・英語・他言語を混ぜないでください。"
+            "資料ラベル、三段要約、タイトル、説明、番号、タグ、創作した設定は禁止です。"
+            f"追加方針：{short_script_prompt}\n"
+            "出力JSONには既存のtitles、synopses、tagsに加えて、必ず"
+            f"\"short_script\":\"最大{short_script_max_chars}文字の完成ナレーション\"を含めてください。"
+        )
     input_hash = _stable_hash({
         "schema": "marketing_candidates_v4_no_fallback_source_text",
         "source": story_material,
@@ -5105,6 +5133,9 @@ def stage_metadata(
         "min_chars": min_chars,
         "max_chars": max_chars,
         "ai_episode_title_enabled": ai_episode_title_enabled,
+        "prebuild_short_script": prebuild_short_script,
+        "short_script_max_chars": short_script_max_chars,
+        "short_script_prompt": config.get("short_video_script_prompt", ""),
     })
     candidates_path = job_dir / "marketing_candidates.json"
     cached = _read_json(candidates_path, {})
@@ -5113,7 +5144,12 @@ def stage_metadata(
         try:
             candidate = _parse_marketing_candidates(cached)
             candidate = _fit_marketing_title_lengths(candidate, max_chars)
-            if not (_marketing_validation_error(candidate, min_chars, max_chars) or _marketing_topic_error(candidate, novel.title, story_material)):
+            candidate["short_script"] = _clean_prebuilt_short_script(candidate.get("short_script", ""), short_script_max_chars)
+            if not (
+                _marketing_validation_error(candidate, min_chars, max_chars)
+                or _marketing_topic_error(candidate, novel.title, story_material)
+                or _prebuilt_short_script_error(candidate, prebuild_short_script, short_script_max_chars)
+            ):
                 bundle = candidate
                 on_log("  reuse 3 title / 2 synopsis marketing candidates")
         except Exception:
@@ -5144,15 +5180,19 @@ def stage_metadata(
                     max_tokens=int(config.get("marketing_candidates_max_tokens", 1600) or 1600),
                     timeout=180.0,
                 )
-                request = (
+                request_head = (
                     "以下は作品のタイトルと、冒頭・中盤・終盤から抽出した事実資料です。"
                     "この資料全体を根拠に、指定JSONだけを返してください。\n\n"
                     f"作品タイトル（事実確認用。出力しない）：{clean_title}\n"
                     f"既存の全体簡報：{json.dumps(story_context or {}, ensure_ascii=False)}\n\n"
-                    + f"冒頭・中盤・終盤の資料：\n{story_material}"
+                    + "冒頭・中盤・終盤の資料：\n"
                 )
                 for attempt in range(max_generation_attempts):
                     generation_attempts = attempt + 1
+                    # Start economical (about 2,000 chars × three samples).
+                    # If that result is unusable, retries receive the full
+                    # configured evidence cap rather than repeating it.
+                    material_for_attempt = expanded_story_material if attempt else story_material
                     retry_note = ""
                     if attempt:
                         if _is_transient_json_response_error(validation_error) and retry_delay_seconds > 0:
@@ -5172,16 +5212,20 @@ def stage_metadata(
                         with external_api_slot(action="marketing candidates"):
                             raw_output = llm.complete(
                                 prompt,
-                                request + retry_note,
+                                request_head + material_for_attempt + retry_note,
                                 max_tokens=int(config.get("marketing_candidates_max_tokens", 1600) or 1600),
                                 temperature=0.7,
                             ).strip()
                         candidate = _parse_marketing_candidates(raw_output)
                         candidate = _fit_marketing_title_lengths(candidate, max_chars)
+                        candidate["short_script"] = _clean_prebuilt_short_script(
+                            candidate.get("short_script", ""), short_script_max_chars
+                        )
                         last_candidate = candidate
                         validation_error = (
                             _marketing_validation_error(candidate, min_chars, max_chars)
                             or _marketing_topic_error(candidate, novel.title, story_material)
+                            or _prebuilt_short_script_error(candidate, prebuild_short_script, short_script_max_chars)
                         )
                     except Exception as exc:
                         candidate = {}
@@ -5200,6 +5244,15 @@ def stage_metadata(
         )
         if fallback_error:
             raise RuntimeError(f"本地标题兜底生成失败：{fallback_error}")
+        if prebuild_short_script:
+            fallback_short_script = _fallback_prebuilt_short_script(
+                novel, story_material, short_script_max_chars
+            )
+            if _looks_like_japanese_short_script(fallback_short_script):
+                bundle["short_script"] = fallback_short_script
+            else:
+                bundle["short_script"] = ""
+                on_log("  WARN 本地标题保底资料不是日语，未缓存Short文案；Short阶段将重新调用文本模型")
         if not ai_episode_title_enabled:
             on_log("  series setting disabled AI episode titles; using local source-derived titles")
         else:
@@ -5218,6 +5271,8 @@ def stage_metadata(
         "generation_attempts": generation_attempts,
         "validation_warning": validation_error,
         "raw_model_output": raw_output,
+        "short_script": str(bundle.get("short_script") or ""),
+        "short_script_max_chars": short_script_max_chars if prebuild_short_script else 0,
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     _write_json(candidates_path, bundle_record)
@@ -5236,7 +5291,18 @@ def stage_metadata(
         "story_brief": _metadata_intro(novel, story_context),
         "author": novel.author,
         "tags": str(config.youtube_tags or ""),
+        "short_script": str(bundle.get("short_script") or ""),
     }
+    if prebuild_short_script and metadata["short_script"]:
+        short_dir = job_dir / "shorts"
+        short_dir.mkdir(parents=True, exist_ok=True)
+        short_script_path = short_dir / "short_script.txt"
+        existing_short_script = (
+            short_script_path.read_text(encoding="utf-8", errors="ignore")
+            if short_script_path.exists() else ""
+        )
+        if existing_short_script != metadata["short_script"]:
+            short_script_path.write_text(metadata["short_script"], encoding="utf-8")
     _write_json(job_dir / "metadata.json", metadata)
     on_log(f"  marketing candidates: {len(bundle['titles'])} titles / {len(bundle['synopses'])} synopses")
     for index, value in enumerate(bundle["titles"], start=1):
@@ -6304,27 +6370,6 @@ def regenerate_job_cover(
         result["cover"] = str(cover)
         _write_json(result_path, result)
 
-    # Keep an already-exported delivery package in sync without re-exporting
-    # or touching its finished video.
-    try:
-        source_path = str(previous_status.get("source_path") or previous_status.get("input") or "")
-        source = Path(source_path).expanduser()
-        exported_directory = str(result.get("exported_directory") or "") if isinstance(result, dict) else ""
-        exported = Path(exported_directory).expanduser() if exported_directory else None
-        source_export = bool(
-            source.is_file()
-            and exported is not None
-            and exported.is_dir()
-            and exported.resolve() == source.parent.resolve()
-        )
-        if source.is_file() and (bool(config.get("output_to_input_directory", False)) or source_export):
-            base = safe_job_name(source.stem, fallback="article")
-            shutil.copy2(cover, source.parent.resolve() / f"{base}_cover{cover.suffix.lower() or '.jpg'}")
-        if exported is not None and exported.is_dir() and not source_export:
-            shutil.copy2(cover, exported / cover.name)
-    except Exception as exc:
-        on_log(f"  WARN regenerated cover could not be synced to the delivery folder: {redact_secret_text(exc)}")
-
     write_status(
         job_dir,
         stage=previous_stage,
@@ -6653,6 +6698,483 @@ def _stage_compose_manifest_impl(
         tmp.unlink(missing_ok=True)
     on_log(f"  OK video completed: {out}")
     return out
+
+
+_SHORT_RATIO_RE = re.compile(r"(?<!\d)16\s*[:：/]\s*9(?!\d)", re.I)
+_SHORT_DIMENSION_RE = re.compile(r"(?<!\d)(\d{3,4})\s*[x×✖]\s*(\d{3,4})(?!\d)", re.I)
+
+
+def _portrait_prompt_from_main(prompt: str, width: int, height: int) -> str:
+    """Change only explicit output ratio/size language in a main-scene prompt.
+
+    This intentionally does not run an LLM and does not touch people, actions,
+    locations, lighting, art style, or camera-shot terms such as ``wide shot``.
+    """
+    value = str(prompt or "").strip()
+    value, ratio_count = _SHORT_RATIO_RE.subn("9:16", value)
+
+    known_landscape_sizes = {
+        (1792, 1008), (1920, 1080), (1280, 720), (1536, 1024),
+        (int(config.get("image_width", 1792) or 1792), int(config.get("image_height", 1008) or 1008)),
+    }
+
+    def replace_dimension(match: re.Match) -> str:
+        source = (int(match.group(1)), int(match.group(2)))
+        if source in known_landscape_sizes or source[0] > source[1]:
+            separator = "×" if "×" in match.group(0) or "✖" in match.group(0) else "x"
+            return f"{int(width)}{separator}{int(height)}"
+        return match.group(0)
+
+    value, dimension_count = _SHORT_DIMENSION_RE.subn(replace_dimension, value)
+    # Only orientation adjectives that directly qualify an output/canvas
+    # declaration are replaced. Narrative/camera wording remains untouched.
+    value = re.sub(
+        r"(?i)\b(?:horizontal|landscape)(?=\s+(?:9\s*:\s*16|output|canvas|format|aspect\s+ratio))",
+        "portrait",
+        value,
+    )
+    value = re.sub(r"横向(?=(?:9\s*[:：]\s*16|输出|画布|尺寸|比例))", "竖向", value)
+    value = re.sub(r"横屏(?=(?:9\s*[:：]\s*16|输出|画布|尺寸|比例))", "竖屏", value)
+    if ratio_count == 0 and dimension_count == 0:
+        suffix = f"Output aspect ratio 9:16; output size {int(width)}x{int(height)}."
+        value = f"{value.rstrip(' .')}。 {suffix}" if value else suffix
+    return value
+
+
+def _sample_prompt_rows(rows: list[dict], count: int) -> list[dict]:
+    valid = [row for row in rows if isinstance(row, dict) and str(row.get("prompt") or "").strip()]
+    if not valid:
+        raise RuntimeError("主视频没有可沿用的插图文字提示词 prompts.json")
+    count = max(1, min(int(count or 1), len(valid)))
+    if count == 1:
+        return [valid[0]]
+    indexes = [round(i * (len(valid) - 1) / (count - 1)) for i in range(count)]
+    return [valid[index] for index in indexes]
+
+
+def _short_llm() -> LLMBackend:
+    route = _llm_route_settings()
+    if not _can_call_text_llm():
+        raise RuntimeError("独立制作Short需要可用的文本模型/API")
+    return LLMBackend(
+        provider=route["provider"],
+        base_url=route["base_url"],
+        api_key=route["api_key"],
+        model=route["model"],
+        system_prompt="You create grounded short-form narration and image prompts from supplied fiction only.",
+        style_suffix="",
+    )
+
+
+def _generate_short_script(novel: Novel, segments: list[Segment], short_dir: Path, on_log: LogFn) -> str:
+    prompt = str(config.get("short_video_script_prompt", "") or "").strip()
+    minimum = max(1, min(59, int(config.get("short_video_script_min_seconds", 45) or 45)))
+    maximum = max(minimum, min(60, int(config.get("short_video_script_max_seconds", 58) or 58)))
+    if bool(config.get("short_video_prebuild_script_enabled", False)):
+        cached_path = short_dir / "short_script.txt"
+        if cached_path.exists():
+            cached = _clean_prebuilt_short_script(
+                cached_path.read_text(encoding="utf-8", errors="ignore"),
+                int(config.get("short_video_script_max_chars", 350) or 350),
+            )
+            if len(cached) >= 30 and _looks_like_japanese_short_script(cached):
+                if cached != cached_path.read_text(encoding="utf-8", errors="ignore").strip():
+                    cached_path.write_text(cached, encoding="utf-8")
+                on_log(f"  Short文案：复用标题阶段预生成缓存（{len(cached)}字）")
+                return cached
+    evidence = sampled_story_input(novel, segments, 12000, expand_to_limit=True)
+    request = (
+        f"{prompt}\n\n"
+        f"今回のナレーションは必ず{minimum}秒以上、{maximum}秒以内に収めてください。\n"
+        "出力本文には自然な日本語だけを使用し、中国語・英語・他言語を混ぜないでください。\n\n"
+        f"小説の事実資料：\n{evidence}"
+    )
+    on_log(f"  Short文案：调用文本模型重写{minimum}–{maximum}秒旁白")
+    llm = _short_llm()
+    with external_api_slot(action="Short script"):
+        raw = llm.complete(llm.system_prompt, request, max_tokens=1200, temperature=0.35)
+    script = str(raw or "").strip()
+    script = re.sub(r"^```(?:text|markdown)?\s*", "", script, flags=re.I)
+    script = re.sub(r"\s*```$", "", script)
+    script = re.sub(r"(?i)^\s*(?:Short文案|短视频文案|旁白|script)\s*[:：]\s*", "", script).strip()
+    if len(script) < 30:
+        raise RuntimeError("文本模型返回的Short文案过短")
+    if not _looks_like_japanese_short_script(script):
+        raise RuntimeError("文本模型返回的Short文案不是自然日语，请检查模型或提示词")
+    (short_dir / "short_script.txt").write_text(script, encoding="utf-8")
+    return script
+
+
+def _rewrite_short_image_prompts(
+    script: str,
+    count: int,
+    character_analysis: dict | None,
+    on_log: LogFn,
+) -> list[str]:
+    template = str(config.get("short_video_image_prompt", "") or "").strip()
+    character_lock = ""
+    if isinstance(character_analysis, dict):
+        character_lock = "\n人物与画风锁定：\n" + json.dumps(character_analysis, ensure_ascii=False)[:7000]
+    request = (
+        f"{template}\n必须恰好输出{count}条prompts。\n\nShort旁白：\n{script}{character_lock}"
+    )
+    on_log(f"  Short插图：调用文本模型重写{count}条竖屏提示词")
+    llm = _short_llm()
+    with external_api_slot(action="Short image prompts"):
+        raw = llm.complete(llm.system_prompt, request, max_tokens=max(1200, count * 260), temperature=0.3)
+    payload = parse_json_object(raw)
+    values = payload.get("prompts")
+    if not isinstance(values, list):
+        raise RuntimeError("Short插图提示词没有返回 prompts 数组")
+    prompts = [str(value).strip() for value in values if str(value).strip()]
+    if len(prompts) != count:
+        raise RuntimeError(f"Short插图提示词数量不正确：需要{count}，实际{len(prompts)}")
+    suffix = str(config.get("short_video_portrait_suffix", "") or "").strip()
+    return [f"{prompt.rstrip(' .')}. {suffix}" if suffix else prompt for prompt in prompts]
+
+
+def _generate_short_images(
+    prompts: list[str],
+    short_dir: Path,
+    width: int,
+    height: int,
+    on_log: LogFn,
+    *,
+    source_rows: list[dict] | None = None,
+) -> list[Path]:
+    route = dict(_image_route_settings("scene"))
+    # The normal unified-image route carries the main landscape request size.
+    # Override it here so the provider itself receives the portrait dimensions.
+    route["request_width"] = int(width)
+    route["request_height"] = int(height)
+    negative = str(config.get("llm_negative_prompt", "") or "").strip(" ,")
+    backend = _make_image_backend(route)
+    image_dir = short_dir / "images"
+    image_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict | None] = [None] * len(prompts)
+    paths: list[Path | None] = [None] * len(prompts)
+    lock = threading.Lock()
+    timeout = _bounded_timeout(config.get("image_api_timeout_seconds", 300), 300.0)
+
+    def generate_one(index: int, prompt: str) -> tuple[int, Path]:
+        out = image_dir / f"img_{index:05d}.png"
+        cache_path = _image_cache_metadata_path(out)
+        cache_key = _image_cache_key(
+            route=route,
+            prompt=prompt,
+            negative_prompt=negative,
+            width=width,
+            height=height,
+            reference_paths=[],
+        )
+        meta = _read_json(cache_path, {})
+        expected_status = "placeholder" if route["provider"] == "placeholder" else "success"
+        reusable = (
+            out.exists() and out.stat().st_size >= 100 and isinstance(meta, dict)
+            and meta.get("status") == expected_status and meta.get("cache_key") == cache_key
+        )
+        if not reusable:
+            out.unlink(missing_ok=True)
+            last_error: Exception | None = None
+            attempts = max(1, min(10, int(config.get("image_retry_attempts", 5) or 5)))
+            for attempt in range(1, attempts + 1):
+                try:
+                    on_log(
+                        f"  Short image {index + 1}/{len(prompts)} provider={route['provider']} "
+                        f"size={width}x{height} attempt={attempt}"
+                    )
+                    if route["provider"] == "placeholder":
+                        backend.generate(prompt, negative, out, width=width, height=height)
+                    else:
+                        with external_api_slot(action=f"Short image {index + 1}", timeout_seconds=timeout):
+                            backend.generate(prompt, negative, out, width=width, height=height)
+                    if not out.exists() or out.stat().st_size < 100:
+                        raise RuntimeError("image backend returned no valid output file")
+                    _write_json(cache_path, {
+                        "schema": 1, "status": expected_status, "cache_key": cache_key,
+                        "provider": route["provider"], "base_url": route.get("base_url", ""),
+                        "model": route.get("model", ""), "file": _file_signature(out),
+                    })
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    out.unlink(missing_ok=True)
+                    on_log(f"  WARN Short图{index + 1}生成失败 {attempt}/{attempts}: {redact_secret_text(exc)}")
+                    time.sleep(attempt)
+            if not out.exists() or out.stat().st_size < 100:
+                raise RuntimeError(f"Short图{index + 1}生成失败：{redact_secret_text(last_error)}")
+        else:
+            on_log(f"  Short image {index + 1}/{len(prompts)} reuse cached file")
+        source = source_rows[index] if source_rows and index < len(source_rows) else {}
+        row = {
+            "index": index,
+            "prompt": prompt,
+            "source_main_index": source.get("index") if isinstance(source, dict) else None,
+            "source_main_prompt": source.get("prompt") if isinstance(source, dict) else "",
+            "width": int(width), "height": int(height),
+        }
+        with lock:
+            rows[index] = row
+            _write_json(short_dir / "prompts.json", [item for item in rows if item is not None])
+        return index, out
+
+    workers = _parallel_limit("max_parallel_images", 2, len(prompts), hard_cap=8)
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="short-image") as pool:
+        futures = [pool.submit(generate_one, index, prompt) for index, prompt in enumerate(prompts)]
+        for future in as_completed(futures):
+            index, out = future.result()
+            paths[index] = out
+    final = [path for path in paths if path is not None]
+    if len(final) != len(prompts):
+        raise RuntimeError("Short图片没有全部生成")
+    return final
+
+
+def _clip_short_timeline(
+    segments: list[Segment], durations: list[float], maximum: float,
+) -> tuple[list[Segment], list[float]]:
+    remaining = max(0.1, min(60.0, float(maximum)))
+    kept_segments: list[Segment] = []
+    kept_durations: list[float] = []
+    for segment, raw_duration in zip(segments, durations):
+        if remaining <= 0.05:
+            break
+        duration = min(max(0.05, float(raw_duration)), remaining)
+        kept_segments.append(segment)
+        kept_durations.append(duration)
+        remaining -= duration
+    return kept_segments, kept_durations
+
+
+def stage_short_video(
+    novel: Novel,
+    segments: list[Segment],
+    main_video: Path,
+    job_dir: Path,
+    character_analysis: dict | None = None,
+    on_log: LogFn = _noop,
+    *,
+    force: bool = False,
+) -> Path | None:
+    if not bool(config.get("short_video_enabled", False)):
+        return None
+    short_dir = job_dir / "shorts"
+    short_dir.mkdir(parents=True, exist_ok=True)
+    out = short_dir / "short.mp4"
+    manifest_path = short_dir / "manifest.json"
+    mode = str(config.get("short_video_mode", "reuse_main") or "reuse_main")
+    width = max(2, int(config.get("short_video_width", 1080) or 1080) // 2 * 2)
+    height = max(2, int(config.get("short_video_height", 1920) or 1920) // 2 * 2)
+    maximum = max(1.0, min(60.0, float(config.get("short_video_duration_seconds", 58) or 58)))
+    if force:
+        out.unlink(missing_ok=True)
+        manifest_path.unlink(missing_ok=True)
+    on_log(f"[Short] mode={mode} output={width}x{height} max={maximum:.1f}s")
+
+    if mode == "reuse_main":
+        input_hash = _stable_hash({
+            "kind": "short_reuse_main_v1", "source": _file_signature(main_video),
+            "duration": maximum, "width": width, "height": height,
+            "fps": int(config.get("video_fps", 30) or 30),
+            "blur": float(config.get("short_video_blur_sigma", 28.0) or 28.0),
+            "encoder": config.get("video_encoder", "libx264"),
+            "quality": config.get("video_encoder_quality", 20),
+        })
+        manifest = _read_json(manifest_path, {})
+        if out.exists() and manifest.get("input_hash") == input_hash:
+            on_log(f"  reuse completed Short: {out}")
+            return out
+        build_blurred_portrait_short(
+            main_video, out, on_log, duration=maximum, width=width, height=height,
+            fps=int(config.get("video_fps", 30) or 30),
+            blur_sigma=float(config.get("short_video_blur_sigma", 28.0) or 28.0),
+            video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
+            video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
+            video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
+        )
+        _write_json(manifest_path, {
+            "schema": 1, "status": "ready", "mode": mode, "input_hash": input_hash,
+            "video": str(out), "duration": round(_audio_duration(out), 3),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        on_log(f"  OK Short completed: {out}")
+        return out
+
+    if mode != "independent":
+        raise RuntimeError(f"未知Short制作模式：{mode}")
+
+    maximum = min(
+        maximum,
+        max(1.0, min(60.0, float(config.get("short_video_script_max_seconds", 58) or 58))),
+    )
+    prompt_mode = str(config.get("short_video_image_prompt_mode", "reuse_main") or "reuse_main")
+    independent_hash = _stable_hash({
+        "kind": "short_independent_v1",
+        "novel": _text_hash(novel.full_text),
+        "segments": [_text_hash(segment.text) for segment in segments],
+        "script_prompt": config.get("short_video_script_prompt", ""),
+        "script_seconds": [config.get("short_video_script_min_seconds", 45), maximum],
+        "prebuild_script": config.get("short_video_prebuild_script_enabled", False),
+        "script_max_chars": config.get("short_video_script_max_chars", 350),
+        "cached_script": _file_signature(short_dir / "short_script.txt"),
+        "image_prompt_mode": prompt_mode,
+        "image_prompt": config.get("short_video_image_prompt", ""),
+        "portrait_suffix": config.get("short_video_portrait_suffix", ""),
+        "main_prompts": _file_signature(job_dir / "prompts.json"),
+        "character_analysis": character_analysis or {},
+        "image": {
+            "count": config.get("short_video_image_count", 6),
+            "width": config.get("short_video_image_width", 1024),
+            "height": config.get("short_video_image_height", 1792),
+            "route": {key: value for key, value in _image_route_settings("scene").items() if key != "api_key"},
+        },
+        "tts": _tts_config_hash(),
+        "video": {
+            "width": width, "height": height, "fps": config.get("video_fps", 30),
+            "motion": config.get("video_motion", "none"), "transition": config.get("video_transition", "none"),
+            "subtitle_size": config.get("short_video_subtitle_size", 58),
+            "subtitle_margin": config.get("short_video_subtitle_margin_v", 300),
+        },
+    })
+    existing_manifest = _read_json(manifest_path, {})
+    if out.exists() and existing_manifest.get("status") == "ready" and existing_manifest.get("input_hash") == independent_hash:
+        on_log(f"  reuse completed Short: {out}")
+        return out
+
+    script = _generate_short_script(novel, segments, short_dir, on_log)
+    short_segments = split_segments(script, target_min=35, target_max=80)
+    if not short_segments:
+        raise RuntimeError("Short文案无法切分为配音段")
+    _write_json(short_dir / "segments.json", [{"i": s.index, "text": s.text} for s in short_segments])
+    audios, durations = stage_tts(short_segments, short_dir, on_log=on_log)
+    original_short_audio_seconds = sum(max(0.0, float(value)) for value in durations)
+    short_segments, durations = _clip_short_timeline(short_segments, durations, maximum)
+    if not short_segments:
+        raise RuntimeError("Short配音时长无效")
+    if original_short_audio_seconds > maximum + 0.05:
+        on_log(
+            f"  Short配音 {original_short_audio_seconds:.1f}s 超过上限 {maximum:.1f}s；"
+            "成片在上限位置直接截断"
+        )
+    audio_full = short_dir / "audio_full.mp3"
+    concat_audios(audios, audio_full, on_log)
+
+    requested_count = max(1, min(30, int(config.get("short_video_image_count", 6) or 6)))
+    plans = plan_images(short_segments, durations, mode="fixed_count", fixed_count=requested_count)
+    count = len(plans)
+    if count < 1:
+        raise RuntimeError("Short图片时间轴为空")
+    image_width = max(16, int(config.get("short_video_image_width", 1024) or 1024))
+    image_height = max(16, int(config.get("short_video_image_height", 1792) or 1792))
+    source_rows: list[dict] | None = None
+    if prompt_mode == "reuse_main":
+        main_rows = _read_json(job_dir / "prompts.json", [])
+        source_rows = _sample_prompt_rows(main_rows if isinstance(main_rows, list) else [], count)
+        if len(source_rows) != count:
+            plans = plan_images(short_segments, durations, mode="fixed_count", fixed_count=len(source_rows))
+            count = len(plans)
+            source_rows = _sample_prompt_rows(main_rows if isinstance(main_rows, list) else [], count)
+        prompts = [
+            _portrait_prompt_from_main(str(row.get("prompt") or ""), image_width, image_height)
+            for row in source_rows
+        ]
+        on_log("  Short插图提示词：本地仅替换主视频提示词中的输出比例/尺寸，不调用文本AI")
+    elif prompt_mode == "rewrite":
+        prompts = _rewrite_short_image_prompts(script, count, character_analysis, on_log)
+    else:
+        raise RuntimeError(f"未知Short插图提示词来源：{prompt_mode}")
+    images = _generate_short_images(
+        prompts, short_dir, image_width, image_height, on_log, source_rows=source_rows,
+    )
+    image_durations = [float(plan.duration) for plan in plans]
+    if not images or len(images) != len(image_durations):
+        raise RuntimeError("Short图片数量与时间轴不一致")
+    subs: list[tuple[float, float, str]] = []
+    cursor = 0.0
+    for segment, duration in zip(short_segments, durations):
+        end = cursor + max(0.05, float(duration))
+        subs.append((cursor, end, segment.text))
+        cursor = end
+    ass_path = short_dir / "short_subtitle.ass"
+    build_ass(
+        subs, ass_path,
+        font=config.video_subtitle_font,
+        size=int(config.get("short_video_subtitle_size", 58) or 58),
+        video_w=width, video_h=height, position="下边",
+        primary_color=config.get("video_subtitle_color", "#FFFFFF"),
+        outline_color=config.get("video_subtitle_outline_color", "#000000"),
+        back_color=config.get("video_subtitle_back_color", "#000000"),
+        outline=float(config.get("video_subtitle_outline", 4.0) or 4.0),
+        shadow=float(config.get("video_subtitle_shadow", 1.0) or 1.0),
+        margin_v=int(config.get("short_video_subtitle_margin_v", 300) or 300),
+        margin_lr=int(config.get("video_subtitle_margin_lr", 56) or 56),
+        bold=bool(config.get("video_subtitle_bold", False)),
+        italic=bool(config.get("video_subtitle_italic", False)),
+        chars_per_line=int(config.get("short_video_subtitle_chars_per_line", 13) or 13),
+        max_lines=int(config.get("short_video_subtitle_max_lines", 2) or 2),
+    )
+    build_srt(
+        subs, short_dir / "short_subtitle.srt",
+        chars_per_line=int(config.get("short_video_subtitle_chars_per_line", 13) or 13),
+        max_lines=int(config.get("short_video_subtitle_max_lines", 2) or 2),
+    )
+    tmp = out.with_name(out.stem + ".tmp" + out.suffix)
+    tmp.unlink(missing_ok=True)
+    try:
+        build_video(
+            images=images, image_durations=image_durations, audio_path=audio_full,
+            out_path=tmp, on_log=on_log, width=width, height=height,
+            fps=int(config.get("video_fps", 30) or 30), ken_burns=bool(config.ken_burns),
+            subtitle_ass=ass_path,
+            bgm_path=Path(config.video_bgm_path) if config.video_bgm_path else None,
+            bgm_volume=float(config.video_bgm_volume), long_mode=bool(config.video_long_mode),
+            cleanup_temp=bool(config.video_cleanup_temp), motion=str(config.video_motion or "none"),
+            motion_curve=str(config.get("video_motion_curve", "ease") or "ease"),
+            motion_cycle_seconds=float(config.get("video_motion_cycle_seconds", 0.0) or 0.0),
+            transition=str(config.video_transition or "none"),
+            transition_duration=float(config.video_transition_duration or 0.4),
+            video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
+            video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
+            video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20),
+        )
+        if not tmp.exists() or _audio_duration(tmp) <= 0.05:
+            raise RuntimeError("Short合成结果无效")
+        tmp.replace(out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    _write_json(manifest_path, {
+        "schema": 1, "status": "ready", "mode": mode,
+        "prompt_mode": prompt_mode, "input_hash": independent_hash, "video": str(out),
+        "duration": round(_audio_duration(out), 3), "script": str(short_dir / "short_script.txt"),
+        "image_count": len(images), "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    on_log(f"  OK Short completed: {out}")
+    return out
+
+
+def regenerate_job_short(job_id: str, on_log: LogFn = _noop) -> Path:
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再重新生成Short。")
+    job_dir = _safe_job_path(job_id)
+    novel = _read_saved_novel(job_dir / "novel.json")
+    segments = _read_saved_segments(job_dir / "segments.json")
+    if novel is None or segments is None:
+        raise RuntimeError("任务缺少小说正文或文本切片，无法生成Short")
+    main_video = video_output_path(job_dir)
+    if not main_video.exists() and (job_dir / "final.mp4").exists():
+        main_video = job_dir / "final.mp4"
+    if not main_video.exists():
+        raise RuntimeError("任务还没有主视频，无法生成Short")
+    character_analysis = _read_json(job_dir / "character_profiles.json", {})
+    result = stage_short_video(
+        novel, segments, main_video, job_dir,
+        character_analysis=character_analysis if isinstance(character_analysis, dict) else None,
+        on_log=on_log, force=True,
+    )
+    if result is None:
+        raise RuntimeError("请先在流水线配置中开启“生成Short视频”")
+    write_status(job_dir, short_video=str(result), short_error="")
+    return result
 
 
 def stage_upload(
@@ -7546,16 +8068,33 @@ def run_full(
             require_active_stage=False,
         )
         video = timed("8_compose", stage_compose, audios, durs, segments, plans, images, job_dir, on_log=log)
-        exported_directory = export_completed_video(
-            video,
-            cover,
-            novel.title,
-            str(metadata.get("short_title", "") or ""),
-            source_path=str(_read_json(job_dir / "status.json", {}).get("source_path") or _read_json(job_dir / "status.json", {}).get("input") or ""),
-            on_log=log,
-        )
         if tts_redo_reuse_images:
             (job_dir / TTS_REDO_REUSE_IMAGES_FILE).unlink(missing_ok=True)
+        short_video = None
+        short_error = ""
+        if bool(config.get("short_video_enabled", False)):
+            progress("short", 0.94, title=novel.title, video=str(video), cover=str(cover or ""))
+            try:
+                short_video = timed(
+                    "8b_short",
+                    stage_short_video,
+                    novel,
+                    segments,
+                    video,
+                    job_dir,
+                    character_analysis,
+                    log,
+                )
+            except Exception as exc:
+                # A Short is an optional sibling artifact. Its failure must not
+                # discard a successfully completed main video or block upload.
+                short_error = redact_secret_text(exc)
+                log(f"  WARN Short生成失败，主视频继续完成：{short_error}")
+                _write_json(job_dir / "shorts" / "manifest.json", {
+                    "schema": 1, "status": "failed", "error": short_error,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                write_status(job_dir, short_video="", short_error=short_error)
         youtube_url = ""
         if bool(config.upload_enabled):
             progress("upload", 0.96, title=novel.title, short_title=metadata.get("short_title", ""), video=str(video), cover=str(cover or ""))
@@ -7567,7 +8106,8 @@ def run_full(
             "job_id": job_id,
             "job_dir": str(job_dir),
             "video": str(video),
-            "exported_directory": str(exported_directory or ""),
+            "short_video": str(short_video or ""),
+            "short_error": short_error,
             "cover": str(cover or ""),
             "title": novel.title,
             "short_title": metadata.get("short_title", ""),
@@ -7584,6 +8124,8 @@ def run_full(
             title=novel.title,
             short_title=metadata.get("short_title", ""),
             video=str(video),
+            short_video=str(short_video or ""),
+            short_error=short_error,
             cover=str(cover or ""),
             youtube_url=youtube_url,
             worker_pid=None,
@@ -7675,12 +8217,13 @@ def _fallback_storyboard_prompt(text: str) -> str:
     prefix = str(config.get("llm_image_prompt_prefix", "") or "").strip()
     prompt = (
         f"{prefix} "
-        "Depict mainland Chinese late Han dynasty people and places only: Chinese facial features, Han robes and armor, "
-        "Chinese palace, village, battlefield, banners, and weapons; never Japanese people, kimono, samurai, shrine, or Japan setting. "
+        "Depict only the story's stated world, era, characters, costumes, and setting. "
+        "Keep the Japanese isekai light-novel illustration style and do not import people, places, or historical eras "
+        "from an unrelated story. "
         f"{config.llm_image_style_suffix}. "
         # Keep the concrete narration at the end: the safe prompt length cap
         # intentionally preserves the tail as well as the global style lock.
-        f"Scene-specific Three Kingdoms event to depict: {excerpt}."
+        f"Scene-specific event to depict: {excerpt}."
     )
     return _policy_safe_image_prompt(prompt, fallback_text="")
 

@@ -28,6 +28,7 @@
 | 剧情图 | 图片与提示词 | `app/backends/image.py`, `app/pipeline_runner.py` | `images/`, `prompts.json` |
 | 封面 | 封面配置 | `app/backends/image.py`, `app/pipeline_runner.py` | `cover/` |
 | 合成视频 | 字幕/视频配置 | `app/stages/stage6_compose.py`, `app/pipeline_runner.py` | `{输入文件名}.mp4`, `subtitle.srt` |
+| Short竖屏视频 | Short 竖屏短视频 | `app/stages/stage6_compose.py`, `app/pipeline_runner.py` | `shorts/short.mp4`, `shorts/prompts.json` |
 | 浏览器上传 | 批量与上传 | `app/upload.py`, `app/vendor/stage5_upload_browser.py` | `upload_result.json` |
 | 依赖检测 | 依赖检测 | `app/dependency_manager.py`, `scripts/setup_macos.sh` | `data/dependency_report.json` |
 
@@ -71,6 +72,11 @@ GUI 里的 `人设图 workflow(仅 ComfyUI)`、`剧情参考 workflow(仅 ComfyU
 | `llm_image_prompt_prefix` | 每张剧情图的通用前缀 | 会拼到剧情图提示词前 |
 | `llm_storyboard_prompt` | 剧情图 AI 分析的系统提示词 | 控制分镜图分析规则 |
 | `llm_storyboard_user_template` | 剧情图 AI 分析的用户模板 | `{prefix}`, `{style}`, `{index}`, `{text}` |
+| `short_video_script_prompt` | 独立制作Short时重写45–58秒旁白 | 小说开头、中段、结尾的平衡采样 |
+| `short_video_prebuild_script_enabled` | 在标题/概梗的同一次模型请求中预生成Short文案 | 开关，无模板变量 |
+| `short_video_script_max_chars` | 标题阶段预生成Short文案的最大字数，默认350 | 数字上限 |
+| `short_video_image_prompt` | 选择“重写Short专用提示词”时生成竖屏分镜提示词 | Short旁白、人物与画风锁定 |
+| `short_video_portrait_suffix` | 只追加到重写得到的Short插图提示词 | 固定9:16竖屏构图要求 |
 | `cover_prompt_template` | 封面生成的题材模板 | `{title}`, `{excerpt}`, `{titles}`, `{synopses}`, `{style}`, `{custom}` |
 | `cover_custom_prompt` | 封面模板里的自定义方向 | 由 `{custom}` 引用 |
 | `cover_ai_analysis_prompt` | 封面题材 AI 分析模板 | 全部标题和概梗 |

@@ -25,7 +25,7 @@ JOBS_DIR.mkdir(exist_ok=True)
 PROFILES_DIR.mkdir(exist_ok=True)
 
 
-SETTINGS_SCHEMA_VERSION = 42
+SETTINGS_SCHEMA_VERSION = 47
 DEFAULT_YOUTUBE_TITLE_TEMPLATE = "{candidate_title}"
 DEFAULT_YOUTUBE_DESCRIPTION = ""
 
@@ -161,7 +161,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
     # 视频生图解决方案1：把秒数作为图片数量预算，每个预算窗口只选择一个旁白高光点。
     "storyboard_highlight_enabled": True,
-    "storyboard_highlight_context_max_chars": 18000,
+    "storyboard_highlight_context_max_chars": 10000,
     "storyboard_highlight_max_segments": 3,
     "storyboard_highlight_align_timeline": True,
 
@@ -448,13 +448,47 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "video_bgm_volume": 0.15,
     "video_long_mode": True,
     "video_cleanup_temp": True,
-    # Optional delivery folder.  The job copy remains in data/jobs so a task
-    # can still resume or upload later; completed videos are copied here too.
-    "output_directory": "",
-    # When importing local text, optionally deliver the finished assets next
-    # to that input file instead of to one shared output directory.
-    "output_to_input_directory": False,
 
+    # Short vertical video. Disabled by default so upgrading an existing
+    # installation never creates unexpected text/image API calls.
+    "short_video_enabled": False,
+    "short_video_mode": "reuse_main",  # reuse_main / independent
+    "short_video_duration_seconds": 58,
+    "short_video_width": 1080,
+    "short_video_height": 1920,
+    "short_video_blur_sigma": 28.0,
+    "short_video_script_min_seconds": 45,
+    "short_video_script_max_seconds": 58,
+    "short_video_prebuild_script_enabled": False,
+    "short_video_script_max_chars": 350,
+    "short_video_image_count": 6,
+    "short_video_image_width": 1024,
+    "short_video_image_height": 1792,
+    "short_video_image_prompt_mode": "reuse_main",  # reuse_main / rewrite
+    "short_video_script_prompt": (
+        "入力は、同じ小説の冒頭・中盤・終盤から抽出した事実資料です。資料の順番どおりに朗読・要約せず、"
+        "三段構成のあらすじや原文の機械的な継ぎ合わせにもしないでください。まず内部で、作品全体から視聴者を最も"
+        "引きつける核心――主人公の境遇、重要な人物関係、最大の対立、異常事態、秘密、逆転、結末直前の謎――を"
+        "見極め、それらの精髄を一本のShort予告ナレーションへ再構成してください。最初の一文で最も強い対立、"
+        "異常な事実、衝撃的な結果のいずれかを直ちに提示し、その後は人物と危機を短く明確に伝えながら緊張を高め、"
+        "真相、決断、逆転、結末が明らかになる直前で止め、続きを強く見たくさせてください。出力は、そのまま音声化"
+        "できる自然な日本語の一段落だけにしてください。中国語・英語・他言語を混ぜず、タイトル、説明、タグ、"
+        "番号、絵コンテ、冒頭・中盤・終盤という資料ラベル、『この物語は』のような前置きを出力しないでください。"
+        "原作の事実を厳守し、存在しない人物、能力、事件、設定、結末を追加しないでください。"
+    ),
+    "short_video_image_prompt": (
+        "根据Short旁白拆分竖屏分镜。每张图必须描述人物身份、外貌、服装、动作、情绪、场景、镜头景别与光线；"
+        "保持人物设定连续。主体放在画面中央安全区域，避免关键信息贴近顶部、底部和右侧按钮区。"
+        "只输出严格JSON对象：{\"prompts\":[\"prompt 1\",\"prompt 2\"]}，不要Markdown和解释。"
+    ),
+    "short_video_portrait_suffix": (
+        "portrait 9:16 composition, vertical canvas, full-height environment, "
+        "subject inside the center safe area, no letterbox, no landscape canvas, no text"
+    ),
+    "short_video_subtitle_size": 58,
+    "short_video_subtitle_margin_v": 300,
+    "short_video_subtitle_chars_per_line": 13,
+    "short_video_subtitle_max_lines": 2,
     "max_concurrent_jobs": 1,
     "max_concurrent_external_api": 2,
     "max_concurrent_ffmpeg": 1,
@@ -780,10 +814,6 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             "tts_auto_pronunciation_max_terms",
         ):
             data.setdefault(key, DEFAULT_SETTINGS[key])
-    if saved_version < 21:
-        data.setdefault("output_directory", DEFAULT_SETTINGS["output_directory"])
-    if saved_version < 22:
-        data.setdefault("output_to_input_directory", DEFAULT_SETTINGS["output_to_input_directory"])
     if saved_version < 23:
         for key in (
             "marketing_title_min_chars",
@@ -903,6 +933,37 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
             "ai_rewrite_user_template",
         ):
             data.pop(key, None)
+    if saved_version < 43:
+        # Delivery-folder export has been retired.  Remove legacy profile
+        # values so they cannot create an unexpected extra copy again.
+        data.pop("output_directory", None)
+        data.pop("output_to_input_directory", None)
+    if saved_version < 44:
+        for key in (
+            "short_video_enabled", "short_video_mode", "short_video_duration_seconds",
+            "short_video_width", "short_video_height", "short_video_blur_sigma",
+            "short_video_script_min_seconds", "short_video_script_max_seconds",
+            "short_video_image_count", "short_video_image_width", "short_video_image_height",
+            "short_video_image_prompt_mode", "short_video_script_prompt",
+            "short_video_image_prompt", "short_video_portrait_suffix",
+            "short_video_subtitle_size", "short_video_subtitle_margin_v",
+            "short_video_subtitle_chars_per_line", "short_video_subtitle_max_lines",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 45:
+        for key in (
+            "short_video_prebuild_script_enabled",
+            "short_video_script_max_chars",
+        ):
+            data.setdefault(key, DEFAULT_SETTINGS[key])
+    if saved_version < 46:
+        old_short_prompt = str(data.get("short_video_script_prompt") or "")
+        if old_short_prompt.startswith("请从小说全文中选取一个冲突最强、能够独立理解的情节"):
+            data["short_video_script_prompt"] = DEFAULT_SETTINGS["short_video_script_prompt"]
+    if saved_version < 47:
+        old_short_prompt = str(data.get("short_video_script_prompt") or "")
+        if old_short_prompt.startswith("输入是同一部小说从开头、中段和结尾提取的事实资料"):
+            data["short_video_script_prompt"] = DEFAULT_SETTINGS["short_video_script_prompt"]
     # Cover prompts describe aspect ratio only. Older profiles hard-coded a
     # pixel size even when the GUI's actual cover dimensions were different.
     for key in ("cover_prompt_template", "cover_ai_analysis_prompt", "cover_poster_method_prompt"):

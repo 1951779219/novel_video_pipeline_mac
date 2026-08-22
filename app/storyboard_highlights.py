@@ -60,8 +60,20 @@ def parse_json_object(raw: str) -> dict[str, Any]:
     return value
 
 
-def sampled_story_input(novel: Novel, segments: list[Segment], max_chars: int) -> str:
-    limit = max(3000, int(max_chars or 18000))
+def sampled_story_input(
+    novel: Novel,
+    segments: list[Segment],
+    max_chars: int,
+    *,
+    expand_to_limit: bool = False,
+) -> str:
+    """Return balanced title/context evidence without routinely sending the full cap.
+
+    Long stories normally use compact beginning/middle/end samples.  A caller can
+    explicitly expand a retry up to its configured cap when compact evidence did
+    not yield a usable result.
+    """
+    limit = max(3000, int(max_chars or 10000))
     rows = [s.text.strip() for s in segments if s.text.strip()]
     if not rows:
         rows = [str(novel.full_text or "").strip()]
@@ -71,7 +83,10 @@ def sampled_story_input(novel: Novel, segments: list[Segment], max_chars: int) -
     if len(joined) <= budget:
         return header + joined
     # Sample beginning/middle/end so a long article is not represented only by its opening.
-    part = max(300, budget // 3)
+    # A normal pass needs only enough evidence to establish the hook, turn and
+    # outcome.  Do not consume the full context budget merely because it is
+    # available; retries may opt into the full cap.
+    part = max(300, budget // 3) if expand_to_limit else min(2000, max(500, budget // 3))
     middle = max(0, len(joined) // 2 - part // 2)
     return header + "[开头]\n" + joined[:part] + "\n[中段]\n" + joined[middle : middle + part] + "\n[结尾]\n" + joined[-part:]
 

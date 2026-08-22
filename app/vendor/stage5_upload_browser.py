@@ -769,14 +769,15 @@ def _run_upload_session(job, config, video_path, title, cover_path,
                 return "CHROME_CRASH"
             ctx = browser.contexts[0] if browser.contexts else browser.new_context()
 
+        upload_page = None
         try:
-            page = None
-            for p in ctx.pages:
-                if "studio.youtube.com" in p.url:
-                    page = p
-                    break
-            if page is None:
-                page = ctx.new_page()
+            # Keep the signed-in Studio tab and the Chrome process intact.
+            # Each item gets its own temporary upload tab, which is closed
+            # only after that item finishes (or fails).  The next item can
+            # immediately open another tab in this already-running browser.
+            upload_page = ctx.new_page()
+            page = upload_page
+            on_log("已打开本条视频的上传标签页（Chrome 和登录状态会继续保留）")
             _reset_youtube_studio_runtime_cache(ctx, page, on_log)
 
             _MAX_UPLOAD_RETRY = 3
@@ -846,6 +847,13 @@ def _run_upload_session(job, config, video_path, title, cover_path,
             on_log("❌ 上传重试 3 次均失败")
             return None
         finally:
+            if upload_page is not None:
+                try:
+                    if not upload_page.is_closed():
+                        upload_page.close()
+                        on_log("本条上传标签页已关闭；Chrome 保持打开，准备下一条上传")
+                except Exception:
+                    pass
             # Never call browser.close() for a browser attached over CDP: it
             # sends Browser.close and kills the user's signed-in debug Chrome.
             # Leaving the sync_playwright block disconnects the client cleanly.
@@ -2525,7 +2533,7 @@ def _click_schedule_checking_notice(page) -> Optional[dict]:
 def _schedule_upload_immediately(page, job, scheduled_at: str,
                                  on_log: Callable, on_progress: Callable,
                                  timeout: int, upload_state: dict = None) -> Optional[str]:
-    """Complete Studio's scheduled-publish flow without waiting for checks.
+    """Complete Studio's scheduled-publish flow after a short upload settle period.
 
     Expected UI sequence:
       Schedule -> optional "still checking" / Got it notice ->
@@ -2541,7 +2549,7 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
         on_log("上传已取消")
         return None
 
-    on_log("日期和时间已填写，立即点击预定（不等待上传或检查完成）...")
+    on_log("日期和时间已填写，点击预定后会等待上传稳定再继续...")
     page.wait_for_timeout(700)
 
     def response_state() -> str:
@@ -2650,12 +2658,18 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
         return None
 
     _emit_upload_progress(upload_state, 88, on_progress)
-    on_log("等待预约提示或成功确认弹窗...")
-    # Acknowledging/closing Studio's post-schedule UI is best effort.  Do not
-    # let a lingering processing dialog hold up the rest of a batch.
-    cleanup_deadline = min(deadline, time.time() + 8)
+    # The Schedule action is often accepted while the file is still uploading
+    # (for example, Studio may show 61% with seconds remaining).  Keep this
+    # page alive for 30 seconds before dismissing its dialogs or moving to the
+    # next item, so Studio can finish committing the upload.  The total wait
+    # is capped at 35 seconds, preserving batch throughput if processing is
+    # slow or the UI does not expose a reliable percentage.
+    settle_until = min(deadline, time.time() + 30)
+    cleanup_deadline = min(deadline, time.time() + 35)
+    on_log("预约已提交，等待约 30 秒让 YouTube 上传并保存，再关闭页面进入下一个视频...")
 
     notice_logged = False
+    settle_logged = False
     while time.time() < cleanup_deadline:
         if job.is_cancelled():
             on_log("上传已取消")
@@ -2702,14 +2716,31 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
             const link = dialog.querySelector(
                 'a[href*="youtu.be"], a[href*="watch?v="], a[href*="shorts/"]'
             );
-            return { text, href: link ? link.href : '' };
+            return {
+                text,
+                href: link ? link.href : '',
+                // This is the explicit file-transfer completion state shown
+                // by Studio ("上传完毕 … 即将开始处理").  Processing may
+                // continue server-side, but the browser can safely move on.
+                uploadComplete: /上传完毕|上傳完畢|upload complete|upload finished/i.test(text),
+            };
             }""")
         except Exception as exc:
             on_log(f"  ⚠️ 预约已提交后无法继续读取 Studio 弹窗：{exc}；不重传该视频")
             _emit_upload_progress(upload_state, 100, on_progress)
             return "scheduled"
         if processing_info:
-            on_log("检测到“正在处理视频”弹窗，预约信息已被 YouTube 接受")
+            upload_complete = bool(processing_info.get("uploadComplete", False))
+            if time.time() < settle_until and not upload_complete:
+                if not settle_logged:
+                    on_log("检测到“正在处理视频”，继续等待上传稳定，不关闭此页面")
+                    settle_logged = True
+                page.wait_for_timeout(1_000)
+                continue
+            if upload_complete:
+                on_log("检测到“上传完毕，即将开始处理”，文件已上传完成，立即关闭页面并继续下一个视频")
+            else:
+                on_log("检测到“正在处理视频”弹窗，预约信息已被 YouTube 接受")
             href = str(processing_info.get("href") or "")
             video_id = None
             match = re.search(
@@ -2765,6 +2796,16 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
             _emit_upload_progress(upload_state, 100, on_progress)
             return "scheduled"
         if not confirmation:
+            if time.time() < settle_until and not settle_logged:
+                on_log("等待 YouTube 完成上传/保存状态...")
+                settle_logged = True
+            page.wait_for_timeout(500)
+            continue
+
+        if time.time() < settle_until:
+            if not settle_logged:
+                on_log("已出现预约确认，仍等待上传稳定后再关闭页面")
+                settle_logged = True
             page.wait_for_timeout(500)
             continue
 
@@ -2789,7 +2830,7 @@ def _schedule_upload_immediately(page, job, scheduled_at: str,
         return video_id or "scheduled"
 
     target_label = str(scheduled_at or "").replace("T", " ")
-    on_log(f"  ✓ 已点击预定（目标 {target_label}）；收尾弹窗未在 8 秒内完成，自动继续下一个视频且不重传")
+    on_log(f"  ✓ 已点击预定（目标 {target_label}）；已等待上传稳定，收尾弹窗未完成，自动继续下一个视频且不重传")
     _emit_upload_progress(upload_state, 100, on_progress)
     return "scheduled"
 
