@@ -277,7 +277,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "完成した動画タイトルを必ず3案作り、各40〜70文字程度、3案は構成と切り口を変えてください。"
         "概要欄用あらすじを必ず2案作り、各80〜160文字程度、事件・関係性・主人公の状況を入れ、結末を全部"
         "書かず、2案は切り口を変えてください。内容に一致するタグを10〜15個作ってください。"
-        "【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。\n\n"
+        "【朗読・小説】、#日本語・#日语・#Japaneseなど言語名だけのタグは付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。\n\n"
         "必ず次のJSONオブジェクトだけを出力し、Markdown、説明、作品タイトル、判定結果、推理過程を付けないでください。\n"
         "{\"titles\":[\"タイトル1\",\"タイトル2\",\"タイトル3\"],"
         "\"synopses\":[\"あらすじ1\",\"あらすじ2\"],"
@@ -981,6 +981,12 @@ def _apply_compat_migrations(data: dict[str, Any], saved: dict[str, Any] | None 
         "タグは生成しないでください。",
         "内容に一致するタグを10〜15個作ってください。【朗読・小説】は付けず、#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
     )
+    language_tag_rule = "#日本語・#日语・#Japaneseなど言語名だけのタグは付けないでください。"
+    if language_tag_rule not in marketing_prompt:
+        marketing_prompt = marketing_prompt.replace(
+            "#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
+            f"{language_tag_rule}#赤陽の勧めるノベルと制作方法に関するタグも使用しないでください。",
+        )
     if '"tags"' not in marketing_prompt and '"synopses"' in marketing_prompt:
         marketing_prompt = marketing_prompt.replace(
             '"synopses":["あらすじ1","あらすじ2"]}',

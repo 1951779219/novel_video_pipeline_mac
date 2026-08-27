@@ -473,6 +473,7 @@ class PipelineGUI:
         self.root.title(f"小说推文视频生产台 v{VERSION}")
         self.root.geometry("1320x820")
         self.root.minsize(1050, 680)
+        self._install_text_edit_shortcuts()
         self._selected_job = ""
         self._rendered_log_job = ""
         self._rendered_log_text = None
@@ -499,6 +500,34 @@ class PipelineGUI:
         self.root.after(900, self._start_edge_voice_detection)
         self.root.after(2400, self._maybe_check_update_on_startup)
         self.root.after(3500, self._poll_script_publish_queue)
+
+    def _install_text_edit_shortcuts(self):
+        """Make Select All reliable in editable fields on every supported Tk build."""
+        def select_all(event):
+            widget = event.widget
+            if isinstance(widget, tk.Text):
+                if str(widget.cget("state")) != str(tk.NORMAL):
+                    return None
+                widget.tag_add(tk.SEL, "1.0", "end-1c")
+                widget.mark_set(tk.INSERT, "end-1c")
+                widget.see(tk.INSERT)
+                return "break"
+
+            if isinstance(widget, (tk.Entry, ttk.Entry, ttk.Combobox)):
+                if str(widget.cget("state")) in {str(tk.DISABLED), "readonly"}:
+                    return None
+                widget.selection_range(0, tk.END)
+                widget.icursor(tk.END)
+                return "break"
+            return None
+
+        # Some macOS Tk releases do not consistently map Command-A to the
+        # SelectAll virtual event for Text widgets created inside scroll panes.
+        # Bind the platform-native shortcut explicitly; other platforms retain
+        # their conventional Control-A behaviour.
+        modifier = "Command" if sys.platform == "darwin" else "Control"
+        self.root.bind_all(f"<{modifier}-a>", select_all, add="+")
+        self.root.bind_all(f"<{modifier}-A>", select_all, add="+")
 
     def _build_style(self):
         style = ttk.Style(self.root)
@@ -948,7 +977,7 @@ class PipelineGUI:
         ttk.Button(toolbar_box, text="清空已结束任务", command=self._delete_finished_jobs).pack(side=tk.LEFT)
         ttk.Button(toolbar_box, text="停止一切任务", command=self._stop_all_jobs).pack(side=tk.LEFT, padx=(6, 0))
 
-        cols = ("job_id", "stage", "progress", "worker", "audio", "dictionary", "title", "video", "youtube")
+        cols = ("job_id", "stage", "short", "progress", "worker", "audio", "dictionary", "title", "video", "youtube")
         tree_box = ttk.Frame(queue_pane)
         queue_pane.add(toolbar_box, weight=0)
         queue_pane.add(tree_box, weight=1)
@@ -969,6 +998,7 @@ class PipelineGUI:
         headings = {
             "job_id": "任务ID",
             "stage": "制作阶段",
+            "short": "Short",
             "progress": "进度",
             "worker": "Worker",
             "audio": "音频来源",
@@ -980,6 +1010,7 @@ class PipelineGUI:
         widths = {
             "job_id": 95,
             "stage": 88,
+            "short": 68,
             "progress": 56,
             "worker": 72,
             "audio": 74,
@@ -991,6 +1022,7 @@ class PipelineGUI:
         min_widths = {
             "job_id": 58,
             "stage": 52,
+            "short": 52,
             "progress": 44,
             "worker": 50,
             "audio": 52,
@@ -1043,8 +1075,8 @@ class PipelineGUI:
         ):
             self.job_context_menu.add_command(label=label, command=command)
         self.job_schedule_menu = tk.Menu(self.job_context_menu, tearoff=False)
-        self.job_schedule_menu.add_command(label="油管内定时", command=self._schedule_selected_jobs_on_youtube)
-        self.job_schedule_menu.add_command(label="脚本内定时", command=self._schedule_selected_jobs_in_script)
+        self.job_schedule_menu.add_command(label="1.油管内定时", command=self._schedule_selected_jobs_on_youtube)
+        self.job_schedule_menu.add_command(label="3.脚本内定时", command=self._schedule_selected_jobs_in_script)
         self.job_context_menu.add_cascade(label="定时任务", menu=self.job_schedule_menu)
         # A cascade opens to the right on hover, keeping the everyday actions
         # compact while grouping every recovery/retry path in one Adobe-like menu.
@@ -1056,6 +1088,7 @@ class PipelineGUI:
             ("指定段配音修复", self._retry_tts_segments),
             ("重试（生图除外）", self._retry_from_clean_reuse_images),
             ("仅重试合成", self._compose_selected),
+            ("重试 Short", self._regenerate_selected_shorts),
         ):
             self.job_retry_menu.add_command(label=label, command=command)
         self.job_context_menu.add_cascade(label="重试", menu=self.job_retry_menu)
@@ -4537,7 +4570,7 @@ class PipelineGUI:
             for job_id in ids:
                 pr.append_log(pr.job_dir_for(job_id), message)
 
-    def _ask_batch_schedule_datetimes(self, title: str, ids: list[str], mode: str) -> tuple[list[datetime], str, str, str, list[str]] | None:
+    def _ask_batch_schedule_datetimes(self, title: str, ids: list[str], mode: str) -> tuple[list[datetime], str, str, str, list[str], str, bool, int] | None:
         # Keep the scheduler and channel editor on one authoritative saved
         # configuration, even when scheduling starts from the task menu.
         try:
@@ -4634,13 +4667,48 @@ class PipelineGUI:
             pass
         outer = ttk.Frame(win, padding=12)
         outer.pack(fill=tk.BOTH, expand=True)
+        schedule_tabs = None
+        short_page = None
+        if mode == "youtube":
+            schedule_tabs = ttk.Notebook(outer)
+            schedule_tabs.pack(fill=tk.BOTH, expand=True)
+            main_page = ttk.Frame(schedule_tabs, padding=(8, 8, 8, 0))
+            short_page = ttk.Frame(schedule_tabs, padding=(8, 8, 8, 0))
+            schedule_tabs.add(main_page, text="正片")
+            schedule_tabs.add(short_page, text="Short")
+            content_parent = main_page
+        else:
+            content_parent = outer
         ttk.Label(
-            outer,
+            content_parent,
             text="左侧是选中的任务，右侧可分别修改年、月、日、时、分。所有输入框只接受数字。",
             foreground="#555",
         ).pack(anchor=tk.W, pady=(0, 8))
 
-        channel_bar = ttk.Frame(outer)
+        publish_together_var = tk.BooleanVar(value=True)
+        short_offset_var = tk.StringVar(value="-5")
+
+        def make_short_controls(parent, paired_label: str):
+            controls = ttk.Frame(parent)
+            controls.pack(fill=tk.X, pady=(0, 8))
+            ttk.Checkbutton(
+                controls, text=paired_label, variable=publish_together_var,
+            ).pack(side=tk.LEFT)
+            ttk.Label(controls, text="Short 发布时间为：").pack(side=tk.LEFT, padx=(18, 4))
+            validate_offset = (
+                win.register(lambda value: value in {"", "+", "-"} or value.lstrip("+-").isdigit()),
+                "%P",
+            )
+            ttk.Entry(
+                controls, textvariable=short_offset_var, width=7,
+                validate="key", validatecommand=validate_offset,
+            ).pack(side=tk.LEFT)
+            ttk.Label(controls, text="分钟（相对正片）").pack(side=tk.LEFT, padx=(4, 0))
+
+        if mode == "youtube":
+            make_short_controls(content_parent, "同时发布 Short")
+
+        channel_bar = ttk.Frame(content_parent)
         channel_bar.pack(fill=tk.X, pady=(0, 8))
         ttk.Label(channel_bar, text="使用配置：").pack(side=tk.LEFT)
         configuration_var = tk.StringVar(value=selected_configuration)
@@ -4660,6 +4728,7 @@ class PipelineGUI:
         # A schedule must never be allowed to override this value.  The
         # channel editor owns the mapping: channel scheme -> Chrome profile.
         channel_account_var = tk.StringVar()
+        secondary_channel_pickers: list[ttk.Combobox] = []
         ttk.Label(channel_bar, textvariable=channel_account_var, width=18, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 0))
 
         def refresh_channel_detail(*_args):
@@ -4677,6 +4746,8 @@ class PipelineGUI:
             channel_profiles = load_channels(configuration_var.get().strip())
             names = [str(item.get("name") or "").strip() for item in channel_profiles]
             channel_picker.configure(values=names)
+            for picker in secondary_channel_pickers:
+                picker.configure(values=names)
             if not names:
                 channel_var.set("")
                 channel_account_var.set("")
@@ -4696,12 +4767,12 @@ class PipelineGUI:
         configuration_var.trace_add("write", refresh_configuration_channels)
         refresh_channel_detail()
 
-        header = ttk.Frame(outer)
+        header = ttk.Frame(content_parent)
         header.pack(fill=tk.X, padx=(2, 18))
         ttk.Label(header, text="文件名", width=46, anchor=tk.W, font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold")).pack(side=tk.LEFT)
         ttk.Label(header, text="定时时间", font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold")).pack(side=tk.LEFT)
 
-        list_wrap = ttk.Frame(outer)
+        list_wrap = ttk.Frame(content_parent)
         list_wrap.pack(fill=tk.BOTH, expand=True)
         canvas = tk.Canvas(list_wrap, highlightthickness=0)
         scrollbar = ttk.Scrollbar(list_wrap, orient=tk.VERTICAL, command=canvas.yview)
@@ -4791,6 +4862,10 @@ class PipelineGUI:
                     for ordered in row_vars:
                         ordered["line"].pack_forget()
                         ordered["line"].pack(fill=tk.X, pady=3)
+                        short_line = ordered.get("short_line")
+                        if short_line is not None:
+                            short_line.pack_forget()
+                            short_line.pack(fill=tk.X, pady=3)
                 drag_state.clear()
 
             def delete_row(current=row):
@@ -4800,6 +4875,9 @@ class PipelineGUI:
                     return
                 row_vars.remove(current)
                 current["line"].destroy()
+                short_line = current.get("short_line")
+                if short_line is not None:
+                    short_line.destroy()
 
             row_menu = tk.Menu(win, tearoff=False)
             row_menu.add_command(label="删除这个定时任务", command=lambda current=row: delete_row(current))
@@ -4819,6 +4897,93 @@ class PipelineGUI:
                 if not isinstance(widget, (tk.Entry, ttk.Entry)):
                     widget.bind("<ButtonPress-1>", begin_drag, add="+")
                     widget.bind("<ButtonRelease-1>", finish_drag, add="+")
+
+        def read_row_datetime(row) -> datetime:
+            values = row["values"]
+            return _datetime_from_numeric_parts(
+                values["year"].get(), values["month"].get(), values["day"].get(),
+                values["hour"].get(), values["minute"].get(),
+            )
+
+        def refresh_short_times(*_args):
+            try:
+                offset = int(short_offset_var.get().strip())
+            except ValueError:
+                offset = 0
+            for current in row_vars:
+                short_values = current.get("short_values")
+                if not isinstance(short_values, dict):
+                    continue
+                try:
+                    target = read_row_datetime(current) + timedelta(minutes=offset)
+                    parts = (target.year, target.month, target.day, target.hour, target.minute)
+                    for key, value in zip(("year", "month", "day", "hour", "minute"), parts):
+                        short_values[key].set(str(value))
+                except ValueError:
+                    for value in short_values.values():
+                        value.set("")
+
+        if short_page is not None:
+            ttk.Label(
+                short_page,
+                text="Short 的年月日时分由正片定时时间和上方偏移分钟自动计算，不可直接修改。",
+                foreground="#555",
+            ).pack(anchor=tk.W, pady=(0, 8))
+            make_short_controls(short_page, "同时发布正片")
+            short_channel_bar = ttk.Frame(short_page)
+            short_channel_bar.pack(fill=tk.X, pady=(0, 8))
+            ttk.Label(short_channel_bar, text="使用配置：").pack(side=tk.LEFT)
+            ttk.Combobox(
+                short_channel_bar, textvariable=configuration_var, values=configuration_names,
+                state="readonly", width=20,
+            ).pack(side=tk.LEFT, padx=(4, 14))
+            ttk.Label(short_channel_bar, text="目标 YouTube 频道：").pack(side=tk.LEFT)
+            short_channel_picker = ttk.Combobox(
+                short_channel_bar, textvariable=channel_var, values=profile_names,
+                state="readonly", width=28,
+            )
+            short_channel_picker.pack(side=tk.LEFT, padx=(4, 14))
+            secondary_channel_pickers.append(short_channel_picker)
+            ttk.Label(short_channel_bar, text="绑定 Chrome 资料：").pack(side=tk.LEFT)
+            ttk.Label(short_channel_bar, textvariable=channel_account_var, width=18, anchor=tk.W).pack(side=tk.LEFT, padx=(4, 0))
+
+            short_header = ttk.Frame(short_page)
+            short_header.pack(fill=tk.X, padx=(2, 18))
+            ttk.Label(short_header, text="文件名", width=46, anchor=tk.W, font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold")).pack(side=tk.LEFT)
+            ttk.Label(short_header, text="Short 定时时间", font=(UI_FONT, UI_SMALL_FONT_SIZE, "bold")).pack(side=tk.LEFT)
+            short_list_wrap = ttk.Frame(short_page)
+            short_list_wrap.pack(fill=tk.BOTH, expand=True)
+            short_canvas = tk.Canvas(short_list_wrap, highlightthickness=0)
+            short_scrollbar = ttk.Scrollbar(short_list_wrap, orient=tk.VERTICAL, command=short_canvas.yview)
+            short_rows_frame = ttk.Frame(short_canvas)
+            short_rows_window = short_canvas.create_window((0, 0), window=short_rows_frame, anchor="nw")
+            short_canvas.configure(yscrollcommand=short_scrollbar.set)
+            short_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            short_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            short_rows_frame.bind("<Configure>", lambda _event: short_canvas.configure(scrollregion=short_canvas.bbox("all")))
+            short_canvas.bind("<Configure>", lambda event: short_canvas.itemconfigure(short_rows_window, width=event.width))
+
+            for current in row_vars:
+                short_values = {key: tk.StringVar() for key in ("year", "month", "day", "hour", "minute")}
+                current["short_values"] = short_values
+                short_line = ttk.Frame(short_rows_frame)
+                short_line.pack(fill=tk.X, pady=3)
+                current["short_line"] = short_line
+                status = pr.load_status(str(current["job_id"]))
+                short_path = Path(str(status.get("short_video") or pr.short_video_output_path(pr.job_dir_for(str(current["job_id"])))))
+                short_name = short_path.name if short_path.exists() else f"{current['name']}（Short 未生成）"
+                ttk.Label(short_line, text=short_name, width=46, anchor=tk.W).pack(side=tk.LEFT)
+                for key, suffix, width in (
+                    ("year", "年", 6), ("month", "月", 4), ("day", "日", 4),
+                    ("hour", "时", 4), ("minute", "分", 4),
+                ):
+                    ttk.Entry(short_line, textvariable=short_values[key], width=width, state="readonly").pack(side=tk.LEFT, padx=(4, 1))
+                    ttk.Label(short_line, text=suffix).pack(side=tk.LEFT)
+            short_offset_var.trace_add("write", refresh_short_times)
+            for current in row_vars:
+                for value in current["values"].values():
+                    value.trace_add("write", refresh_short_times)
+            refresh_short_times()
 
         actions = ttk.Frame(outer)
         actions.pack(fill=tk.X, pady=(10, 0))
@@ -4851,9 +5016,20 @@ class PipelineGUI:
                 values["hour"].set(str(scheduled.hour))
                 values["minute"].set(str(scheduled.minute))
 
-        ttk.Button(actions, text="同步所有年份", command=lambda: sync_part("year")).pack(side=tk.LEFT)
-        ttk.Button(actions, text="同步所有月份", command=lambda: sync_part("month")).pack(side=tk.LEFT, padx=(6, 0))
-        ttk.Button(actions, text="从第一个视频开始每24小时排列", command=arrange_24_hours).pack(side=tk.LEFT, padx=(6, 0))
+        main_action_buttons = [
+            ttk.Button(actions, text="同步所有年份", command=lambda: sync_part("year")),
+            ttk.Button(actions, text="同步所有月份", command=lambda: sync_part("month")),
+            ttk.Button(actions, text="从第一个视频开始每24小时排列", command=arrange_24_hours),
+        ]
+        main_action_buttons[0].pack(side=tk.LEFT)
+        main_action_buttons[1].pack(side=tk.LEFT, padx=(6, 0))
+        main_action_buttons[2].pack(side=tk.LEFT, padx=(6, 0))
+        if schedule_tabs is not None and short_page is not None:
+            def refresh_page_actions(_event=None):
+                state = "disabled" if schedule_tabs.select() == str(short_page) else "normal"
+                for button in main_action_buttons:
+                    button.configure(state=state)
+            schedule_tabs.bind("<<NotebookTabChanged>>", refresh_page_actions)
 
         result: dict[str, object] = {}
 
@@ -4875,6 +5051,15 @@ class PipelineGUI:
             if not chosen_account:
                 messagebox.showerror("频道方案不完整", "该频道方案没有绑定 Chrome 资料，请回到“编辑频道上传方案”设置。", parent=win)
                 return
+            primary_page = "main"
+            if schedule_tabs is not None and short_page is not None and schedule_tabs.select() == str(short_page):
+                primary_page = "short"
+            try:
+                short_offset = int(short_offset_var.get().strip())
+            except ValueError:
+                messagebox.showerror("Short 发布时间不正确", "Short 发布时间必须填写整数分钟，例如 -5 或 +5。", parent=win)
+                return
+            publish_short = primary_page == "short" or publish_together_var.get()
             scheduled_rows = []
             for index, row in enumerate(row_vars):
                 values = row["values"]
@@ -4889,12 +5074,36 @@ class PipelineGUI:
                 if scheduled <= datetime.now() + timedelta(minutes=5):
                     messagebox.showerror("定时时间太近", f"第 {index + 1} 行必须至少晚于当前时间 5 分钟。", parent=win)
                     return
+                if publish_short:
+                    short_video = Path(str(
+                        pr.load_status(str(row["job_id"])).get("short_video")
+                        or pr.short_video_output_path(pr.job_dir_for(str(row["job_id"])))
+                    ))
+                    if not short_video.exists() or short_video.stat().st_size < 100:
+                        messagebox.showerror("Short 尚未完成", f"第 {index + 1} 行没有可上传的 Short 视频。", parent=win)
+                        return
+                    if primary_page == "short" and not publish_together_var.get():
+                        receipt = pr._read_json(pr.job_dir_for(str(row["job_id"])) / "upload_result.json", {})
+                        if not isinstance(receipt, dict) or not str(receipt.get("title") or "").strip():
+                            messagebox.showerror(
+                                "没有正片上传标题",
+                                f"第 {index + 1} 行尚无正片实际上传标题；请勾选“同时发布正片”，或先完成正片上传。",
+                                parent=win,
+                            )
+                            return
+                    short_scheduled = scheduled + timedelta(minutes=short_offset)
+                    if short_scheduled <= datetime.now() + timedelta(minutes=5):
+                        messagebox.showerror("Short 定时时间太近", f"第 {index + 1} 行的 Short 时间必须至少晚于当前时间 5 分钟。", parent=win)
+                        return
                 scheduled_rows.append(scheduled)
             result["values"] = scheduled_rows
             result["job_ids"] = [str(row["job_id"]) for row in row_vars]
             result["configuration_name"] = chosen_configuration
             result["profile_name"] = chosen_profile
             result["channel_account"] = chosen_account
+            result["primary_page"] = primary_page
+            result["publish_together"] = bool(publish_together_var.get())
+            result["short_offset"] = short_offset
             win.destroy()
 
         ttk.Button(actions, text="确定", style="Primary.TButton", command=accept).pack(side=tk.RIGHT)
@@ -4925,7 +5134,17 @@ class PipelineGUI:
         ordered_ids = result.get("job_ids")
         if not isinstance(ordered_ids, list):
             return None
-        return values, configuration_name, profile_name, channel_account, [str(job_id) for job_id in ordered_ids]
+        primary_page = str(result.get("primary_page") or "main")
+        publish_together = bool(result.get("publish_together", False))
+        try:
+            short_offset = int(result.get("short_offset", -5))
+        except (TypeError, ValueError):
+            short_offset = -5
+        return (
+            values, configuration_name, profile_name, channel_account,
+            [str(job_id) for job_id in ordered_ids], primary_page,
+            publish_together, short_offset,
+        )
 
     def _switch_active_channel_schedule_mode(self, mode: str, scheduled: datetime,
                                              profile_name_override: str = "") -> str | None:
@@ -5064,7 +5283,13 @@ class PipelineGUI:
         schedule_choice = self._ask_batch_schedule_datetimes("油管内定时任务", ids, "youtube")
         if not schedule_choice:
             return
-        scheduled_rows, selected_configuration_name, selected_profile_name, selected_channel_account, ids = schedule_choice
+        (
+            scheduled_rows, selected_configuration_name, selected_profile_name,
+            selected_channel_account, ids, primary_page, publish_together,
+            short_offset_minutes,
+        ) = schedule_choice
+        publish_main = primary_page == "main" or publish_together
+        publish_short = primary_page == "short" or publish_together
         try:
             _cleaned, selected_settings = config.profile_settings(selected_configuration_name)
         except Exception as exc:
@@ -5081,10 +5306,16 @@ class PipelineGUI:
         profile_name = str(active_profile.get("name") or selected_profile_name)
         channel_account = selected_channel_account
         timezone_text = str(active_profile.get("youtube_schedule_timezone") or "Asia/Tokyo")
-        preview = "\n".join(
-            f"{index + 1}. {job_id} → {scheduled_rows[index].strftime('%Y-%m-%d %H:%M')}"
-            for index, job_id in enumerate(ids)
-        )
+        preview_lines = []
+        for index, job_id in enumerate(ids):
+            main_target = scheduled_rows[index]
+            if publish_main:
+                preview_lines.append(f"{index + 1}. 正片 {job_id} → {main_target:%Y-%m-%d %H:%M}")
+            if publish_short:
+                preview_lines.append(
+                    f"   Short → {main_target + timedelta(minutes=short_offset_minutes):%Y-%m-%d %H:%M}"
+                )
+        preview = "\n".join(preview_lines)
         if not messagebox.askyesno(
             "确认油管内定时发布",
             f"使用配置：{selected_configuration_name}\n频道方案：{profile_name}\n"
@@ -5108,52 +5339,208 @@ class PipelineGUI:
         )
         if not profile_name:
             return
-        publish_scheduler.remove_jobs(ids)
+        if publish_main:
+            publish_scheduler.remove_jobs(ids)
         for job_id, target in zip(ids, scheduled_rows):
-            pr.write_status(
-                pr.job_dir_for(job_id),
-                publish_schedule_mode="youtube",
-                publish_scheduled_at=target.strftime("%Y-%m-%dT%H:%M"),
-                publish_schedule_profile=profile_name,
-                publish_config_profile=selected_configuration_name,
-                publish_schedule_state="uploading",
-            )
+            status_updates = {
+                "publish_schedule_profile": profile_name,
+                "publish_config_profile": selected_configuration_name,
+            }
+            if publish_main:
+                status_updates.update({
+                    "publish_schedule_mode": "youtube",
+                    "publish_scheduled_at": target.strftime("%Y-%m-%dT%H:%M"),
+                    "publish_schedule_state": "uploading",
+                })
+            if publish_short:
+                status_updates.update({
+                    "short_scheduled_at": (target + timedelta(minutes=short_offset_minutes)).strftime("%Y-%m-%dT%H:%M"),
+                    "short_schedule_state": "uploading",
+                })
+            pr.write_status(pr.job_dir_for(job_id), **status_updates)
 
         def worker():
             errors = []
             for job_id, target in zip(ids, scheduled_rows):
-                upload_job = browser_upload._Job()
-                self._active_browser_upload_jobs[job_id] = upload_job
+                main_done = not publish_main
+                short_done = not publish_short
                 try:
-                    url = pr.upload_completed_job(
-                        job_id,
+                    if publish_main:
+                        upload_job = browser_upload._Job()
+                        self._active_browser_upload_jobs[job_id] = upload_job
+                        try:
+                            url = pr.upload_completed_job(
+                                job_id,
+                                on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message),
+                                profile_name_override=profile_name,
+                                schedule_enabled_override=True,
+                                scheduled_at_override=target.strftime("%Y-%m-%dT%H:%M"),
+                                schedule_timezone_override=timezone_text,
+                                browser_upload_job=upload_job,
+                            )
+                            if upload_job.is_cancelled():
+                                raise RuntimeError("用户停止了一切任务")
+                            pr.write_status(
+                                pr.job_dir_for(job_id),
+                                publish_schedule_state="scheduled",
+                                publish_schedule_url=url,
+                            )
+                            main_done = True
+                        finally:
+                            if self._active_browser_upload_jobs.get(job_id) is upload_job:
+                                self._active_browser_upload_jobs.pop(job_id, None)
+                    if publish_short:
+                        receipt = pr._read_json(pr.job_dir_for(job_id) / "upload_result.json", {})
+                        main_title = str(receipt.get("title") or "").strip() if isinstance(receipt, dict) else ""
+                        if not main_title:
+                            raise RuntimeError("没有找到正片实际上传标题，Short 已停止上传")
+                        short_target = target + timedelta(minutes=short_offset_minutes)
+                        short_job = browser_upload._Job()
+                        self._active_browser_upload_jobs[f"short:{job_id}"] = short_job
+                        try:
+                            short_url = pr.upload_completed_short_job(
+                                job_id, main_title,
+                                on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message),
+                                profile_name_override=profile_name,
+                                scheduled_at_override=short_target.strftime("%Y-%m-%dT%H:%M"),
+                                schedule_timezone_override=timezone_text,
+                                browser_upload_job=short_job,
+                            )
+                            if short_job.is_cancelled():
+                                raise RuntimeError("用户停止了一切任务")
+                            pr.write_status(
+                                pr.job_dir_for(job_id), short_schedule_state="scheduled",
+                                short_schedule_url=short_url, short_upload_error="",
+                            )
+                            short_done = True
+                        finally:
+                            if self._active_browser_upload_jobs.get(f"short:{job_id}") is short_job:
+                                self._active_browser_upload_jobs.pop(f"short:{job_id}", None)
+                except Exception as exc:
+                    updates = {"publish_schedule_error": str(exc)}
+                    if publish_main and not main_done:
+                        updates["publish_schedule_state"] = "failed"
+                    if publish_short and not short_done:
+                        updates["short_schedule_state"] = "failed"
+                        updates["short_upload_error"] = str(exc)
+                    pr.write_status(pr.job_dir_for(job_id), **updates)
+                    errors.append(f"{job_id}: {exc}")
+            self.root.after(0, lambda: self._finish_combined_schedule(ids, errors, publish_main, publish_short))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_combined_schedule(self, ids: list[str], errors: list[str],
+                                  publish_main: bool, publish_short: bool):
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("油管内定时需要检查", "\n".join(errors))
+            return
+        if publish_main and publish_short:
+            message = f"已为 {len(ids)} 个任务完成正片和 Short 的 YouTube 定时预约。"
+        elif publish_short:
+            message = f"已为 {len(ids)} 个 Short 完成 YouTube 定时预约。"
+        else:
+            message = f"已为 {len(ids)} 个正片完成 YouTube 定时预约。"
+        messagebox.showinfo("预约完成", message)
+
+    def _schedule_selected_shorts_on_youtube(self):
+        """Schedule each completed Short relative to its main video's Studio time."""
+        ids = self._selected_job_ids()
+        if not ids:
+            messagebox.showwarning("没有选择任务", "请先选择正片已经完成油管内定时的任务。")
+            return
+        ids.sort(key=lambda job_id: self.job_tree.index(job_id) if self.job_tree.exists(job_id) else 10**9)
+
+        raw_offset = simpledialog.askstring(
+            "Short 定时", "Short 相对正片的时间偏移（分钟）：\n-5 = 提前五分钟（默认），+5 = 推迟五分钟",
+            initialvalue="-5", parent=self.root,
+        )
+        if raw_offset is None:
+            return
+        try:
+            offset_minutes = int(raw_offset.strip())
+        except ValueError:
+            messagebox.showerror("偏移不正确", "请输入 -5 或 +5。")
+            return
+        if offset_minutes not in {-5, 5}:
+            messagebox.showerror("偏移不正确", "目前只支持 -5（提前五分钟）或 +5（推迟五分钟）。")
+            return
+
+        entries = []
+        invalid = []
+        for job_id in ids:
+            status = pr.load_status(job_id)
+            short_video = Path(str(status.get("short_video") or pr.short_video_output_path(pr.job_dir_for(job_id))))
+            scheduled_text = str(status.get("publish_scheduled_at") or "").strip()
+            profile_name = str(status.get("publish_schedule_profile") or "").strip()
+            configuration_name = str(status.get("publish_config_profile") or "").strip()
+            try:
+                main_time = datetime.strptime(scheduled_text, "%Y-%m-%dT%H:%M")
+            except ValueError:
+                invalid.append(f"{job_id}：没有正片的油管内定时时间")
+                continue
+            receipt = pr._read_json(pr.job_dir_for(job_id) / "upload_result.json", {})
+            main_title = str(receipt.get("title") or "").strip() if isinstance(receipt, dict) else ""
+            if status.get("worker_alive") or not short_video.exists() or short_video.stat().st_size < 100:
+                invalid.append(f"{job_id}：没有已完成的 Short 视频")
+            elif not profile_name or not configuration_name:
+                invalid.append(f"{job_id}：缺少正片定时使用的频道配置")
+            elif not main_title:
+                invalid.append(f"{job_id}：没有找到正片实际上传标题")
+            else:
+                entries.append((job_id, main_time + timedelta(minutes=offset_minutes), profile_name, configuration_name, main_title))
+        if invalid:
+            messagebox.showwarning("无法创建 Short 定时", "\n".join(invalid))
+            return
+        too_soon = [f"{job_id}：{target:%Y-%m-%d %H:%M}" for job_id, target, *_rest in entries if target <= datetime.now() + timedelta(minutes=5)]
+        if too_soon:
+            messagebox.showwarning("Short 定时时间太近", "Short 的目标时间必须至少晚于当前时间 5 分钟：\n" + "\n".join(too_soon))
+            return
+
+        preview = "\n".join(
+            f"{job_id}：正片 {target - timedelta(minutes=offset_minutes):%Y-%m-%d %H:%M} → Short {target:%Y-%m-%d %H:%M}"
+            for job_id, target, *_rest in entries
+        )
+        direction = "提前" if offset_minutes < 0 else "推迟"
+        if not messagebox.askyesno(
+            "确认 Short 定时", f"Short 将使用与正片完全相同的上传标题。\n相对正片：{direction} 5 分钟。\n\n{preview}\n\n确认开始上传并预定吗？"
+        ):
+            return
+
+        def worker():
+            errors = []
+            for job_id, target, profile_name, configuration_name, main_title in entries:
+                upload_job = browser_upload._Job()
+                self._active_browser_upload_jobs[f"short:{job_id}"] = upload_job
+                try:
+                    config.load_profile(configuration_name)
+                    timezone_text = str(config.get("youtube_schedule_timezone", "Asia/Tokyo") or "Asia/Tokyo")
+                    pr.append_log(pr.job_dir_for(job_id), f"Short 定时：正片标题复用为 {main_title}；目标 {target:%Y-%m-%d %H:%M}")
+                    pr.upload_completed_short_job(
+                        job_id, main_title,
                         on_log=lambda message, jid=job_id: pr.append_log(pr.job_dir_for(jid), message),
                         profile_name_override=profile_name,
-                        schedule_enabled_override=True,
                         scheduled_at_override=target.strftime("%Y-%m-%dT%H:%M"),
                         schedule_timezone_override=timezone_text,
                         browser_upload_job=upload_job,
                     )
-                    if upload_job.is_cancelled():
-                        raise RuntimeError("用户停止了一切任务")
-                    pr.write_status(
-                        pr.job_dir_for(job_id),
-                        publish_schedule_state="scheduled",
-                        publish_schedule_url=url,
-                    )
+                    pr.write_status(pr.job_dir_for(job_id), short_scheduled_at=target.strftime("%Y-%m-%dT%H:%M"))
                 except Exception as exc:
-                    pr.write_status(
-                        pr.job_dir_for(job_id),
-                        publish_schedule_state="failed",
-                        publish_schedule_error=str(exc),
-                    )
+                    pr.write_status(pr.job_dir_for(job_id), short_upload_error=str(exc))
                     errors.append(f"{job_id}: {exc}")
                 finally:
-                    if self._active_browser_upload_jobs.get(job_id) is upload_job:
-                        self._active_browser_upload_jobs.pop(job_id, None)
-            self.root.after(0, lambda: self._finish_manual_upload(ids, errors, scheduled=True))
+                    if self._active_browser_upload_jobs.get(f"short:{job_id}") is upload_job:
+                        self._active_browser_upload_jobs.pop(f"short:{job_id}", None)
+            self.root.after(0, lambda: self._finish_short_schedule(entries, errors))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_short_schedule(self, entries, errors: list[str]):
+        self._refresh_jobs()
+        if errors:
+            messagebox.showerror("Short 定时需要检查", "\n".join(errors))
+        else:
+            messagebox.showinfo("Short 预约完成", f"已为 {len(entries)} 个 Short 完成 YouTube 定时预约。")
 
     def _schedule_selected_jobs_in_script(self):
         ids = self._selected_job_ids()
@@ -5166,7 +5553,11 @@ class PipelineGUI:
         schedule_choice = self._ask_batch_schedule_datetimes("脚本内定时任务", ids, "script")
         if not schedule_choice:
             return
-        scheduled_rows, selected_configuration_name, selected_profile_name, selected_channel_account, ids = schedule_choice
+        (
+            scheduled_rows, selected_configuration_name, selected_profile_name,
+            selected_channel_account, ids, _primary_page, _publish_together,
+            _short_offset_minutes,
+        ) = schedule_choice
         try:
             _cleaned, selected_settings = config.profile_settings(selected_configuration_name)
         except Exception as exc:
@@ -5346,7 +5737,7 @@ class PipelineGUI:
             return
         if not messagebox.askyesno(
             "重新生成Short",
-            f"将使用当前Short设置，为选中的 {len(ids)} 个任务生成或替换 shorts/short.mp4。\n\n"
+            f"将使用当前Short设置，为选中的 {len(ids)} 个任务生成或替换 shorts/“正片标题缩略_shorts”.mp4。\n\n"
             "主视频、封面和上传结果不会改变。独立制作模式可能调用文本、TTS和图片接口。继续吗？",
         ):
             return
@@ -5613,8 +6004,8 @@ class PipelineGUI:
             return
         running = [job_id for job_id in ids if pr.is_worker_running(job_id)]
         message = (
-            f"将把 {len(ids)} 个任务整理为预备分包，仅保留 _source_input、成片 MP4、"
-            "audio_full.mp3、cover 和 images。\n\n"
+            f"将把 {len(ids)} 个任务整理为预备分包，仅保留 _source_input、正片 MP4、"
+            "正片 audio_full.mp3、cover、images，以及 shorts（Short MP4 与其 audio_full.mp3）。\n\n"
             "其余文件（包括状态、字幕、分镜、日志和可续跑数据）会永久删除，任务无法再从此目录继续运行。"
             "整理后的目录会放入 data/预备分，并命名为“预备分_原任务名”。"
         )
@@ -6812,6 +7203,24 @@ class PipelineGUI:
         rows_with_status.sort(key=sort_key, reverse=reverse)
         return rows_with_status
 
+    def _short_queue_status(self, job_id: str, status: dict) -> str:
+        """Return a compact, per-job Short state for the queue table."""
+        short_path = Path(str(status.get("short_video") or pr.short_video_output_path(pr.job_dir_for(job_id))))
+        if short_path.exists() and short_path.stat().st_size >= 100:
+            return "已完成"
+        if str(status.get("short_error") or "").strip():
+            return "失败"
+        if str(status.get("stage") or "") == "short":
+            return "制作中"
+
+        snapshot = pr._read_json(pr.job_dir_for(job_id) / pr.SETTINGS_SNAPSHOT_FILE, {})
+        if isinstance(snapshot, dict) and bool(snapshot.get("short_video_enabled", False)):
+            return "待生成"
+        # Queued jobs do not have a settings snapshot until first dispatched.
+        if bool(config.get("short_video_enabled", False)):
+            return "待生成"
+        return "未开启"
+
     def _refresh_jobs(self):
         # Polling used to delete and recreate every row every 2.5 seconds.
         # That silently cleared the selection just as an operator clicked a
@@ -6842,6 +7251,7 @@ class PipelineGUI:
             values = (
                 self._display_job_id(row["job_id"]),
                 row.get("stage_display", row.get("stage", "")),
+                self._short_queue_status(str(row["job_id"]), st),
                 f"{float(row.get('progress') or 0) * 100:.0f}%",
                 worker,
                 "导入 MP3" if st.get("audio_mode") == "imported" else "TTS",
@@ -7004,9 +7414,9 @@ class PipelineGUI:
             if values:
                 values[0] = self._display_job_id(str(iid))
                 full_values = getattr(self, "_job_table_full_values", {}).get(str(iid), {})
-                values[6] = self._display_job_column("title", full_values.get("title", values[6]))
-                values[7] = self._display_job_column("video", full_values.get("video", values[7]))
-                values[8] = self._display_job_column("youtube", full_values.get("youtube", values[8]))
+                values[7] = self._display_job_column("title", full_values.get("title", values[7]))
+                values[8] = self._display_job_column("video", full_values.get("video", values[8]))
+                values[9] = self._display_job_column("youtube", full_values.get("youtube", values[9]))
                 self.job_tree.item(iid, values=values)
 
     def _poll_jobs(self):

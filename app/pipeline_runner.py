@@ -263,6 +263,15 @@ def video_output_path(job_dir: Path) -> Path:
     return job_dir / f"{safe_job_name(output_basename)}.mp4"
 
 
+def short_video_output_path(job_dir: Path, main_video: Path | None = None) -> Path:
+    """Return the Short filename derived from a compact main-video title."""
+    source = main_video or video_output_path(job_dir)
+    # Keep this short enough to be convenient in Finder while still making the
+    # relationship to the full video immediately recognizable.
+    title_prefix = safe_job_name(source.stem, fallback="video")[:18].rstrip(" .")
+    return job_dir / "shorts" / f"{title_prefix or 'video'}_shorts.mp4"
+
+
 def append_log(job_dir: Path, message: str):
     job_dir.mkdir(parents=True, exist_ok=True)
     with (job_dir / "log.txt").open("a", encoding="utf-8") as f:
@@ -727,6 +736,8 @@ def prepare_job_for_preliminary_scoring(job_id: str) -> str:
         "audio_full.mp3",
         "cover",
         "images",
+        # This includes the Short MP4 and its own audio_full.mp3.
+        "shorts",
     ]
     if video_path.exists() and video_path.parent == path:
         keep_names.append(video_path.name)
@@ -4498,6 +4509,9 @@ _THREE_KINGDOMS_MARKERS = (
 _THREE_KINGDOMS_WRONG_TAGS = {
     "#異世界", "#恋愛", "#ざまぁ", "#貴族令嬢", "#ファンタジー", "#漫画風",
 }
+_LANGUAGE_NAME_TAGS = {
+    "日本語", "日语", "日語", "japanese", "japanese-language", "japaneselanguage",
+}
 
 
 def _is_three_kingdoms_material(*values) -> bool:
@@ -4511,7 +4525,7 @@ def _fallback_marketing_tags(novel: Novel, story_material: str) -> list[str]:
         return _three_kingdoms_fallback_tags()
     # Do not guess genre, romance, gender, or setting when the LLM response is
     # unavailable.  Broad format tags are less promotional, but remain true.
-    return ["#小説", "#朗読", "#物語", "#オーディオブック", "#ストーリー", "#小説紹介", "#日本語", "#動画", "#文学", "#長編"]
+    return ["#小説", "#朗読", "#物語", "#オーディオブック", "#ストーリー", "#小説紹介", "#動画", "#文学", "#長編", "#創作"]
 
 
 def _three_kingdoms_fallback_tags() -> list[str]:
@@ -4576,6 +4590,46 @@ def _looks_like_japanese_short_script(value: str) -> bool:
     return kana_count >= max(3, int(len(text) * 0.02))
 
 
+def _short_script_length_bounds(
+    minimum_seconds: int, maximum_seconds: int, preferred_max_chars: int = 350,
+) -> tuple[int, int]:
+    """Return conservative Japanese-character bounds for a narrated Short.
+
+    The text model is instructed in seconds, but it cannot measure the TTS
+    result.  Keeping a character floor prevents a valid-but-tiny response from
+    becoming a 10--15 second video.
+    """
+    maximum_chars = min(
+        max(80, int(maximum_seconds * 6.2)),
+        max(80, min(2000, int(preferred_max_chars or 350))),
+    )
+    minimum_chars = max(120, int(minimum_seconds * 5.6), int(maximum_chars * 0.8))
+    return min(minimum_chars, maximum_chars), maximum_chars
+
+
+def _is_complete_short_script(value: str) -> bool:
+    """Require a sentence ending so partial model responses are never rendered."""
+    text = re.sub(r"\s+", "", str(value or ""))
+    return bool(text) and text[-1] in "。！？!?…"
+
+
+def _local_short_script_from_segments(segments: list[Segment], minimum_chars: int, maximum_chars: int) -> str:
+    """Build a complete, source-faithful narration when the text API is unavailable."""
+    source = re.sub(r"\s+", "", "".join(str(segment.text or "") for segment in segments))
+    if not source:
+        raise RuntimeError("没有可用于重做Short文案的小说文本")
+    window = source[:maximum_chars]
+    endings = [window.rfind(mark) for mark in "。！？!?…"]
+    cut = max(endings)
+    if cut >= minimum_chars - 1:
+        return window[:cut + 1]
+    # Do not leave a grammatically incomplete fragment in a rendered video.
+    text = window.rstrip("，、；;:： ")
+    if len(text) < minimum_chars:
+        raise RuntimeError(f"小说正文不足以生成{minimum_chars}字的Short文案")
+    return text + "。"
+
+
 def _prebuilt_short_script_error(bundle: dict, required: bool, max_chars: int) -> str:
     if not required:
         return ""
@@ -4600,6 +4654,8 @@ def _candidate_tags(value) -> list[str]:
         if not tag.startswith("#"):
             tag = "#" + tag.lstrip("＃")
         if tag.lstrip("#＃") == "赤陽の勧めるノベル":
+            continue
+        if tag.lstrip("#＃").casefold() in _LANGUAGE_NAME_TAGS:
             continue
         if tag not in tags:
             tags.append(tag)
@@ -5338,8 +5394,9 @@ def _limit_upload_title(text: str, max_chars: int = 100) -> str:
 
 
 def _remove_disallowed_upload_tag(text: str) -> str:
-    """Remove the retired channel tag from new and legacy upload text."""
+    """Remove retired-channel and language-name tags from upload text."""
     value = re.sub(r"[#＃]?赤陽の勧めるノベル", "", str(text or ""))
+    value = re.sub(r"(?i)[#＃](?:日本語|日语|日語|japanese(?:-language)?)\b", "", value)
     return re.sub(r"[ \t]{2,}", " ", value).strip()
 
 
@@ -6770,6 +6827,9 @@ def _generate_short_script(novel: Novel, segments: list[Segment], short_dir: Pat
     prompt = str(config.get("short_video_script_prompt", "") or "").strip()
     minimum = max(1, min(59, int(config.get("short_video_script_min_seconds", 45) or 45)))
     maximum = max(minimum, min(60, int(config.get("short_video_script_max_seconds", 58) or 58)))
+    min_chars, max_chars = _short_script_length_bounds(
+        minimum, maximum, int(config.get("short_video_script_max_chars", 350) or 350),
+    )
     if bool(config.get("short_video_prebuild_script_enabled", False)):
         cached_path = short_dir / "short_script.txt"
         if cached_path.exists():
@@ -6777,32 +6837,56 @@ def _generate_short_script(novel: Novel, segments: list[Segment], short_dir: Pat
                 cached_path.read_text(encoding="utf-8", errors="ignore"),
                 int(config.get("short_video_script_max_chars", 350) or 350),
             )
-            if len(cached) >= 30 and _looks_like_japanese_short_script(cached):
+            if (
+                min_chars <= len(cached) <= max_chars
+                and _looks_like_japanese_short_script(cached)
+                and _is_complete_short_script(cached)
+            ):
                 if cached != cached_path.read_text(encoding="utf-8", errors="ignore").strip():
                     cached_path.write_text(cached, encoding="utf-8")
                 on_log(f"  Short文案：复用标题阶段预生成缓存（{len(cached)}字）")
                 return cached
+            on_log("  WARN 标题阶段的Short文案不满足时长或完整句要求；将重新生成")
     evidence = sampled_story_input(novel, segments, 12000, expand_to_limit=True)
     request = (
         f"{prompt}\n\n"
         f"今回のナレーションは必ず{minimum}秒以上、{maximum}秒以内に収めてください。\n"
+        f"本文は{min_chars}〜{max_chars}文字にしてください。{min_chars}文字未満は不可です。\n"
+        "最後まで完結した一段落にし、文末は必ず「。」「！」「？」「…」のいずれかで終えてください。\n"
         "出力本文には自然な日本語だけを使用し、中国語・英語・他言語を混ぜないでください。\n\n"
         f"小説の事実資料：\n{evidence}"
     )
     on_log(f"  Short文案：调用文本模型重写{minimum}–{maximum}秒旁白")
     llm = _short_llm()
-    with external_api_slot(action="Short script"):
-        raw = llm.complete(llm.system_prompt, request, max_tokens=1200, temperature=0.35)
-    script = str(raw or "").strip()
-    script = re.sub(r"^```(?:text|markdown)?\s*", "", script, flags=re.I)
-    script = re.sub(r"\s*```$", "", script)
-    script = re.sub(r"(?i)^\s*(?:Short文案|短视频文案|旁白|script)\s*[:：]\s*", "", script).strip()
-    if len(script) < 30:
-        raise RuntimeError("文本模型返回的Short文案过短")
-    if not _looks_like_japanese_short_script(script):
-        raise RuntimeError("文本模型返回的Short文案不是自然日语，请检查模型或提示词")
-    (short_dir / "short_script.txt").write_text(script, encoding="utf-8")
-    return script
+    last_error = ""
+    for attempt in range(1, 3):
+        with external_api_slot(action="Short script"):
+            raw = llm.complete(llm.system_prompt, request, max_tokens=1200, temperature=0.35)
+        script = str(raw or "").strip()
+        script = re.sub(r"^```(?:text|markdown)?\s*", "", script, flags=re.I)
+        script = re.sub(r"\s*```$", "", script)
+        script = re.sub(r"(?i)^\s*(?:Short文案|短视频文案|旁白|script)\s*[:：]\s*", "", script).strip()
+        if not _looks_like_japanese_short_script(script):
+            last_error = "文本模型返回的Short文案不是自然日语"
+        elif len(script) < min_chars:
+            last_error = f"文本模型返回的Short文案过短（{len(script)}字，需要至少{min_chars}字）"
+        elif len(script) > max_chars:
+            last_error = f"文本模型返回的Short文案过长（{len(script)}字，最多{max_chars}字）"
+        elif not _is_complete_short_script(script):
+            last_error = "文本模型返回的Short文案不是完整句子"
+        else:
+            (short_dir / "short_script.txt").write_text(script, encoding="utf-8")
+            return script
+        if attempt == 1:
+            on_log(f"  WARN {last_error}；正在重新生成一次")
+    # Some compatible text endpoints consistently return a title-length
+    # summary despite the requested duration.  Do not turn that provider
+    # limitation into a failed Short (or a 14-second video): use complete,
+    # saved source sentences as a deterministic fallback.
+    fallback = _local_short_script_from_segments(segments, min_chars, max_chars)
+    (short_dir / "short_script.txt").write_text(fallback, encoding="utf-8")
+    on_log(f"  WARN {last_error}；已改用本地原文完整句兜底（{len(fallback)}字）")
+    return fallback
 
 
 def _rewrite_short_image_prompts(
@@ -6960,7 +7044,12 @@ def stage_short_video(
         return None
     short_dir = job_dir / "shorts"
     short_dir.mkdir(parents=True, exist_ok=True)
-    out = short_dir / "short.mp4"
+    out = short_video_output_path(job_dir, main_video)
+    legacy_out = short_dir / "short.mp4"
+    # Preserve completed Shorts created before readable Short filenames were
+    # introduced, without needlessly re-rendering them.
+    if not out.exists() and legacy_out.exists():
+        legacy_out.replace(out)
     manifest_path = short_dir / "manifest.json"
     mode = str(config.get("short_video_mode", "reuse_main") or "reuse_main")
     width = max(2, int(config.get("short_video_width", 1080) or 1080) // 2 * 2)
@@ -7177,6 +7266,122 @@ def regenerate_job_short(job_id: str, on_log: LogFn = _noop) -> Path:
     return result
 
 
+def regenerate_job_short_text_only(job_id: str, on_log: LogFn = _noop) -> Path:
+    """Remake an independent Short's narration without calling an image provider."""
+    if is_worker_running(job_id):
+        raise RuntimeError(f"{job_id} 正在运行。请先停止任务，再重新生成Short。")
+    job_dir = _safe_job_path(job_id)
+    short_dir = job_dir / "shorts"
+    out = short_video_output_path(job_dir)
+    legacy_out = short_dir / "short.mp4"
+    if not out.exists() and legacy_out.exists():
+        legacy_out.replace(out)
+    if not out.exists():
+        raise RuntimeError("任务没有现成的Short视频")
+    manifest = _read_json(short_dir / "manifest.json", {})
+    if str(manifest.get("mode") or "") != "independent":
+        raise RuntimeError("仅独立制作模式的Short可在不重生图片的情况下重做文案")
+    images = sorted(
+        path for path in (short_dir / "images").iterdir()
+        if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+    ) if (short_dir / "images").is_dir() else []
+    if not images:
+        raise RuntimeError("Short缺少可复用的竖屏图片")
+    novel = _read_saved_novel(job_dir / "novel.json")
+    segments = _read_saved_segments(job_dir / "segments.json")
+    if novel is None or segments is None:
+        raise RuntimeError("任务缺少小说正文或文本切片，无法重做Short文案")
+
+    script_path = short_dir / "short_script.txt"
+    if script_path.exists():
+        script_backup = short_dir / "short_script.before_text_redo.txt"
+        if not script_backup.exists():
+            shutil.copy2(script_path, script_backup)
+        script_path.unlink()
+    video_backup = short_dir / "short.before_text_redo.mp4"
+    if not video_backup.exists():
+        shutil.copy2(out, video_backup)
+    on_log(f"[Short] text-only redo: reusing {len(images)} existing images")
+    minimum = max(1, min(59, int(config.get("short_video_script_min_seconds", 45) or 45)))
+    maximum_seconds = max(minimum, min(60, int(config.get("short_video_script_max_seconds", 58) or 58)))
+    min_chars, max_chars = _short_script_length_bounds(
+        minimum, maximum_seconds, int(config.get("short_video_script_max_chars", 350) or 350),
+    )
+    # The configured text endpoint has been returning 60--80 character partial
+    # replies.  This bulk-recovery mode must finish all requested jobs, so it
+    # uses complete sentences from the saved source instead of invoking it.
+    script = _local_short_script_from_segments(segments, min_chars, max_chars)
+    script_path.write_text(script, encoding="utf-8")
+    on_log(f"  Short文案：使用本地原文完整句重组（{len(script)}字）")
+    short_segments = split_segments(script, target_min=35, target_max=80)
+    audios, durations = stage_tts(short_segments, short_dir, on_log=on_log)
+    maximum = min(
+        max(1.0, min(60.0, float(config.get("short_video_duration_seconds", 58) or 58))),
+        max(1.0, min(60.0, float(config.get("short_video_script_max_seconds", 58) or 58))),
+    )
+    short_segments, durations = _clip_short_timeline(short_segments, durations, maximum)
+    if not short_segments:
+        raise RuntimeError("Short配音时长无效")
+    concat_audios(audios, short_dir / "audio_full.mp3", on_log)
+    # Preserve the old image set and spread it across the complete new audio.
+    # `plan_images` is segment-oriented, so for a one-image Short it would
+    # otherwise allocate only the first narration segment (about 7--10 sec).
+    selected_paths = images
+    total_duration = sum(max(0.05, float(duration)) for duration in durations)
+    image_durations = [total_duration / len(selected_paths)] * len(selected_paths)
+    subs: list[tuple[float, float, str]] = []
+    cursor = 0.0
+    for segment, duration in zip(short_segments, durations):
+        end = cursor + max(0.05, float(duration))
+        subs.append((cursor, end, segment.text))
+        cursor = end
+    width = max(2, int(config.get("short_video_width", 1080) or 1080) // 2 * 2)
+    height = max(2, int(config.get("short_video_height", 1920) or 1920) // 2 * 2)
+    ass_path = short_dir / "short_subtitle.ass"
+    build_ass(subs, ass_path, font=config.video_subtitle_font,
+        size=int(config.get("short_video_subtitle_size", 58) or 58), video_w=width, video_h=height,
+        position="下边", primary_color=config.get("video_subtitle_color", "#FFFFFF"),
+        outline_color=config.get("video_subtitle_outline_color", "#000000"),
+        back_color=config.get("video_subtitle_back_color", "#000000"),
+        outline=float(config.get("video_subtitle_outline", 4.0) or 4.0),
+        shadow=float(config.get("video_subtitle_shadow", 1.0) or 1.0),
+        margin_v=int(config.get("short_video_subtitle_margin_v", 300) or 300),
+        margin_lr=int(config.get("video_subtitle_margin_lr", 56) or 56),
+        bold=bool(config.get("video_subtitle_bold", False)), italic=bool(config.get("video_subtitle_italic", False)),
+        chars_per_line=int(config.get("short_video_subtitle_chars_per_line", 13) or 13),
+        max_lines=int(config.get("short_video_subtitle_max_lines", 2) or 2))
+    build_srt(subs, short_dir / "short_subtitle.srt",
+        chars_per_line=int(config.get("short_video_subtitle_chars_per_line", 13) or 13),
+        max_lines=int(config.get("short_video_subtitle_max_lines", 2) or 2))
+    tmp = out.with_name(out.stem + ".tmp" + out.suffix)
+    try:
+        build_video(images=selected_paths, image_durations=image_durations, audio_path=short_dir / "audio_full.mp3",
+            out_path=tmp, on_log=on_log, width=width, height=height,
+            fps=int(config.get("video_fps", 30) or 30), ken_burns=bool(config.ken_burns), subtitle_ass=ass_path,
+            bgm_path=Path(config.video_bgm_path) if config.video_bgm_path else None,
+            bgm_volume=float(config.video_bgm_volume), long_mode=bool(config.video_long_mode),
+            cleanup_temp=bool(config.video_cleanup_temp), motion=str(config.video_motion or "none"),
+            motion_curve=str(config.get("video_motion_curve", "ease") or "ease"),
+            motion_cycle_seconds=float(config.get("video_motion_cycle_seconds", 0.0) or 0.0),
+            transition=str(config.video_transition or "none"),
+            transition_duration=float(config.video_transition_duration or 0.4),
+            video_encoder=str(config.get("video_encoder", "libx264") or "libx264"),
+            video_encoder_preset=str(config.get("video_encoder_preset", "veryfast") or "veryfast"),
+            video_encoder_quality=int(config.get("video_encoder_quality", 20) or 20))
+        if not tmp.exists() or _audio_duration(tmp) <= 0.05:
+            raise RuntimeError("Short合成结果无效")
+        tmp.replace(out)
+    finally:
+        tmp.unlink(missing_ok=True)
+    manifest.update({"schema": 1, "status": "ready", "video": str(out),
+        "duration": round(_audio_duration(out), 3), "script": str(script_path),
+        "image_count": len(selected_paths), "text_only_redo": True,
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+    _write_json(short_dir / "manifest.json", manifest)
+    write_status(job_dir, short_video=str(out), short_error="")
+    return out
+
+
 def stage_upload(
     video: Path,
     title: str,
@@ -7191,6 +7396,8 @@ def stage_upload(
     scheduled_at_override: str = "",
     schedule_timezone_override: str = "",
     browser_upload_job=None,
+    upload_title_override: str = "",
+    upload_result_filename: str = "upload_result.json",
 ) -> str:
     if not force and not bool(config.upload_enabled):
         return ""
@@ -7211,6 +7418,9 @@ def stage_upload(
         on_log("  WARN only browser upload is wired in this build")
         return ""
     metadata = metadata or {}
+    # Short uploads share the browser flow with the main video, but must not
+    # replace the main video's receipt.  Keep the filename local to this job.
+    receipt_path = job_dir / Path(str(upload_result_filename or "upload_result.json")).name
     if metadata.get("titles") and not _metadata_has_valid_marketing_titles(metadata):
         raise RuntimeError(
             "标题候选无效，已阻止上传：请先重新生成标题/概梗，不能把“标题：”“简介：”或“local text input”等内部任务文字发布到 YouTube。"
@@ -7339,6 +7549,10 @@ def stage_upload(
                 ),
                 title_limit,
             )
+            # A scheduled Short intentionally carries the already-published
+            # main video's exact title, including its chosen candidate/tags.
+            if upload_title_override.strip():
+                upload_title = upload_title_override.strip()
             upload_description = _remove_disallowed_upload_tag(
                 _format_template(description_template, profile_context, fallback="")
             )
@@ -7405,7 +7619,7 @@ def stage_upload(
                     "schedule_timezone": schedule_timezone,
                     "schedule_status": "needs_review",
                 }
-                _write_json(job_dir / "upload_result.json", {"uploads": results + [review_result], **review_result})
+                _write_json(receipt_path, {"uploads": results + [review_result], **review_result})
                 raise RuntimeError("已经点击 YouTube 预定按钮，但未确认到成功弹窗；为避免重复上传，已停止重试，请到 Studio 检查。")
             url = f"https://www.youtube.com/watch?v={video_id}" if re.fullmatch(r"[A-Za-z0-9_-]{11}", str(video_id)) else ""
             results.append(
@@ -7424,7 +7638,7 @@ def stage_upload(
                     "schedule_status": "scheduled" if schedule_enabled else "published",
                 }
             )
-            _write_json(job_dir / "upload_result.json", {"uploads": results, **results[0]})
+            _write_json(receipt_path, {"uploads": results, **results[0]})
             if schedule_enabled:
                 on_log(f"  OK scheduled [{profile_name}] {scheduled_at}: {url or video_id}")
             else:
@@ -7433,7 +7647,7 @@ def stage_upload(
         _release_upload_lock(lock_path, job_dir.name)
     if not results:
         raise RuntimeError("YouTube upload failed")
-    _write_json(job_dir / "upload_result.json", {"uploads": results, **results[0]})
+    _write_json(receipt_path, {"uploads": results, **results[0]})
     if len(results) > 1:
         on_log(f"  OK uploaded {len(results)} copies")
     return str(results[0].get("url") or "")
@@ -7488,6 +7702,55 @@ def upload_completed_job(
         raise
     write_status(job_dir, stage="completed", progress=1.0, youtube_url=url, upload_error="")
     append_log(job_dir, f"manual upload completed: {url}")
+    return url
+
+
+def upload_completed_short_job(
+    job_id: str,
+    short_title: str,
+    on_log: LogFn = _noop,
+    *,
+    profile_name_override: str = "",
+    scheduled_at_override: str = "",
+    schedule_timezone_override: str = "",
+    browser_upload_job=None,
+) -> str:
+    """Schedule an existing Short without changing the main-video receipt."""
+    job_dir = job_dir_for(job_id)
+    status = load_status(job_id)
+    if status.get("worker_alive"):
+        raise RuntimeError("任务仍在制作中，请完成后再上传 Short。")
+    short_video = Path(str(status.get("short_video") or short_video_output_path(job_dir)))
+    if not short_video.exists() or short_video.stat().st_size < 100:
+        raise FileNotFoundError("没有找到已完成的 Short 视频，无法上传。")
+    if not str(short_title or "").strip():
+        raise ValueError("未找到正片的实际上传标题，不能为 Short 创建定时。")
+    metadata = _read_json(job_dir / "metadata.json", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    append_log(job_dir, f"Short manual schedule started: {scheduled_at_override}")
+    try:
+        url = stage_upload(
+            short_video,
+            str(metadata.get("title") or status.get("title") or job_id),
+            None,
+            job_dir,
+            metadata=metadata,
+            on_log=on_log,
+            force=True,
+            profile_name_override=profile_name_override,
+            schedule_enabled_override=True,
+            scheduled_at_override=scheduled_at_override,
+            schedule_timezone_override=schedule_timezone_override,
+            browser_upload_job=browser_upload_job,
+            upload_title_override=str(short_title).strip(),
+            upload_result_filename="short_upload_result.json",
+        )
+    except Exception as exc:
+        append_log(job_dir, f"Short manual schedule failed: {exc}")
+        raise
+    write_status(job_dir, short_youtube_url=url, short_upload_error="")
+    append_log(job_dir, f"Short manual schedule completed: {url}")
     return url
 
 
