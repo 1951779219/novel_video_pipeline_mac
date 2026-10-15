@@ -1,4 +1,71 @@
-# 小说推文长视频流水线
+# 小说推文长视频流水线 macOS
+
+将小说或推文正文制作成带旁白、分镜图片、字幕和封面的长视频。主要流程是：导入或抓取文本 → 清洗与切片 → TTS 配音 → 分镜与图片 → 字幕 → FFmpeg 合成 → 可选上传 YouTube。
+
+本仓库包含应用源码。macOS 分支提供较新的小说项目管理、TXT+MP3 导入、读音词典和 Short 制作功能。
+
+- [版本下载与更新记录](https://github.com/1951779219/novel_video_pipeline_mac_release/releases)
+- [问题反馈](https://github.com/1951779219/novel_video_pipeline_feedback/issues/new/choose)
+- [模块与提示词修改指南](docs/module_prompt_editing_guide.md)
+- [浏览器多账号上传指南](docs/browser_multi_account_upload.md)
+
+## 获取源码
+
+```bash
+git clone https://github.com/1951779219/novel_video_pipeline_mac.git
+cd novel_video_pipeline_mac
+```
+
+## 快速开始：macOS
+
+需要 Python 3.10 或更高版本及可用的 Tkinter、FFmpeg 和 ffprobe。项目脚本优先探测 Python 3.12/3.11；若已有 Homebrew，可先准备运行环境：
+
+```bash
+brew install python@3.12 python-tk@3.12 ffmpeg-full
+bash scripts/setup_macos.sh
+bash Open_GUI.command
+```
+
+之后通常直接双击 `Open_GUI.command`。如系统阻止脚本执行，可在终端进入项目目录后使用上面的 `bash` 命令。Tkinter 启动异常的处理方法见下方详细说明。
+
+## Windows 源码启动
+
+安装 64 位 Python（含 Tkinter）和 FFmpeg/ffprobe，将媒体工具加入 PATH。然后在项目目录的 PowerShell 中执行：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m app.gui
+```
+
+本仓库以 macOS 桌面入口为主要维护流程；Windows 相关脚本和兼容代码请按实际环境验证。
+
+## 第一次制作视频
+
+1. 启动桌面 GUI，粘贴正文或导入一份 UTF-8 TXT。
+2. 在配置页选择 TTS、文本模型和图片服务，填写自己的 Base URL、API Key 和模型名；本地生图服务按所选后端配置。
+3. 使用配置检测按钮检查服务，再用一小段文本创建并启动任务。
+4. 在任务列表查看阶段、状态和日志。任务产物保存在 `data/jobs/` 下对应任务目录，包括 MP4、字幕、封面和中间文件。
+5. 长任务中断后优先使用已有任务续跑，复用完成的音频与图片。
+6. 需要上传时再按上传指南准备已登录 YouTube Studio 的浏览器，并开启自动上传。
+
+TTS、语言模型和生图服务需自行准备；不同后端可能需要联网或产生服务费用。请使用有权处理和发布的文本、音频及图片。
+
+## 更新与排错
+
+- 源码安装：备份个人配置后执行 `git pull --ff-only`，并用同一 Python 环境重新安装 `requirements.txt`。
+- 发行包安装：使用应用内更新；`_update.zip` 或 `mac-update` 附件需与已有安装配套使用。
+- 合成失败：检查 FFmpeg、ffprobe 和字幕字体是否可用，并查看任务 `log.txt`。
+- API 失败：检查服务地址、模型名和密钥；先运行短任务确认配置。
+- 请保留 `data/settings.json`、`data/profiles/`、任务及浏览器登录资料在本机；提交反馈前对日志做脱敏。
+
+## 许可
+
+仓库中的自有代码与文档按 [MIT License](LICENSE) 提供。第三方依赖、模型、外部服务和输入素材遵循各自许可与使用条款。
+
+---
+
+## 详细功能与操作说明
 
 把小说/推文文本变成长视频：内容抓取 -> 整理/洗稿切片 -> TTS -> 分镜出图 -> 字幕 -> 竖屏视频 -> 可选上传 YouTube。
 
@@ -24,7 +91,7 @@
 macOS 首次使用：
 
 ```bash
-cd "/Users/yang/Documents/novel video pipelin"
+cd novel_video_pipeline_mac
 scripts/setup_macos.sh
 ```
 
